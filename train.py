@@ -405,6 +405,12 @@ def get_sample_byot_alpha(alpha, teacher_prob, branch_outputs, target, args, pro
                 proxy_score = (top2[:, 0] - top2[:, 1]).clamp(0.0, 1.0)
         elif proxy == "teacher_label_prob":
             proxy_score = teacher_prob.gather(1, target.view(-1, 1)).squeeze(1).clamp(0.0, 1.0)
+        elif proxy == "teacher_label_prob_entropy":
+            num_classes = max(teacher_prob.size(1), 2)
+            label_prob = teacher_prob.gather(1, target.view(-1, 1)).squeeze(1).clamp(0.0, 1.0)
+            entropy = -(teacher_prob * torch.log(teacher_prob + 1e-8)).sum(dim=1)
+            confidence = (1.0 - entropy / math.log(num_classes)).clamp(0.0, 1.0)
+            proxy_score = label_prob * confidence
         elif proxy == "teacher_correctness":
             proxy_score = (teacher_pred == target).float()
         elif proxy == "branch_agreement":
@@ -483,7 +489,10 @@ def estimate_client_byot_alpha(net, train_dataloader, device, args, fallback_alp
         return fallback_alpha
 
     reliability = _clamp_unit(total_score / total_count)
-    return alpha_min + (alpha_max - alpha_min) * reliability
+    client_alpha = alpha_min + (alpha_max - alpha_min) * reliability
+    if getattr(args, "byot_client_alpha_mode", "map") == "multiply":
+        return fallback_alpha * client_alpha
+    return client_alpha
 
 def fedavg(net, train_dataloader, optimizer, device, args):
     criterion = nn.CrossEntropyLoss()

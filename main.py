@@ -633,17 +633,21 @@ def get_args():
     parser.add_argument('--byot_sample_proxy', default='none',
                         choices=['none', 'teacher_conf', 'teacher_entropy', 'teacher_margin',
                                  'teacher_label_prob', 'teacher_correctness', 'branch_agreement',
-                                 'branch_soft_kl', 'branch_js'],
+                                 'branch_soft_kl', 'branch_js', 'teacher_label_prob_entropy'],
                         help='Sample-level reliability proxy used to weight BYOT KD loss.')
     parser.add_argument('--byot_client_proxy', default='none',
                         choices=['none', 'teacher_conf', 'teacher_entropy', 'teacher_margin',
                                  'teacher_label_prob', 'teacher_correctness', 'branch_agreement',
-                                 'branch_soft_kl', 'branch_js'],
+                                 'branch_soft_kl', 'branch_js', 'teacher_label_prob_entropy'],
                         help='Client-level reliability proxy used to choose one BYOT KD alpha per client.')
     parser.add_argument('--byot_client_alpha_min', type=float, default=0.01,
                         help='Minimum client-wise BYOT alpha when --byot_client_proxy is enabled.')
     parser.add_argument('--byot_client_alpha_max', type=float, default=0.30,
                         help='Maximum client-wise BYOT alpha when --byot_client_proxy is enabled.')
+    parser.add_argument('--byot_client_alpha_mode', default='map',
+                        choices=['map', 'multiply'],
+                        help='How client reliability is applied. map: alpha_min+(alpha_max-alpha_min)*r. '
+                             'multiply: fallback_alpha*(alpha_min+(alpha_max-alpha_min)*r), useful for round*client schedules.')
     parser.add_argument('--byot_round_lambda_schedule', default='none',
                         choices=['none', 'linear', 'cosine'],
                         help='Round-wise schedule for BYOT alpha/lambda. '
