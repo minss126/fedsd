@@ -498,6 +498,7 @@ def get_args():
     # batchnorm -> groupnorm. 켜도되고 안켜도 되는데, groupnorm이 더 좋다는 연구결과가 있는데 꼭 그렇지는 않더라구요
     parser.add_argument('--num_groups', type=int, default=8, help='num of groups in group_norm')
     # group_norm의 groups
+    parser.add_argument('--num_classes', type=int, default=None, help='number of classes; inferred from dataset when omitted')
     parser.add_argument('--in_channels', type=int, default=3)
     # image channels. 1 channel 데이터셋이도 3 channel로 하면 gray scale -> RGB scale 채널이 복사되서 작동합니다
     parser.add_argument('--last_fc', action='store_true', help='For mobilenet, classifier is fc_layer if True, otherwise, 1x1 conv')
@@ -783,16 +784,20 @@ def main():
     # ==========================================================================
     # [통합 수정] 1. 데이터셋별 클래스 수 & 채널 수 자동 설정
     # ==========================================================================
-    if args.dataset == 'tinyimagenet':
-        args.num_classes = 200
-    elif args.dataset == 'cifar100':
-        args.num_classes = 100
-    elif args.dataset == 'emnist':
-        args.num_classes = 47
-        args.in_channels = 1  # EMNIST는 흑백
-    elif args.dataset == 'cifar10':
-        args.num_classes = 10
-    # 다른 데이터셋 추가 시 여기에 작성
+    if args.num_classes is None:
+        if args.dataset == 'tinyimagenet':
+            args.num_classes = 200
+        elif args.dataset == 'cifar100':
+            args.num_classes = 100
+        elif args.dataset == 'emnist':
+            args.num_classes = 47
+            args.in_channels = 1  # EMNIST는 흑백
+        elif args.dataset == 'cifar10':
+            args.num_classes = 10
+        elif hasattr(global_train_dataset, 'num_classes'):
+            args.num_classes = int(global_train_dataset.num_classes)
+        else:
+            raise ValueError(f"Cannot infer num_classes for dataset={args.dataset}. Pass --num_classes explicitly.")
     
     print(f"🔥 [Auto Setup] Dataset: {args.dataset} | Classes: {args.num_classes} | Channels: {args.in_channels}")
 
