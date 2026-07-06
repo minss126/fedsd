@@ -648,6 +648,20 @@ def get_args():
                         choices=['map', 'multiply'],
                         help='How client reliability is applied. map: alpha_min+(alpha_max-alpha_min)*r. '
                              'multiply: fallback_alpha*(alpha_min+(alpha_max-alpha_min)*r), useful for round*client schedules.')
+    parser.add_argument('--byot_class_proxy', default='none',
+                        choices=['none', 'label_count', 'teacher_label_prob',
+                                 'teacher_correctness', 'teacher_label_prob_count'],
+                        help='Client-class-level reliability proxy used to choose one BYOT KD alpha per class inside each client.')
+    parser.add_argument('--byot_class_alpha_min', type=float, default=0.0,
+                        help='Minimum class-wise BYOT alpha when --byot_class_proxy is enabled.')
+    parser.add_argument('--byot_class_alpha_max', type=float, default=1.0,
+                        help='Maximum class-wise BYOT alpha when --byot_class_proxy is enabled.')
+    parser.add_argument('--byot_class_alpha_mode', default='map',
+                        choices=['map', 'multiply'],
+                        help='How class reliability is applied. map: alpha_min+(alpha_max-alpha_min)*r. '
+                             'multiply: fallback_alpha*(alpha_min+(alpha_max-alpha_min)*r).')
+    parser.add_argument('--byot_class_count_smoothing', type=float, default=1.0,
+                        help='Smoothing added to per-class counts for count-based class-wise BYOT alpha.')
     parser.add_argument('--byot_round_lambda_schedule', default='none',
                         choices=['none', 'linear', 'cosine'],
                         help='Round-wise schedule for BYOT alpha/lambda. '

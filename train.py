@@ -494,6 +494,72 @@ def estimate_client_byot_alpha(net, train_dataloader, device, args, fallback_alp
         return fallback_alpha * client_alpha
     return client_alpha
 
+def estimate_class_byot_alpha(net, train_dataloader, device, args, fallback_alpha):
+    proxy = getattr(args, "byot_class_proxy", "none")
+    if proxy == "none":
+        return None
+
+    alpha_min = float(getattr(args, "byot_class_alpha_min", 0.0))
+    alpha_max = float(getattr(args, "byot_class_alpha_max", 1.0))
+    if alpha_max < alpha_min:
+        alpha_min, alpha_max = alpha_max, alpha_min
+
+    num_classes = int(getattr(args, "num_classes", 100))
+    smoothing = max(float(getattr(args, "byot_class_count_smoothing", 1.0)), 0.0)
+    temperature = float(getattr(args, "temperature", 0.5))
+
+    counts = torch.zeros(num_classes, device=device)
+    score_sums = torch.zeros(num_classes, device=device)
+
+    was_training = net.training
+    net.eval()
+
+    with torch.no_grad():
+        for x, target in train_dataloader:
+            x = x.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True).long()
+            out = net(x)
+            if not (isinstance(out, tuple) and len(out) == 8):
+                continue
+
+            output = out[0]
+            teacher_prob = F.softmax(output / temperature, dim=1)
+            bincount = torch.bincount(target, minlength=num_classes).float()
+            counts += bincount
+
+            if proxy in {"teacher_label_prob", "teacher_label_prob_count"}:
+                label_prob = teacher_prob.gather(1, target.view(-1, 1)).squeeze(1).clamp(0.0, 1.0)
+                score_sums.scatter_add_(0, target, label_prob)
+            elif proxy == "teacher_correctness":
+                teacher_pred = teacher_prob.argmax(dim=1)
+                correctness = (teacher_pred == target).float()
+                score_sums.scatter_add_(0, target, correctness)
+
+    if was_training:
+        net.train()
+
+    if counts.sum().item() <= 0:
+        return None
+
+    count_reliability = (counts + smoothing) / (counts.max().clamp_min(1.0) + smoothing)
+    count_reliability = count_reliability.clamp(0.0, 1.0)
+
+    if proxy == "label_count":
+        reliability = count_reliability
+    elif proxy in {"teacher_label_prob", "teacher_correctness"}:
+        reliability = torch.where(counts > 0, score_sums / counts.clamp_min(1.0), torch.zeros_like(counts))
+        reliability = reliability.clamp(0.0, 1.0)
+    elif proxy == "teacher_label_prob_count":
+        label_reliability = torch.where(counts > 0, score_sums / counts.clamp_min(1.0), torch.zeros_like(counts))
+        reliability = (label_reliability.clamp(0.0, 1.0) * count_reliability).clamp(0.0, 1.0)
+    else:
+        return None
+
+    class_alpha = alpha_min + (alpha_max - alpha_min) * reliability
+    if getattr(args, "byot_class_alpha_mode", "map") == "multiply":
+        class_alpha = fallback_alpha * class_alpha
+    return class_alpha.detach()
+
 def fedavg(net, train_dataloader, optimizer, device, args):
     criterion = nn.CrossEntropyLoss()
     feddecorr = FedDecorrLoss()
@@ -921,6 +987,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
     temperature = args.temperature
     alpha = get_effective_byot_alpha(train_dataloader, args)
     alpha = estimate_client_byot_alpha(net, train_dataloader, device, args, alpha)
+    class_alpha = estimate_class_byot_alpha(net, train_dataloader, device, args, alpha)
     branch_objective = getattr(args, "byot_branch_objective", "blend")
     branch_alphas = get_byot_branch_alphas(args, device)
     if branch_objective == "kd_only" and branch_alphas is not None:
@@ -992,7 +1059,12 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                     loss_feat_students, active_branch_indices, args
                 )
 
-                sample_alpha = None if branch_alphas is not None else get_sample_byot_alpha(alpha, teacher_prob, [m1, m2, m3], target, args)
+                if branch_alphas is not None:
+                    sample_alpha = None
+                elif class_alpha is not None:
+                    sample_alpha = class_alpha[target].to(device)
+                else:
+                    sample_alpha = get_sample_byot_alpha(alpha, teacher_prob, [m1, m2, m3], target, args)
                 if not active_branch_indices:
                     alpha_mean = 0.0
                     alpha_min = 0.0
