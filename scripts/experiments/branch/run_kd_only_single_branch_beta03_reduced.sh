@@ -14,7 +14,7 @@ cd "$REPO_ROOT"
 #   dataset/backbone: CIFAR-100 / ResNet18-BYOT
 #   partition: beta=0.3
 #   active branch: B1, B2, B3
-#   lambda_kd: 0.00, 0.30
+#   lambda_kd: 0.00, 3.00
 #
 # Total default jobs: 3 branches x 2 lambdas = 6.
 # With 2 GPUs, this is 3 sequential jobs per GPU.
@@ -46,7 +46,7 @@ LOG_ROOT="${LOG_ROOT:-logs_kd_only_single_branch_generalization}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 BRANCHES=(${BRANCHES_OVERRIDE:-1:B1 2:B2 3:B3})
-LAMBDAS=(${LAMBDAS_OVERRIDE:-0.00:0p000 0.30:0p300})
+LAMBDAS=(${LAMBDAS_OVERRIDE:-0.00:0p000 3.00:3p000})
 
 WANDB_FLAGS=""
 if [ "${USE_WANDB:-1}" = "1" ]; then
