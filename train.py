@@ -411,6 +411,24 @@ def get_sample_byot_alpha(alpha, teacher_prob, branch_outputs, target, args, pro
             entropy = -(teacher_prob * torch.log(teacher_prob + 1e-8)).sum(dim=1)
             confidence = (1.0 - entropy / math.log(num_classes)).clamp(0.0, 1.0)
             proxy_score = label_prob * confidence
+        elif proxy in {"teacher_label_prob_branch_js", "teacher_label_prob_entropy_branch_js"}:
+            num_classes = max(teacher_prob.size(1), 2)
+            log_c = math.log(num_classes)
+            label_prob = teacher_prob.gather(1, target.view(-1, 1)).squeeze(1).clamp(0.0, 1.0)
+            if proxy == "teacher_label_prob_entropy_branch_js":
+                entropy = -(teacher_prob * torch.log(teacher_prob + 1e-8)).sum(dim=1)
+                label_prob = label_prob * (1.0 - entropy / log_c).clamp(0.0, 1.0)
+
+            js_scores = []
+            for branch_out in branch_outputs:
+                branch_prob = F.softmax(branch_out, dim=1)
+                mix = 0.5 * (teacher_prob + branch_prob)
+                kl_teacher = (teacher_prob * (torch.log(teacher_prob + 1e-8) - torch.log(mix + 1e-8))).sum(dim=1)
+                kl_branch = (branch_prob * (torch.log(branch_prob + 1e-8) - torch.log(mix + 1e-8))).sum(dim=1)
+                js = 0.5 * (kl_teacher + kl_branch)
+                js_scores.append((1.0 - js / log_c).clamp(0.0, 1.0))
+            branch_agreement = torch.stack(js_scores, dim=0).mean(dim=0)
+            proxy_score = (label_prob * branch_agreement).clamp(0.0, 1.0)
         elif proxy == "teacher_correctness":
             proxy_score = (teacher_pred == target).float()
         elif proxy == "branch_agreement":

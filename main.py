@@ -634,12 +634,16 @@ def get_args():
     parser.add_argument('--byot_sample_proxy', default='none',
                         choices=['none', 'teacher_conf', 'teacher_entropy', 'teacher_margin',
                                  'teacher_label_prob', 'teacher_correctness', 'branch_agreement',
-                                 'branch_soft_kl', 'branch_js', 'teacher_label_prob_entropy'],
+                                 'branch_soft_kl', 'branch_js', 'teacher_label_prob_entropy',
+                                 'teacher_label_prob_branch_js',
+                                 'teacher_label_prob_entropy_branch_js'],
                         help='Sample-level reliability proxy used to weight BYOT KD loss.')
     parser.add_argument('--byot_client_proxy', default='none',
                         choices=['none', 'teacher_conf', 'teacher_entropy', 'teacher_margin',
                                  'teacher_label_prob', 'teacher_correctness', 'branch_agreement',
-                                 'branch_soft_kl', 'branch_js', 'teacher_label_prob_entropy'],
+                                 'branch_soft_kl', 'branch_js', 'teacher_label_prob_entropy',
+                                 'teacher_label_prob_branch_js',
+                                 'teacher_label_prob_entropy_branch_js'],
                         help='Client-level reliability proxy used to choose one BYOT KD alpha per client.')
     parser.add_argument('--byot_client_alpha_min', type=float, default=0.01,
                         help='Minimum client-wise BYOT alpha when --byot_client_proxy is enabled.')
