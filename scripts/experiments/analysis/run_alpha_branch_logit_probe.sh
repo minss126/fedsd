@@ -5,31 +5,19 @@ set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-# Probe why alpha trends differ across tasks/partitions.
+# Alpha probe with CE/KD gradients + branch logit statistics.
 #
-# Measures, every PROBE_INTERVAL rounds:
-#   1) KD information proxies from teacher outputs
-#      - entropy / normalized entropy
-#      - true-label probability
-#      - non-target mass
-#      - top-2 margin
-#   2) CE-vs-KD gradient relation
-#      - direct CE-KD cosine
-#      - normalized CE-KD gradient distance
-#      - KD/CE norm ratio
-#
-# Objective:
-#   BYOT blend branch objective:
-#     L = CE_teacher + sum_b [(1-alpha) CE_branch + alpha KD_branch] + beta_feat L_feat
-#
-# Default cases:
+# Same representative cases as the CE-KD gradient probe:
 #   1. CIFAR-100 + ResNet18-BYOT + beta=0.5
 #   2. CIFAR-100 + ResNet18-BYOT + beta=0.1
 #   3. CIFAR-10  + ResNet18-BYOT + beta=0.5
 #
-# Each case runs alpha=0 and alpha=1 for 100 rounds.
+# The probe logs branch-wise:
+#   - entropy / true-label probability / non-target mass / top-2 margin
+#   - confidence / train-batch accuracy
+#   - teacher-branch JS / KL / entropy gap
 
-GPUS=(${GPUS_OVERRIDE:-0 1 2 3})
+GPUS=(${GPUS_OVERRIDE:-0 1})
 NUM_GPUS=${#GPUS[@]}
 if [ "$NUM_GPUS" -lt 1 ]; then
     echo "No GPU ids provided. Set GPUS_OVERRIDE." >&2
@@ -54,8 +42,12 @@ TEMP_VAL="${TEMP_VAL:-0.5}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
 PROBE_INTERVAL="${PROBE_INTERVAL:-10}"
 PROBE_BATCHES="${PROBE_BATCHES:-1}"
+EXAMPLE_ROUNDS="${EXAMPLE_ROUNDS:-0,100,250,last}"
+EXAMPLE_CLIENTS="${EXAMPLE_CLIENTS:-2}"
+EXAMPLE_SAMPLES="${EXAMPLE_SAMPLES:-8}"
+EXAMPLE_TOPK="${EXAMPLE_TOPK:-5}"
 CIFAR10_BETA="${CIFAR10_BETA:-0.5}"
-LOG_ROOT="${LOG_ROOT:-logs_alpha_kd_info_gradient_probe_r500}"
+LOG_ROOT="${LOG_ROOT:-logs_alpha_branch_logit_probe_r500}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 ALPHAS=(${ALPHAS_OVERRIDE:-0.00 1.00})
@@ -74,7 +66,7 @@ if [ "${USE_WANDB:-1}" = "1" ]; then
 fi
 
 alpha_tag() {
-    printf "%s" "$1" | sed 's/\\./p/g'
+    printf "%s" "$1" | tr '.' 'p'
 }
 
 has_completed_log() {
@@ -93,7 +85,7 @@ run_job() {
     alpha_name="$(alpha_tag "$alpha")"
 
     local setting="${dataset}_resnet18/${env_name}/fedavg"
-    local method_name="alpha${alpha_name}_probe"
+    local method_name="alpha${alpha_name}_branch_probe"
     local log_dir="${LOG_ROOT}/${setting}"
     local log_file="${log_dir}/${method_name}.log"
 
@@ -127,6 +119,11 @@ run_job() {
         --log_gradient_probe \
         --gradient_probe_interval "${PROBE_INTERVAL}" \
         --gradient_probe_batches "${PROBE_BATCHES}" \
+        --log_branch_logit_examples \
+        --branch_logit_example_rounds "${EXAMPLE_ROUNDS}" \
+        --branch_logit_example_clients "${EXAMPLE_CLIENTS}" \
+        --branch_logit_example_samples "${EXAMPLE_SAMPLES}" \
+        --branch_logit_example_topk "${EXAMPLE_TOPK}" \
         ${env_flags} ${WANDB_FLAGS} \
         > "${log_dir}/${method_name}_terminal.log" 2>&1
 
@@ -160,11 +157,12 @@ for case_spec in "${CASES[@]}"; do
     done
 done
 
-echo "========== Alpha KD Info / CE-KD Gradient Probe =========="
+echo "========== Alpha Branch Logit Probe =========="
 echo "gpus=${GPUS[*]}, rounds=${ROUNDS}, local_epochs=${LOCAL_EPOCHS}, seed=${SEED}"
 echo "cases=${CASES[*]}"
 echo "alphas=${ALPHAS[*]}"
 echo "probe_interval=${PROBE_INTERVAL}, probe_batches=${PROBE_BATCHES}"
+echo "example_rounds=${EXAMPLE_ROUNDS}, example_clients=${EXAMPLE_CLIENTS}, example_samples=${EXAMPLE_SAMPLES}, example_topk=${EXAMPLE_TOPK}"
 echo "feature_beta=${FEATURE_BETA}, temp=${TEMP_VAL}"
 echo "log_root=${LOG_ROOT}, skip_existing=${SKIP_EXISTING}, wandb=${USE_WANDB:-1}"
 echo "jobs=${job_count}"
@@ -179,4 +177,4 @@ for ((i = 0; i < NUM_GPUS; i++)); do
 done
 
 wait "${pids[@]}"
-echo "Alpha KD info / CE-KD gradient probe complete (${job_count} jobs)"
+echo "Alpha branch logit probe complete (${job_count} jobs)"

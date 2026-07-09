@@ -5,6 +5,8 @@ import time
 import pickle
 import random
 import os 
+import math
+import json
 import numpy as np 
 
 import sys
@@ -24,6 +26,26 @@ from models.resnet_cifar import ResNet18_cifar10
 from models.mobilenet_v2 import MobileNetV2, MobileNetV2BYOT
 
 import fl_utils 
+
+BRANCH_LOGIT_PROBE_METRICS = [
+    "entropy_norm",
+    "true_label_prob",
+    "non_target_mass",
+    "top2_margin",
+    "confidence",
+    "acc",
+    "teacher_js",
+    "teacher_kl",
+    "entropy_gap",
+]
+BRANCH_LOGIT_PROBE_KEYS = [
+    f"branch_logit_b{branch_idx}_{metric}"
+    for branch_idx in (1, 2, 3)
+    for metric in BRANCH_LOGIT_PROBE_METRICS
+] + [
+    f"branch_logit_avg_{metric}"
+    for metric in BRANCH_LOGIT_PROBE_METRICS
+]
 
 # python main.py --seed 0 --model mobilenet --last_fc --alg fedavg
 
@@ -179,6 +201,164 @@ def _average_kd_info_probe(model, dataloader, device, args, max_batches):
         return None
     return {key: value / total_count for key, value in metrics.items()}
 
+def _should_log_branch_logit_examples(args):
+    if not getattr(args, "log_branch_logit_examples", False):
+        return False
+    current_round = int(getattr(args, "current_round", 0))
+    total_rounds = max(int(getattr(args, "round", 1)), 1)
+    raw = str(getattr(args, "branch_logit_example_rounds", "0,100,250,last") or "")
+    rounds = set()
+    for item in raw.split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        if item == "last":
+            rounds.add(total_rounds - 1)
+        else:
+            try:
+                rounds.add(int(item))
+            except ValueError:
+                continue
+    return current_round in rounds
+
+def _branch_logit_example_path(args):
+    log_file_name = getattr(args, "log_file_name", None) or "branch_logit_probe"
+    return os.path.join(args.logdir, f"{log_file_name}_topk.jsonl")
+
+def _topk_payload(prob, topk):
+    k = min(max(int(topk), 1), int(prob.numel()))
+    values, indices = torch.topk(prob, k=k)
+    return [
+        {"class": int(idx.item()), "prob": float(value.item())}
+        for value, idx in zip(values.detach().cpu(), indices.detach().cpu())
+    ]
+
+def _average_branch_logit_probe(
+    model, dataloader, device, args, max_batches, client_id=None, save_examples=False
+):
+    per_branch = [
+        {metric: 0.0 for metric in BRANCH_LOGIT_PROBE_METRICS}
+        for _ in range(3)
+    ]
+    total_count = 0
+    temperature = float(getattr(args, 'temperature', 0.5))
+    example_rows = []
+    max_examples = max(int(getattr(args, "branch_logit_example_samples", 8)), 0)
+    topk = max(int(getattr(args, "branch_logit_example_topk", 5)), 1)
+    saved_examples = 0
+
+    with torch.no_grad():
+        for batch_idx, (x, target) in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+            x, target = x.to(device), target.to(device).long()
+            out = model(x)
+            if not (isinstance(out, tuple) and len(out) == 8):
+                continue
+
+            output, m1, m2, m3 = out[0], out[1], out[2], out[3]
+            teacher_prob = F.softmax(output / temperature, dim=1)
+            branches = [m1, m2, m3]
+            branch_probs = [F.softmax(branch_logits / temperature, dim=1) for branch_logits in branches]
+            batch_size = int(target.numel())
+            num_classes = max(int(teacher_prob.size(1)), 2)
+            log_c = math.log(num_classes)
+            teacher_entropy_norm = (
+                -(teacher_prob * torch.log(teacher_prob + 1e-8)).sum(dim=1) / log_c
+            )
+
+            if save_examples and saved_examples < max_examples:
+                take = min(batch_size, max_examples - saved_examples)
+                for sample_offset in range(take):
+                    sample_index = saved_examples + sample_offset
+                    row_base = {
+                        "round": int(getattr(args, "current_round", 0)),
+                        "client_id": None if client_id is None else int(client_id),
+                        "batch_index": int(batch_idx),
+                        "sample_index": int(sample_index),
+                        "target": int(target[sample_offset].detach().cpu().item()),
+                        "dataset": getattr(args, "dataset", None),
+                        "partition": getattr(args, "partition", None),
+                        "beta": None if not hasattr(args, "beta") else float(getattr(args, "beta")),
+                        "alpha": float(getattr(args, "byot_alpha", 0.0)),
+                    }
+                    heads = [("teacher", teacher_prob)] + [
+                        (f"b{branch_idx}", branch_prob)
+                        for branch_idx, branch_prob in enumerate(branch_probs, start=1)
+                    ]
+                    for head_name, prob_tensor in heads:
+                        prob = prob_tensor[sample_offset]
+                        entropy_norm = float(
+                            (-(prob * torch.log(prob + 1e-8)).sum() / log_c).detach().cpu().item()
+                        )
+                        example_rows.append({
+                            **row_base,
+                            "head": head_name,
+                            "entropy_norm": entropy_norm,
+                            "true_label_prob": float(prob[row_base["target"]].detach().cpu().item()),
+                            "topk": _topk_payload(prob, topk),
+                        })
+                saved_examples += take
+
+            for branch_idx, branch_prob in enumerate(branch_probs):
+                branch_entropy_norm = (
+                    -(branch_prob * torch.log(branch_prob + 1e-8)).sum(dim=1) / log_c
+                )
+                true_label_prob = branch_prob.gather(1, target.view(-1, 1)).squeeze(1).clamp(0.0, 1.0)
+                top2 = branch_prob.topk(k=min(2, num_classes), dim=1).values
+                if top2.size(1) == 1:
+                    margin = torch.ones_like(top2[:, 0])
+                else:
+                    margin = (top2[:, 0] - top2[:, 1]).clamp(0.0, 1.0)
+                confidence, pred = branch_prob.max(dim=1)
+                mix = 0.5 * (teacher_prob + branch_prob)
+                kl_teacher = (
+                    teacher_prob * (torch.log(teacher_prob + 1e-8) - torch.log(mix + 1e-8))
+                ).sum(dim=1)
+                kl_branch = (
+                    branch_prob * (torch.log(branch_prob + 1e-8) - torch.log(mix + 1e-8))
+                ).sum(dim=1)
+                js = 0.5 * (kl_teacher + kl_branch) / log_c
+                teacher_kl = (
+                    teacher_prob * (torch.log(teacher_prob + 1e-8) - torch.log(branch_prob + 1e-8))
+                ).sum(dim=1) / log_c
+                entropy_gap = teacher_entropy_norm - branch_entropy_norm
+
+                stats = per_branch[branch_idx]
+                stats["entropy_norm"] += float(branch_entropy_norm.sum().item())
+                stats["true_label_prob"] += float(true_label_prob.sum().item())
+                stats["non_target_mass"] += float((1.0 - true_label_prob).sum().item())
+                stats["top2_margin"] += float(margin.sum().item())
+                stats["confidence"] += float(confidence.sum().item())
+                stats["acc"] += float((pred == target).float().sum().item())
+                stats["teacher_js"] += float(js.sum().item())
+                stats["teacher_kl"] += float(teacher_kl.sum().item())
+                stats["entropy_gap"] += float(entropy_gap.sum().item())
+
+            total_count += batch_size
+
+    if total_count == 0:
+        return None
+
+    if save_examples and example_rows:
+        output_path = _branch_logit_example_path(args)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "a", encoding="utf-8") as f:
+            for row in example_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    result = {}
+    for branch_idx, stats in enumerate(per_branch, start=1):
+        for metric, value in stats.items():
+            result[f"branch_logit_b{branch_idx}_{metric}"] = value / total_count
+
+    for metric in BRANCH_LOGIT_PROBE_METRICS:
+        result[f"branch_logit_avg_{metric}"] = sum(
+            result[f"branch_logit_b{branch_idx}_{metric}"]
+            for branch_idx in (1, 2, 3)
+        ) / 3.0
+    return result
+
 def _average_probe_gradient(model, dataloader, device, args, loss_kind, max_batches):
     grads = []
     temperature = float(getattr(args, 'temperature', 0.5))
@@ -291,7 +471,10 @@ def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_av
     ce_gradients = []
     kd_gradients = []
     kd_info_sums = {}
+    branch_logit_sums = {}
     used_weights = []
+    save_branch_examples_this_round = _should_log_branch_logit_examples(args)
+    max_example_clients = max(int(getattr(args, "branch_logit_example_clients", 2)), 0)
 
     for idx, client_id in enumerate(nets_this_round.keys()):
         dataloader = dataloaders_this_round.get(client_id)
@@ -301,6 +484,15 @@ def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_av
         was_training = model.training
         model.eval()
         kd_info = _average_kd_info_probe(model, dataloader, device, args, max_batches)
+        branch_logit_info = _average_branch_logit_probe(
+            model,
+            dataloader,
+            device,
+            args,
+            max_batches,
+            client_id=client_id,
+            save_examples=save_branch_examples_this_round and idx < max_example_clients,
+        )
         ce_grad = _average_probe_gradient(model, dataloader, device, args, 'ce', max_batches)
         kd_grad = _average_probe_gradient(model, dataloader, device, args, 'kd', max_batches)
         if was_training:
@@ -316,6 +508,9 @@ def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_av
         if kd_info is not None:
             for key, value in kd_info.items():
                 kd_info_sums[key] = kd_info_sums.get(key, 0.0) + weight * value
+        if branch_logit_info is not None:
+            for key, value in branch_logit_info.items():
+                branch_logit_sums[key] = branch_logit_sums.get(key, 0.0) + weight * value
 
     ce_stats = _weighted_gradient_stats(ce_gradients, used_weights)
     kd_stats = _weighted_gradient_stats(kd_gradients, used_weights)
@@ -339,6 +534,8 @@ def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_av
         metrics["gradient_ce_kd_corr"] = cross_stats["corr"]
     for key, value in kd_info_sums.items():
         metrics[f"kd_info_{key}"] = value
+    for key, value in branch_logit_sums.items():
+        metrics[key] = value
 
     ce_kd_cosine = 0.0
     ce_kd_distance = 0.0
@@ -729,9 +926,9 @@ def get_args():
                         help='How client reliability is applied. map: alpha_min+(alpha_max-alpha_min)*r. '
                              'multiply: fallback_alpha*(alpha_min+(alpha_max-alpha_min)*r), useful for round*client schedules.')
     parser.add_argument('--byot_client_skew_proxy', default='none',
-                        choices=['none', 'label_entropy', 'max_concentration'],
+                        choices=['none', 'label_entropy', 'max_concentration', 'prediction_entropy'],
                         help='Client-local label-skew proxy used to downscale BYOT alpha/lambda. '
-                             'Computed only from each client local labels and never sent to the server.')
+                             'Computed only inside each client and never sent to the server.')
     parser.add_argument('--byot_client_skew_min_scale', type=float, default=0.0,
                         help='Minimum skew-penalty scale when client labels are extremely concentrated.')
     parser.add_argument('--byot_client_skew_power', type=float, default=1.0,
@@ -808,6 +1005,16 @@ def get_args():
                         help='Probe gradient dissimilarity every N rounds when --log_gradient_probe is enabled.')
     parser.add_argument('--gradient_probe_batches', type=int, default=1,
                         help='Number of local batches per sampled client used for gradient probing.')
+    parser.add_argument('--log_branch_logit_examples', action='store_true',
+                        help='Save branch/teacher top-k probability examples as JSONL during gradient probes.')
+    parser.add_argument('--branch_logit_example_rounds', default='0,100,250,last',
+                        help='Comma-separated rounds for branch logit example dumps. Use "last" for round-1.')
+    parser.add_argument('--branch_logit_example_clients', type=int, default=2,
+                        help='Number of sampled clients per probe round used for branch logit examples.')
+    parser.add_argument('--branch_logit_example_samples', type=int, default=8,
+                        help='Number of local samples per selected client saved for branch logit examples.')
+    parser.add_argument('--branch_logit_example_topk', type=int, default=5,
+                        help='Top-k probabilities saved for teacher and branch logits.')
     
     
     parser.add_argument('--min_threshold', type=float, default=0.8, help='시작 임계값 (Dynamic Threshold용)')
@@ -1006,6 +1213,8 @@ def main():
         'byot_effective_alpha_max': [],
         'max': 0, 'avg_10': 0, 'avg_30': 0, 'avg_50': 0
     }
+    for branch_logit_key in BRANCH_LOGIT_PROBE_KEYS:
+        pkl_dict[branch_logit_key] = []
     last_10 = []
     lr = args.lr
 
@@ -1144,6 +1353,7 @@ def main():
             'kd_info_teacher_non_target_mass',
             'kd_info_teacher_top2_margin',
             'kd_info_teacher_confidence',
+            *BRANCH_LOGIT_PROBE_KEYS,
         ]:
             pkl_dict[gradient_key].append(gradient_probe_metrics.get(gradient_key))
 

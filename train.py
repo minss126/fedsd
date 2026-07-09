@@ -265,35 +265,66 @@ def get_effective_byot_alpha(train_dataloader, args):
 
     return alpha
 
-def get_client_label_skew_scale(train_dataloader, args):
+def get_client_skew_scale(net, train_dataloader, device, args):
     proxy = getattr(args, "byot_client_skew_proxy", "none")
     if proxy == "none":
         return 1.0
 
-    targets = _extract_dataset_targets(train_dataloader.dataset)
-    if targets is None or len(targets) == 0:
-        return 1.0
+    if proxy == "prediction_entropy":
+        temperature = float(getattr(args, "temperature", 0.5))
+        was_training = net.training
+        net.eval()
+        prob_sum = None
+        total = 0
+        with torch.no_grad():
+            for x, _ in train_dataloader:
+                x = x.to(device, non_blocking=True)
+                out = net(x)
+                if isinstance(out, tuple) and len(out) == 8:
+                    logits = out[0]
+                elif isinstance(out, tuple):
+                    logits = out[-1]
+                else:
+                    logits = out
+                probs = F.softmax(logits / temperature, dim=1)
+                batch_sum = probs.sum(dim=0)
+                prob_sum = batch_sum if prob_sum is None else prob_sum + batch_sum
+                total += int(probs.size(0))
+        if was_training:
+            net.train()
+        if prob_sum is None or total <= 0:
+            return 1.0
 
-    targets = np.asarray(targets, dtype=np.int64).reshape(-1)
-    num_classes = _infer_num_classes_from_targets(targets, args)
-    counts = np.bincount(targets, minlength=num_classes).astype(np.float64)
-    total = counts.sum()
-    if total <= 0.0:
-        return 1.0
-
-    probs = counts[counts > 0] / total
-    if proxy == "label_entropy":
-        if num_classes <= 1 or len(probs) == 0:
-            reliability = 0.0
-        else:
-            entropy = -np.sum(probs * np.log(probs + 1e-12))
-            reliability = entropy / np.log(num_classes)
-    elif proxy == "max_concentration":
-        reliability = 1.0 - float(counts.max() / total)
-        if num_classes > 1:
-            reliability = reliability / (1.0 - 1.0 / num_classes)
+        mean_prob = (prob_sum / float(total)).detach().cpu().numpy().astype(np.float64)
+        mean_prob = mean_prob[mean_prob > 0]
+        num_classes = max(int(prob_sum.numel()), 2)
+        entropy = -np.sum(mean_prob * np.log(mean_prob + 1e-12))
+        reliability = entropy / np.log(num_classes)
     else:
-        return 1.0
+        targets = _extract_dataset_targets(train_dataloader.dataset)
+        if targets is None or len(targets) == 0:
+            return 1.0
+
+        targets = np.asarray(targets, dtype=np.int64).reshape(-1)
+        num_classes = _infer_num_classes_from_targets(targets, args)
+        counts = np.bincount(targets, minlength=num_classes).astype(np.float64)
+        total = counts.sum()
+        if total <= 0.0:
+            return 1.0
+
+        probs = counts[counts > 0] / total
+        if proxy == "label_entropy":
+            if num_classes <= 1 or len(probs) == 0:
+                reliability = 0.0
+            else:
+                entropy = -np.sum(probs * np.log(probs + 1e-12))
+                reliability = entropy / np.log(num_classes)
+        elif proxy == "max_concentration":
+            reliability = 1.0 - float(counts.max() / total)
+            if num_classes > 1:
+                reliability = reliability / (1.0 - 1.0 / num_classes)
+        else:
+            return 1.0
 
     reliability = _clamp_unit(reliability)
     power = max(float(getattr(args, "byot_client_skew_power", 1.0)), 1e-8)
@@ -1054,7 +1085,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
     temperature = args.temperature
     alpha = get_effective_byot_alpha(train_dataloader, args)
     alpha = estimate_client_byot_alpha(net, train_dataloader, device, args, alpha)
-    alpha *= get_client_label_skew_scale(train_dataloader, args)
+    alpha *= get_client_skew_scale(net, train_dataloader, device, args)
     class_alpha = estimate_class_byot_alpha(net, train_dataloader, device, args, alpha)
     branch_objective = getattr(args, "byot_branch_objective", "blend")
     branch_alphas = get_byot_branch_alphas(args, device)
