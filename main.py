@@ -130,6 +130,55 @@ def _gradient_probe_losses(model, x, target, temperature):
         output = out
     return F.cross_entropy(output, target), None
 
+def _average_kd_info_probe(model, dataloader, device, args, max_batches):
+    metrics = {
+        "teacher_entropy": 0.0,
+        "teacher_entropy_norm": 0.0,
+        "teacher_true_label_prob": 0.0,
+        "teacher_non_target_mass": 0.0,
+        "teacher_top2_margin": 0.0,
+        "teacher_confidence": 0.0,
+    }
+    total_count = 0
+    temperature = float(getattr(args, 'temperature', 0.5))
+
+    with torch.no_grad():
+        for batch_idx, (x, target) in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+            x, target = x.to(device), target.to(device).long()
+            out = model(x)
+            if isinstance(out, tuple) and len(out) == 8:
+                output = out[0]
+            elif isinstance(out, tuple):
+                output = out[-1]
+            else:
+                output = out
+
+            prob = F.softmax(output / temperature, dim=1)
+            batch_size = int(target.numel())
+            num_classes = max(int(prob.size(1)), 2)
+            entropy = -(prob * torch.log(prob + 1e-8)).sum(dim=1)
+            true_label_prob = prob.gather(1, target.view(-1, 1)).squeeze(1).clamp(0.0, 1.0)
+            top2 = prob.topk(k=min(2, num_classes), dim=1).values
+            if top2.size(1) == 1:
+                margin = torch.ones_like(top2[:, 0])
+            else:
+                margin = (top2[:, 0] - top2[:, 1]).clamp(0.0, 1.0)
+            confidence = top2[:, 0]
+
+            metrics["teacher_entropy"] += float(entropy.sum().item())
+            metrics["teacher_entropy_norm"] += float((entropy / math.log(num_classes)).sum().item())
+            metrics["teacher_true_label_prob"] += float(true_label_prob.sum().item())
+            metrics["teacher_non_target_mass"] += float((1.0 - true_label_prob).sum().item())
+            metrics["teacher_top2_margin"] += float(margin.sum().item())
+            metrics["teacher_confidence"] += float(confidence.sum().item())
+            total_count += batch_size
+
+    if total_count == 0:
+        return None
+    return {key: value / total_count for key, value in metrics.items()}
+
 def _average_probe_gradient(model, dataloader, device, args, loss_kind, max_batches):
     grads = []
     temperature = float(getattr(args, 'temperature', 0.5))
@@ -241,6 +290,7 @@ def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_av
     alpha = float(getattr(args, 'byot_alpha', 0.0))
     ce_gradients = []
     kd_gradients = []
+    kd_info_sums = {}
     used_weights = []
 
     for idx, client_id in enumerate(nets_this_round.keys()):
@@ -250,6 +300,7 @@ def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_av
         model = nets_this_round[client_id]
         was_training = model.training
         model.eval()
+        kd_info = _average_kd_info_probe(model, dataloader, device, args, max_batches)
         ce_grad = _average_probe_gradient(model, dataloader, device, args, 'ce', max_batches)
         kd_grad = _average_probe_gradient(model, dataloader, device, args, 'kd', max_batches)
         if was_training:
@@ -260,7 +311,11 @@ def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_av
             kd_grad = torch.zeros_like(ce_grad)
         ce_gradients.append(ce_grad)
         kd_gradients.append(kd_grad)
-        used_weights.append(float(fed_avg_freqs[idx]))
+        weight = float(fed_avg_freqs[idx])
+        used_weights.append(weight)
+        if kd_info is not None:
+            for key, value in kd_info.items():
+                kd_info_sums[key] = kd_info_sums.get(key, 0.0) + weight * value
 
     ce_stats = _weighted_gradient_stats(ce_gradients, used_weights)
     kd_stats = _weighted_gradient_stats(kd_gradients, used_weights)
@@ -282,6 +337,26 @@ def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_av
     if cross_stats is not None:
         metrics["gradient_ce_kd_cross"] = cross_stats["cross"]
         metrics["gradient_ce_kd_corr"] = cross_stats["corr"]
+    for key, value in kd_info_sums.items():
+        metrics[f"kd_info_{key}"] = value
+
+    ce_kd_cosine = 0.0
+    ce_kd_distance = 0.0
+    kd_ce_norm_ratio = 0.0
+    weight_total = sum(used_weights)
+    if weight_total > 0:
+        for ce_grad, kd_grad, weight in zip(ce_gradients, kd_gradients, used_weights):
+            weight = weight / weight_total
+            ce_norm = torch.norm(ce_grad)
+            kd_norm = torch.norm(kd_grad)
+            denom = ce_norm * kd_norm + 1e-12
+            ce_kd_cosine += weight * float(torch.sum(ce_grad * kd_grad).item() / denom.item())
+            ce_kd_distance += weight * float(torch.norm(ce_grad - kd_grad).item() / (ce_norm.item() + kd_norm.item() + 1e-12))
+            kd_ce_norm_ratio += weight * float(kd_norm.item() / (ce_norm.item() + 1e-12))
+        metrics["gradient_ce_kd_cosine"] = ce_kd_cosine
+        metrics["gradient_ce_kd_distance"] = ce_kd_distance
+        metrics["gradient_kd_ce_norm_ratio"] = kd_ce_norm_ratio
+
     return metrics
 
 def norm_based_classwise_aggregation(global_model, nets_this_round, clients_this_round, client_data_sizes=None):
@@ -653,6 +728,14 @@ def get_args():
                         choices=['map', 'multiply'],
                         help='How client reliability is applied. map: alpha_min+(alpha_max-alpha_min)*r. '
                              'multiply: fallback_alpha*(alpha_min+(alpha_max-alpha_min)*r), useful for round*client schedules.')
+    parser.add_argument('--byot_client_skew_proxy', default='none',
+                        choices=['none', 'label_entropy', 'max_concentration'],
+                        help='Client-local label-skew proxy used to downscale BYOT alpha/lambda. '
+                             'Computed only from each client local labels and never sent to the server.')
+    parser.add_argument('--byot_client_skew_min_scale', type=float, default=0.0,
+                        help='Minimum skew-penalty scale when client labels are extremely concentrated.')
+    parser.add_argument('--byot_client_skew_power', type=float, default=1.0,
+                        help='Power applied to the client skew reliability before scaling BYOT alpha/lambda.')
     parser.add_argument('--byot_class_proxy', default='none',
                         choices=['none', 'label_count', 'teacher_label_prob',
                                  'teacher_correctness', 'teacher_label_prob_count'],
@@ -909,6 +992,15 @@ def main():
         'gradient_combined_cosine': [],
         'gradient_ce_kd_cross': [],
         'gradient_ce_kd_corr': [],
+        'gradient_ce_kd_cosine': [],
+        'gradient_ce_kd_distance': [],
+        'gradient_kd_ce_norm_ratio': [],
+        'kd_info_teacher_entropy': [],
+        'kd_info_teacher_entropy_norm': [],
+        'kd_info_teacher_true_label_prob': [],
+        'kd_info_teacher_non_target_mass': [],
+        'kd_info_teacher_top2_margin': [],
+        'kd_info_teacher_confidence': [],
         'byot_effective_alpha_mean': [],
         'byot_effective_alpha_min': [],
         'byot_effective_alpha_max': [],
@@ -1043,6 +1135,15 @@ def main():
             'gradient_combined_cosine',
             'gradient_ce_kd_cross',
             'gradient_ce_kd_corr',
+            'gradient_ce_kd_cosine',
+            'gradient_ce_kd_distance',
+            'gradient_kd_ce_norm_ratio',
+            'kd_info_teacher_entropy',
+            'kd_info_teacher_entropy_norm',
+            'kd_info_teacher_true_label_prob',
+            'kd_info_teacher_non_target_mass',
+            'kd_info_teacher_top2_margin',
+            'kd_info_teacher_confidence',
         ]:
             pkl_dict[gradient_key].append(gradient_probe_metrics.get(gradient_key))
 
