@@ -47,6 +47,27 @@ BRANCH_LOGIT_PROBE_KEYS = [
     for metric in BRANCH_LOGIT_PROBE_METRICS
 ]
 
+TRAIN_BRANCH_FREQ_GROUPS = ("low", "mid", "high")
+TRAIN_BRANCH_FREQ_METRICS = (
+    "true_label_prob",
+    "entropy_norm",
+    "confidence",
+    "acc",
+    "teacher_js",
+    "prob_mass_low",
+    "prob_mass_mid",
+    "prob_mass_high",
+    "high_low_mass_ratio",
+    "local_count",
+    "local_ratio",
+)
+TRAIN_BRANCH_FREQ_KEYS = [
+    f"train_branch_freq_{group}_b{branch_idx}_{metric}"
+    for group in TRAIN_BRANCH_FREQ_GROUPS
+    for branch_idx in (1, 2, 3)
+    for metric in ("count", *TRAIN_BRANCH_FREQ_METRICS)
+]
+
 # python main.py --seed 0 --model mobilenet --last_fc --alg fedavg
 
 def compute_client_update_drift(old_w, nets_this_round, fed_avg_freqs, eps=1e-12):
@@ -925,6 +946,8 @@ def get_args():
                         choices=['map', 'multiply'],
                         help='How client reliability is applied. map: alpha_min+(alpha_max-alpha_min)*r. '
                              'multiply: fallback_alpha*(alpha_min+(alpha_max-alpha_min)*r), useful for round*client schedules.')
+    parser.add_argument('--byot_client_reliability_power', type=float, default=1.0,
+                        help='Power applied to the averaged client reliability before mapping/multiplying BYOT alpha/lambda.')
     parser.add_argument('--byot_client_skew_proxy', default='none',
                         choices=['none', 'label_entropy', 'max_concentration', 'prediction_entropy'],
                         help='Client-local label-skew proxy used to downscale BYOT alpha/lambda. '
@@ -956,6 +979,12 @@ def get_args():
     parser.add_argument('--byot_round_lambda_warmup', type=int, default=0,
                         help='Number of communication rounds used to ramp BYOT alpha/lambda from min to max. '
                              'If 0, args.round is used.')
+    parser.add_argument('--byot_server_lambda_adaptive', action='store_true',
+                        help='Scale BYOT alpha/lambda by previous-round server-observed client update drift.')
+    parser.add_argument('--byot_server_lambda_tau', type=float, default=1.0,
+                        help='Strength for server drift scaling: scale=1/(1+tau*relative_drift).')
+    parser.add_argument('--byot_server_lambda_min_scale', type=float, default=0.0,
+                        help='Lower bound for server drift scaling.')
     
     parser.add_argument('--warmup_rounds', type=int, default=0, help='Number of rounds for warmup (Teacher only training)')
     parser.add_argument('--amp', action='store_true', help='Use PyTorch AMP (mixed precision)')
@@ -1015,6 +1044,12 @@ def get_args():
                         help='Number of local samples per selected client saved for branch logit examples.')
     parser.add_argument('--branch_logit_example_topk', type=int, default=5,
                         help='Top-k probabilities saved for teacher and branch logits.')
+    parser.add_argument('--log_train_branch_frequency_stats', action='store_true',
+                        help='Accumulate branch logit statistics during local training by local target-class frequency.')
+    parser.add_argument('--train_branch_freq_low_ratio', type=float, default=0.5,
+                        help='Local target count ratio below this value is treated as low-frequency.')
+    parser.add_argument('--train_branch_freq_high_ratio', type=float, default=1.5,
+                        help='Local target count ratio above this value is treated as high-frequency.')
     
     
     parser.add_argument('--min_threshold', type=float, default=0.8, help='시작 임계값 (Dynamic Threshold용)')
@@ -1211,18 +1246,24 @@ def main():
         'byot_effective_alpha_mean': [],
         'byot_effective_alpha_min': [],
         'byot_effective_alpha_max': [],
+        'byot_server_lambda_scale': [],
         'max': 0, 'avg_10': 0, 'avg_30': 0, 'avg_50': 0
     }
     for branch_logit_key in BRANCH_LOGIT_PROBE_KEYS:
         pkl_dict[branch_logit_key] = []
+    if getattr(args, "log_train_branch_frequency_stats", False):
+        for train_branch_key in TRAIN_BRANCH_FREQ_KEYS:
+            pkl_dict[train_branch_key] = []
     last_10 = []
     lr = args.lr
 
     # --- 4. 메인 학습 루프 ---
     m = max(int(args.sample_fraction * args.n_clients), 1) # 참여 클라이언트 수
+    server_lambda_scale = 1.0
 
     for round in range(args.round):
         args.current_round = round
+        args.byot_server_lambda_scale = server_lambda_scale
         logger.info(f'round:{round}')
         t0 = time.time()
 
@@ -1322,6 +1363,11 @@ def main():
         pkl_dict['byot_effective_alpha_mean'].append(avg_byot_alpha_mean)
         pkl_dict['byot_effective_alpha_min'].append(avg_byot_alpha_min)
         pkl_dict['byot_effective_alpha_max'].append(avg_byot_alpha_max)
+        pkl_dict['byot_server_lambda_scale'].append(server_lambda_scale)
+        if getattr(args, "log_train_branch_frequency_stats", False):
+            train_branch_stats = getattr(args, "_last_train_branch_frequency_stats", {}) or {}
+            for train_branch_key in TRAIN_BRANCH_FREQ_KEYS:
+                pkl_dict.setdefault(train_branch_key, []).append(train_branch_stats.get(train_branch_key))
         for gradient_key in [
             'gradient_probe_clients',
             'gradient_ce_divergence',
@@ -1360,7 +1406,7 @@ def main():
         # 모델 집계 (Aggregation)
         drift_metrics = {}
         should_log_drift = (
-            getattr(args, 'log_client_drift', False)
+            (getattr(args, 'log_client_drift', False) or getattr(args, 'byot_server_lambda_adaptive', False))
             and getattr(args, 'drift_log_interval', 1) > 0
             and round % getattr(args, 'drift_log_interval', 1) == 0
         )
@@ -1385,6 +1431,15 @@ def main():
                 f"norm={drift_metrics['client_update_norm']:.6f}, "
                 f"cos={drift_metrics['client_update_cosine']:.6f}"
             )
+            if getattr(args, 'byot_server_lambda_adaptive', False):
+                tau = max(float(getattr(args, 'byot_server_lambda_tau', 1.0)), 0.0)
+                min_scale = max(0.0, min(1.0, float(getattr(args, 'byot_server_lambda_min_scale', 0.0))))
+                rel_drift = max(float(drift_metrics.get('client_relative_drift', 0.0) or 0.0), 0.0)
+                server_lambda_scale = max(min_scale, 1.0 / (1.0 + tau * rel_drift))
+                logger.info(
+                    "Server adaptive lambda scale for next round: "
+                    f"scale={server_lambda_scale:.6f}, tau={tau:.4f}, rel_drift={rel_drift:.6f}"
+                )
 
         if getattr(args, 'use_norm_agg', False):
             global_w = norm_based_classwise_aggregation(global_model, nets_this_round, fed_avg_freqs)

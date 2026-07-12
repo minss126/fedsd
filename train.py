@@ -263,6 +263,8 @@ def get_effective_byot_alpha(train_dataloader, args):
         entropy_scale = min_scale + (1.0 - min_scale) * (entropy_norm ** power)
         alpha *= entropy_scale
 
+    alpha *= float(getattr(args, "byot_server_lambda_scale", 1.0))
+
     return alpha
 
 def get_client_skew_scale(net, train_dataloader, device, args):
@@ -408,6 +410,163 @@ def reduce_active_branch_loss(loss, active_branch_indices, args):
     if getattr(args, "byot_branch_loss_reduction", "sum") == "mean":
         return loss / max(1, len(active_branch_indices))
     return loss
+
+TRAIN_BRANCH_FREQ_GROUPS = ("low", "mid", "high")
+TRAIN_BRANCH_FREQ_METRICS = (
+    "true_label_prob",
+    "entropy_norm",
+    "confidence",
+    "acc",
+    "teacher_js",
+    "prob_mass_low",
+    "prob_mass_mid",
+    "prob_mass_high",
+    "high_low_mass_ratio",
+    "local_count",
+    "local_ratio",
+)
+
+def _dataset_targets_array(dataset):
+    if hasattr(dataset, "targets"):
+        targets = dataset.targets
+        if torch.is_tensor(targets):
+            targets = targets.detach().cpu().numpy()
+        return np.asarray(targets, dtype=np.int64)
+    if hasattr(dataset, "target"):
+        targets = dataset.target
+        if torch.is_tensor(targets):
+            targets = targets.detach().cpu().numpy()
+        return np.asarray(targets, dtype=np.int64)
+    if hasattr(dataset, "samples"):
+        return np.asarray([sample[1] for sample in dataset.samples], dtype=np.int64)
+    if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+        base_targets = _dataset_targets_array(dataset.dataset)
+        return base_targets[np.asarray(dataset.indices, dtype=np.int64)]
+    return np.asarray([int(dataset[idx][1]) for idx in range(len(dataset))], dtype=np.int64)
+
+def get_local_class_counts(train_dataloader, args, device):
+    if train_dataloader is None or getattr(train_dataloader, "dataset", None) is None:
+        return None, None, None
+    num_classes = int(getattr(args, "num_classes", 0) or 0)
+    if num_classes <= 0:
+        return None, None, None
+    targets = _dataset_targets_array(train_dataloader.dataset)
+    if targets.size == 0:
+        return None, None, None
+    counts_np = np.bincount(targets, minlength=num_classes).astype(np.float32)
+    counts = torch.tensor(counts_np, device=device)
+    total = float(counts.sum().detach().item())
+    expected = total / max(float(num_classes), 1.0)
+    return counts, total, expected
+
+def init_train_branch_freq_stats():
+    stats = {}
+    for group in TRAIN_BRANCH_FREQ_GROUPS:
+        for branch_idx in (1, 2, 3):
+            prefix = f"train_branch_freq_{group}_b{branch_idx}"
+            stats[f"{prefix}_count"] = 0.0
+            for metric in TRAIN_BRANCH_FREQ_METRICS:
+                stats[f"{prefix}_{metric}"] = 0.0
+    return stats
+
+def update_train_branch_freq_stats(
+    stats, branch_logits, teacher_prob, target, class_counts, expected_count, args
+):
+    if stats is None or class_counts is None or expected_count is None or expected_count <= 0.0:
+        return
+    low_ratio = float(getattr(args, "train_branch_freq_low_ratio", 0.5))
+    high_ratio = float(getattr(args, "train_branch_freq_high_ratio", 1.5))
+    temperature = float(getattr(args, "temperature", 0.5))
+    num_classes = max(int(teacher_prob.size(1)), 2)
+    log_c = math.log(num_classes)
+
+    with torch.no_grad():
+        target_counts = class_counts[target].float()
+        local_ratio = target_counts / max(float(expected_count), 1e-12)
+        group_masks = {
+            "low": local_ratio < low_ratio,
+            "mid": (local_ratio >= low_ratio) & (local_ratio <= high_ratio),
+            "high": local_ratio > high_ratio,
+        }
+        class_ratio = class_counts.float() / max(float(expected_count), 1e-12)
+        class_group_masks = {
+            "low": class_ratio < low_ratio,
+            "mid": (class_ratio >= low_ratio) & (class_ratio <= high_ratio),
+            "high": class_ratio > high_ratio,
+        }
+
+        for branch_idx, logits in enumerate(branch_logits, start=1):
+            branch_prob = F.softmax(logits / temperature, dim=1)
+            entropy_norm = -(branch_prob * torch.log(branch_prob + 1e-8)).sum(dim=1) / log_c
+            true_label_prob = branch_prob.gather(1, target.view(-1, 1)).squeeze(1).clamp(0.0, 1.0)
+            confidence, pred = branch_prob.max(dim=1)
+            mix = 0.5 * (teacher_prob + branch_prob)
+            kl_teacher = (
+                teacher_prob * (torch.log(teacher_prob + 1e-8) - torch.log(mix + 1e-8))
+            ).sum(dim=1)
+            kl_branch = (
+                branch_prob * (torch.log(branch_prob + 1e-8) - torch.log(mix + 1e-8))
+            ).sum(dim=1)
+            teacher_js = 0.5 * (kl_teacher + kl_branch) / log_c
+            acc = (pred == target).float()
+            prob_mass = {}
+            for group, class_mask in class_group_masks.items():
+                if class_mask.any():
+                    prob_mass[group] = branch_prob[:, class_mask].sum(dim=1)
+                else:
+                    prob_mass[group] = torch.zeros_like(true_label_prob)
+            high_low_mass_ratio = prob_mass["high"] / (prob_mass["low"] + 1e-8)
+
+            values = {
+                "true_label_prob": true_label_prob,
+                "entropy_norm": entropy_norm,
+                "confidence": confidence,
+                "acc": acc,
+                "teacher_js": teacher_js,
+                "prob_mass_low": prob_mass["low"],
+                "prob_mass_mid": prob_mass["mid"],
+                "prob_mass_high": prob_mass["high"],
+                "high_low_mass_ratio": high_low_mass_ratio,
+                "local_count": target_counts,
+                "local_ratio": local_ratio,
+            }
+            for group, mask in group_masks.items():
+                if not mask.any():
+                    continue
+                prefix = f"train_branch_freq_{group}_b{branch_idx}"
+                count = float(mask.float().sum().detach().item())
+                stats[f"{prefix}_count"] += count
+                for metric, tensor in values.items():
+                    stats[f"{prefix}_{metric}"] += float(tensor[mask].sum().detach().item())
+
+def finalize_train_branch_freq_stats(stats):
+    if not stats:
+        return {}
+    finalized = {}
+    for group in TRAIN_BRANCH_FREQ_GROUPS:
+        for branch_idx in (1, 2, 3):
+            prefix = f"train_branch_freq_{group}_b{branch_idx}"
+            count = float(stats.get(f"{prefix}_count", 0.0))
+            finalized[f"{prefix}_count"] = count
+            for metric in TRAIN_BRANCH_FREQ_METRICS:
+                key = f"{prefix}_{metric}"
+                finalized[key] = (stats.get(key, 0.0) / count) if count > 0 else None
+    return finalized
+
+def merge_train_branch_freq_stats(total, update):
+    if not update:
+        return
+    for group in TRAIN_BRANCH_FREQ_GROUPS:
+        for branch_idx in (1, 2, 3):
+            prefix = f"train_branch_freq_{group}_b{branch_idx}"
+            count_key = f"{prefix}_count"
+            count = float(update.get(count_key, 0.0) or 0.0)
+            total[count_key] = total.get(count_key, 0.0) + count
+            for metric in TRAIN_BRANCH_FREQ_METRICS:
+                key = f"{prefix}_{metric}"
+                value = update.get(key)
+                if value is not None:
+                    total[key] = total.get(key, 0.0) + float(value) * count
 
 def get_batch_byot_alpha(alpha, output, branch_outputs, target, args):
     proxy = getattr(args, "byot_alpha_proxy", "none")
@@ -587,6 +746,8 @@ def estimate_client_byot_alpha(net, train_dataloader, device, args, fallback_alp
         return fallback_alpha
 
     reliability = _clamp_unit(total_score / total_count)
+    reliability_power = max(float(getattr(args, "byot_client_reliability_power", 1.0)), 1e-8)
+    reliability = reliability ** reliability_power
     client_alpha = alpha_min + (alpha_max - alpha_min) * reliability
     if getattr(args, "byot_client_alpha_mode", "map") == "multiply":
         return fallback_alpha * client_alpha
@@ -1106,6 +1267,10 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
     total_alpha_batches = 0
     min_effective_alpha = None
     max_effective_alpha = None
+    branch_freq_stats = init_train_branch_freq_stats() if getattr(args, "log_train_branch_frequency_stats", False) else None
+    class_counts, _, expected_class_count = get_local_class_counts(
+        train_dataloader, args, device
+    ) if branch_freq_stats is not None else (None, None, None)
     net.train()
     
     for epoch in range(args.epochs):
@@ -1247,10 +1412,13 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
         min_effective_alpha = alpha
     if max_effective_alpha is None:
         max_effective_alpha = alpha
-    return (
+    result = (
         total_loss / denom, 1.0, 0.0, 1.0, avg_correct_conf, 0, 0.0, avg_entropy,
         avg_effective_alpha, min_effective_alpha, max_effective_alpha,
     )
+    if branch_freq_stats is not None:
+        return result + (finalize_train_branch_freq_stats(branch_freq_stats),)
+    return result
 
 def fedbyot_lc(net, train_dataloader, optimizer, device, args):
     import torch
@@ -1581,6 +1749,17 @@ def fedbyot_selective_ce_fallback(net, global_model, prev_net, train_dataloader,
                     if correct_mask.any():
                         total_correct_conf += teacher_conf[correct_mask].mean().item()
                         valid_conf_batches += 1
+
+                if branch_freq_stats is not None:
+                    update_train_branch_freq_stats(
+                        branch_freq_stats,
+                        [m1, m2, m3],
+                        teacher_prob,
+                        target,
+                        class_counts,
+                        expected_class_count,
+                        args,
+                    )
 
                 if proxy == "none":
                     reliability = (teacher_conf >= threshold).float()
@@ -3826,6 +4005,7 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     total_correct_conf = 0.0
     total_zero_kd = 0.0 
     total_kd_std = 0.0  
+    total_branch_freq_stats = init_train_branch_freq_stats() if getattr(args, "log_train_branch_frequency_stats", False) else {}
     
     # [NEW] 시간 및 연산 효율 측정을 위한 누적 변수
     total_time = 0.0
@@ -3949,13 +4129,20 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
             
         elif args.alg == 'fedbyot':
             fedbyot_result = fedbyot(net, global_model, prev_net, dataloaders[net_id], optimizer, device, args)
-            if len(fedbyot_result) == 11:
+            branch_freq_stats = None
+            if len(fedbyot_result) == 12:
+                (
+                    loss, ratio, rfd, feat_ratio, correct_conf, zero_kd_classes, kd_std, entropy,
+                    byot_alpha_mean, byot_alpha_min, byot_alpha_max, branch_freq_stats,
+                ) = fedbyot_result
+            elif len(fedbyot_result) == 11:
                 (
                     loss, ratio, rfd, feat_ratio, correct_conf, zero_kd_classes, kd_std, entropy,
                     byot_alpha_mean, byot_alpha_min, byot_alpha_max,
                 ) = fedbyot_result
             else:
                 loss, ratio, rfd, feat_ratio, correct_conf, zero_kd_classes, kd_std, entropy = fedbyot_result
+            merge_train_branch_freq_stats(total_branch_freq_stats, branch_freq_stats)
             wall_clock_time = time.time() - start_time
             
         elif args.alg == 'fedbyot_logit_adj':
@@ -4019,6 +4206,7 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     avg_byot_alpha_min = total_byot_alpha_min / num_clients
     avg_byot_alpha_max = total_byot_alpha_max / num_clients
     avg_entropy = total_entropy / num_clients
+    args._last_train_branch_frequency_stats = finalize_train_branch_freq_stats(total_branch_freq_stats)
     
     # [NEW] 시간 및 연산 효율 평균
     avg_time = total_time / num_clients
