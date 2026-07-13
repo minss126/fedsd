@@ -17,7 +17,8 @@ cd "$REPO_ROOT"
 #
 # Logged per round in the pkl:
 #   train_branch_freq_{low,mid,high}_b{1,2,3}_{count,true_label_prob,
-#     entropy_norm,confidence,acc,teacher_js,local_count,local_ratio}
+#     entropy_norm,confidence,acc,teacher_js,prob_mass_low,prob_mass_mid,
+#     prob_mass_high,high_low_mass_ratio,local_count,local_ratio}
 
 GPUS=(${GPUS_OVERRIDE:-0 1})
 NUM_GPUS=${#GPUS[@]}

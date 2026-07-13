@@ -1508,6 +1508,16 @@ def main():
                 metrics[f"drift/{drift_key}"] = drift_value
             for gradient_key, gradient_value in gradient_probe_metrics.items():
                 metrics[f"gradient_probe/{gradient_key}"] = gradient_value
+            if getattr(args, "log_train_branch_frequency_stats", False):
+                for train_branch_key in TRAIN_BRANCH_FREQ_KEYS:
+                    train_branch_values = pkl_dict.get(train_branch_key)
+                    if train_branch_values:
+                        train_branch_value = train_branch_values[-1]
+                        if train_branch_value is not None:
+                            metrics[
+                                "train_branch_freq/"
+                                + train_branch_key.removeprefix("train_branch_freq_")
+                            ] = train_branch_value
 
             wandb.log(metrics, step=round)
 

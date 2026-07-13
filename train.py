@@ -442,6 +442,9 @@ def _dataset_targets_array(dataset):
     if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
         base_targets = _dataset_targets_array(dataset.dataset)
         return base_targets[np.asarray(dataset.indices, dtype=np.int64)]
+    if hasattr(dataset, "dataset") and hasattr(dataset, "dataidxs"):
+        base_targets = _dataset_targets_array(dataset.dataset)
+        return base_targets[np.asarray(dataset.dataidxs, dtype=np.int64)]
     return np.asarray([int(dataset[idx][1]) for idx in range(len(dataset))], dtype=np.int64)
 
 def get_local_class_counts(train_dataloader, args, device):
@@ -1311,6 +1314,17 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                     if correct_mask.any():
                         total_correct_conf += teacher_conf[correct_mask].mean().item()
                         valid_conf_batches += 1
+
+                if branch_freq_stats is not None:
+                    update_train_branch_freq_stats(
+                        branch_freq_stats,
+                        [m1, m2, m3],
+                        teacher_prob,
+                        target,
+                        class_counts,
+                        expected_class_count,
+                        args,
+                    )
                 
                 # 4. Feature Imitation
                 feat_branch_losses = [

@@ -78,7 +78,7 @@ LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_adaptive_lambda_extended_methods}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 ENVS=(${ENVS_OVERRIDE:-iid beta_0.5 beta_0.3 beta_0.1})
-METHODS=(${METHODS_OVERRIDE:-label_prob_only confidence_only margin_only correctness_only entropy_certainty_only server_drift_soft server_drift_soft_floor})
+METHODS=(${METHODS_OVERRIDE:-label_prob_only confidence_only margin_only correctness_only entropy_certainty_only label_prob_entropy label_prob_predskew})
 
 WANDB_FLAGS=""
 if [ "${USE_WANDB:-1}" = "1" ]; then
@@ -102,6 +102,9 @@ env_flags() {
             ;;
         beta_0.5)
             echo "--partition noniid --beta 0.5"
+            ;;
+        noniid_grouping)
+            echo "--partition noniid_grouping --partition_groups ${PARTITION_GROUPS:-8}"
             ;;
         *)
             echo "Unknown env: ${env_name}" >&2
@@ -127,6 +130,12 @@ method_flags() {
             ;;
         entropy_certainty_only)
             echo "--byot_client_proxy teacher_entropy --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0 --alpha_min_scale 0.0"
+            ;;
+        label_prob_entropy)
+            echo "--byot_client_proxy teacher_label_prob_entropy --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0 --alpha_min_scale 0.0"
+            ;;
+        label_prob_predskew)
+            echo "--byot_client_proxy teacher_label_prob --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0 --alpha_min_scale 0.0 --byot_client_skew_proxy prediction_entropy --byot_client_skew_min_scale 0.00 --byot_client_skew_power 2.0"
             ;;
         server_drift_soft)
             echo "--byot_server_lambda_adaptive --byot_server_lambda_tau ${SERVER_TAU_SOFT} --byot_server_lambda_min_scale 0.0 --log_client_drift --drift_log_interval 1"
