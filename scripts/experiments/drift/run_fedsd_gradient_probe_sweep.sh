@@ -8,7 +8,7 @@ cd "$REPO_ROOT"
 # This probes CE, KD, and CE + alpha*KD gradient dissimilarity at the
 # round-start global model, before local training.
 #
-# Results are isolated under logs_probe/ to avoid mixing with previous runs.
+# Results are isolated under logs/drift/logs_probe/ to avoid mixing with previous runs.
 #
 # wandb is enabled by default for experiment tracking.
 # Disable if needed:
@@ -18,7 +18,7 @@ GPUS=(0 1 2 3)
 NUM_GPUS=${#GPUS[@]}
 JOB_COUNT=0
 
-LOG_ROOT="${LOG_ROOT:-logs_probe}"
+LOG_ROOT="${LOG_ROOT:-logs/drift/logs_probe}"
 BASE_ALGO_NAME="fedprox"
 BASE_ALGO_FLAGS="--use_fedprox --mu 0.01"
 

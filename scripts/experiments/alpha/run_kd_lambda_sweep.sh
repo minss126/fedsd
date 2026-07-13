@@ -20,7 +20,7 @@ cd "$REPO_ROOT"
 #   lambda_kd: 0, 0.01, 0.1, 0.3, 1, 3, 10
 #
 # beta_0.1 kd_only results already exist in:
-#   logs_byot_beta_kd_only_alpha/beta_0.1/fedavg/
+#   logs/alpha/logs_byot_beta_kd_only_alpha/beta_0.1/fedavg/
 # Set INCLUDE_BETA01=1 if you want to rerun beta_0.1 in this log root too.
 #
 # Usage:
@@ -53,7 +53,7 @@ LR="${LR:-0.1}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
-LOG_ROOT="${LOG_ROOT:-logs_kd_lambda_sweep}"
+LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_kd_lambda_sweep}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 if [ -n "${ENVS_OVERRIDE:-}" ]; then

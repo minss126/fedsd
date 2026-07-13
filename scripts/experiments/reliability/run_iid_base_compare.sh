@@ -30,7 +30,7 @@ BYOT_BETA_VAL="${BYOT_BETA_VAL:-0.01}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
 FEDPROX_MU="${FEDPROX_MU:-0.01}"
 MOON_MU="${MOON_MU:-1.0}"
-LOG_ROOT="${LOG_ROOT:-logs_iid_base_compare}"
+LOG_ROOT="${LOG_ROOT:-logs/reliability/logs_iid_base_compare}"
 
 BASE_ALGOS=(${BASE_ALGOS:-fedprox moon})
 FIXED_ALPHAS=(${FIXED_ALPHAS:-0.50:0p50 0.70:0p70 1.00:1p00})

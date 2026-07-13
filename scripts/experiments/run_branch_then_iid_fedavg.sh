@@ -18,11 +18,11 @@ cd "$REPO_ROOT"
 echo "========== Step 1/2: Branch-wise alpha sweep: beta_0.1 beta_0.3 beta_0.5 =========="
 ENVS_OVERRIDE="beta_0.1 beta_0.3 beta_0.5" \
 BASE_ALGOS="${BASE_ALGOS_BRANCH:-fedavg}" \
-LOG_ROOT="${BRANCH_LOG_ROOT:-logs_branch_alpha_sweep}" \
+LOG_ROOT="${BRANCH_LOG_ROOT:-logs/branch/logs_branch_alpha_sweep}" \
 bash scripts/experiments/branch/run_branch_alpha_sweep.sh
 
 echo "========== Step 2/2: IID FedAvg compare =========="
-LOG_ROOT="${IID_LOG_ROOT:-logs_iid_fedavg_compare}" \
+LOG_ROOT="${IID_LOG_ROOT:-logs/reliability/logs_iid_fedavg_compare}" \
 bash scripts/experiments/reliability/run_iid_fedavg_compare.sh
 
 echo "Branch-wise then IID FedAvg queue complete."

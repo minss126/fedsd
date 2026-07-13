@@ -47,7 +47,7 @@ NUM_WORKERS="${NUM_WORKERS:-2}"
 CIFAR_LR="${CIFAR_LR:-0.1}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
-LOG_ROOT="${LOG_ROOT:-logs_fixed_single_branch_lambda_sweep}"
+LOG_ROOT="${LOG_ROOT:-logs/branch/logs_fixed_single_branch_lambda_sweep}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 SETTING="${SETTING_OVERRIDE:-cifar100_resnet18}"

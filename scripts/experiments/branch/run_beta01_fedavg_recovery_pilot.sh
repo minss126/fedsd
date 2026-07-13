@@ -32,7 +32,7 @@ fi
 
 SEED="${SEED:-0}"
 BYOT_ALPHA_VAL="${BYOT_ALPHA_VAL:-1.0}"
-LOG_ROOT="${LOG_ROOT:-logs_beta01_fedavg_recovery_pilot}"
+LOG_ROOT="${LOG_ROOT:-logs/branch/logs_beta01_fedavg_recovery_pilot}"
 
 # Format:
 #   method_name:active_branches:temperature:byot_feature_beta

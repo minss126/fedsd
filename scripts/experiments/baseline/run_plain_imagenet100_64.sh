@@ -45,7 +45,7 @@ BATCH_SIZE="${BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 ROUNDS="${IMAGENET100_ROUNDS:-300}"
 LR="${IMAGENET100_LR:-0.01}"
-LOG_ROOT="${LOG_ROOT:-logs_plain_imagenet100_64}"
+LOG_ROOT="${LOG_ROOT:-logs/baseline/logs_plain_imagenet100_64}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 DATA_DIR="${IMAGENET100_DATADIR:-/data/imagenet100_resized_64_png}"
 

@@ -111,9 +111,9 @@ def discover_entries():
     for partition_label, tuned_folder, orig_folder in PARTITION_MAP:
         for alg in ALGS:
             for method in METHODS:
-                tuned_json = os.path.join("logs_tuning", tuned_folder, alg, f"{method}.json")
+                tuned_json = os.path.join("logs_prev/logs_tuning", tuned_folder, alg, f"{method}.json")
                 orig_json = os.path.join("logs", orig_folder, alg, f"{method}.json")
-                source, path = first_existing(("logs_tuning", tuned_json), ("logs", orig_json))
+                source, path = first_existing(("logs_prev/logs_tuning", tuned_json), ("logs", orig_json))
                 if path is None:
                     missing.append(
                         {
@@ -180,14 +180,14 @@ def write_markdown(path, entries, missing, fairness_diffs, method_diffs, source_
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write("# Plot Config Comparison\n\n")
-        f.write("This report follows the same path priority as plot.py: logs_tuning first, logs second.\n\n")
+        f.write("This report follows the same path priority as plot.py: logs_prev/logs_tuning first, logs second.\n\n")
 
         f.write("## Summary\n\n")
         f.write(f"- Loaded JSON files: {len(entries)}\n")
         f.write(f"- Missing JSON files: {len(missing)}\n")
         f.write(f"- Fairness diff groups: {sum(len(v) for v in fairness_diffs.values())}\n")
         f.write(f"- Method diff groups: {sum(len(v) for v in method_diffs.values())}\n")
-        f.write(f"- Groups mixing logs_tuning/logs sources: {len(source_mix)}\n\n")
+        f.write(f"- Groups mixing logs_prev/logs_tuning/logs sources: {len(source_mix)}\n\n")
 
         if source_mix:
             f.write("## Source Mixing\n\n")

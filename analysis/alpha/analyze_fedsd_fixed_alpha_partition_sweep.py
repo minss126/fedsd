@@ -149,7 +149,7 @@ def write_report(path, rows, best_rows):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root-dir", default="logs_tuning")
+    parser.add_argument("--root-dir", default="logs_prev/logs_tuning")
     parser.add_argument("--base-algo", default="fedprox")
     parser.add_argument("--out-dir", default="results_analysis/fedsd_fixed_alpha_partition_sweep")
     args = parser.parse_args()

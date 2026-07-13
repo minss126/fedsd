@@ -53,7 +53,7 @@ LR="${LR:-0.1}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
-LOG_ROOT="${LOG_ROOT:-logs_round_lambda_adaptive}"
+LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_round_lambda_adaptive}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 ENVS=(${ENVS_OVERRIDE:-iid beta_0.5 beta_0.3 beta_0.1})

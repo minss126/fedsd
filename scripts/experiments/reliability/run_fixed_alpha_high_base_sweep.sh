@@ -38,7 +38,7 @@ BETA_VAL="${BYOT_BETA_VAL:-0.01}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
 FEDPROX_MU="${FEDPROX_MU:-0.01}"
 MOON_MU="${MOON_MU:-1.0}"
-LOG_ROOT="${LOG_ROOT:-logs_fixed_alpha_high_base}"
+LOG_ROOT="${LOG_ROOT:-logs/reliability/logs_fixed_alpha_high_base}"
 
 BASE_ALGOS=(${BASE_ALGOS:-fedprox moon})
 ENVS=(${ENVS_OVERRIDE:-beta_0.1 beta_0.3 beta_0.5})

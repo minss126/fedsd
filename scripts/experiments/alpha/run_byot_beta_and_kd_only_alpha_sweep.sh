@@ -11,7 +11,7 @@ cd "$REPO_ROOT"
 # Sweep B: remove branch CE and vary the unrestricted branch KD coefficient.
 #
 # Existing reference shared by both sweeps:
-#   logs_fixed_alpha_high/beta_0.1/fedavg/fixed_alpha1p00.log
+#   logs/reliability/logs_fixed_alpha_high/beta_0.1/fedavg/fixed_alpha1p00.log
 #   alpha=1.0, BYOT feature beta=0.01, full branches, sum reduction.
 #
 # We omit the duplicate reference run and execute 12 new jobs over four
@@ -35,7 +35,7 @@ SEED="${SEED:-0}"
 ROUNDS="${ROUNDS:-500}"
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-5}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
-LOG_ROOT="${LOG_ROOT:-logs_byot_beta_kd_only_alpha}"
+LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_byot_beta_kd_only_alpha}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 WANDB_FLAGS=""
@@ -106,7 +106,7 @@ run_queue() {
 echo "========== BYOT Feature-Beta and KD-Only Alpha Sweep =========="
 echo "gpus=${GPUS[*]}, rounds=${ROUNDS}, local_epochs=${LOCAL_EPOCHS}, seed=${SEED}"
 echo "partition_beta=0.1, temperature=${TEMP_VAL}, log_root=${LOG_ROOT}"
-echo "reference: alpha=1.0, feature_beta=0.01 from logs_fixed_alpha_high"
+echo "reference: alpha=1.0, feature_beta=0.01 from logs/reliability/logs_fixed_alpha_high"
 
 run_queue "${GPUS[0]}" \
     "feature_beta0p000|blend|1.0|0.0" \

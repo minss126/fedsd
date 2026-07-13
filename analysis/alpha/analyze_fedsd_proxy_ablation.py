@@ -121,7 +121,7 @@ def write_report(path, summaries):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log-dir", default="logs_tuning/beta_0.3/fedprox")
+    parser.add_argument("--log-dir", default="logs_prev/logs_tuning/beta_0.3/fedprox")
     parser.add_argument("--out-dir", default="results_analysis/fedsd_proxy_ablation")
     args = parser.parse_args()
 

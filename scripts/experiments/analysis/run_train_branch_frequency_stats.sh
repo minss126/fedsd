@@ -44,7 +44,7 @@ TEMP_VAL="${TEMP_VAL:-0.5}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
 LOW_RATIO="${LOW_RATIO:-0.5}"
 HIGH_RATIO="${HIGH_RATIO:-1.5}"
-LOG_ROOT="${LOG_ROOT:-logs_train_branch_frequency_stats}"
+LOG_ROOT="${LOG_ROOT:-logs/analysis/logs_train_branch_frequency_stats}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 ALPHAS=(${ALPHAS_OVERRIDE:-0.00 1.00})

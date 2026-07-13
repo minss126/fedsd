@@ -47,7 +47,7 @@ def parse_log_file(filepath):
 def analyze_and_plot():
     data = []
     
-    # 환경 매핑: (그래프 표시명, logs_tuning 폴더명, logs 폴더명)
+    # 환경 매핑: (그래프 표시명, logs_prev/logs_tuning 폴더명, logs 폴더명)
     partition_map = [
         ('IID', 'iid', 'iid'),
         ('Beta 0.3', 'beta_0.3', 'beta_0.3'),
@@ -62,13 +62,13 @@ def analyze_and_plot():
     for disp_partition, tuned_folder, orig_folder in partition_map:
         for alg in algs:
             for method in methods:
-                # logs_tuning 폴더와 logs 폴더의 각각 다른 폴더명 반영
-                tuned_log_path = os.path.join('logs_tuning', tuned_folder, alg, f"{method}.log")
+                # logs_prev/logs_tuning 폴더와 logs 폴더의 각각 다른 폴더명 반영
+                tuned_log_path = os.path.join('logs_prev/logs_tuning', tuned_folder, alg, f"{method}.log")
                 orig_log_path = os.path.join('logs', orig_folder, alg, f"{method}.log")
                 
                 parsed = None
                 
-                # 1순위: logs_tuning 폴더의 결과
+                # 1순위: logs_prev/logs_tuning 폴더의 결과
                 if os.path.exists(tuned_log_path):
                     parsed = parse_log_file(tuned_log_path)
                     if parsed:

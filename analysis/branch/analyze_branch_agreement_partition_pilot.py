@@ -126,7 +126,7 @@ def write_report(path, rows, deltas):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root-dir", default="logs_tuning")
+    parser.add_argument("--root-dir", default="logs_prev/logs_tuning")
     parser.add_argument("--base-algo", default="fedprox")
     parser.add_argument("--out-dir", default="results_analysis/branch_agreement_partition_pilot")
     args = parser.parse_args()

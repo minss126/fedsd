@@ -46,7 +46,7 @@ run_job() {
     local method_name="fedsd_alpha${alpha_tag}_partition_sweep"
     local gpu_idx=$(( JOB_COUNT % NUM_GPUS ))
     local gpu_id=${GPUS[$gpu_idx]}
-    local log_dir="logs_tuning/${env_name}/${BASE_ALGO_NAME}"
+    local log_dir="logs_prev/logs_tuning/${env_name}/${BASE_ALGO_NAME}"
     mkdir -p "$log_dir"
 
     echo "[GPU ${gpu_id}] 시작: ${env_name} | ${BASE_ALGO_NAME} | ${method_name} | alpha=${alpha_val}"
@@ -55,7 +55,7 @@ run_job() {
         --dataset cifar100 --n_clients 100 --sample_fraction 0.1 \
         --epochs 5 --lr 0.1 --batch_size 64 --round 500 --seed "${SEED}" \
         --device "cuda:${gpu_id}" \
-        --logdir "logs_tuning" \
+        --logdir "logs_prev/logs_tuning" \
         --log_file_name "${env_name}/${BASE_ALGO_NAME}/${method_name}" \
         --model resnet18_byot --alg fedbyot \
         --kd_conf_threshold 0.0 \

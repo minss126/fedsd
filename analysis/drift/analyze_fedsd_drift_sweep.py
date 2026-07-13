@@ -247,7 +247,7 @@ def write_report(path, summary_rows, missing):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root-dir", default="logs_drift")
+    parser.add_argument("--root-dir", default="logs/drift/logs_drift")
     parser.add_argument("--base-algo", default="fedprox")
     parser.add_argument("--out-dir", default="results_analysis/fedsd_drift_sweep")
     parser.add_argument("--method-suffix", default="drift",

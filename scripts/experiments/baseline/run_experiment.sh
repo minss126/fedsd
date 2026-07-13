@@ -29,8 +29,8 @@ run_job() {
     local gpu_idx=$(( JOB_COUNT % NUM_GPUS ))
     local gpu_id=${GPUS[$gpu_idx]}
 
-    # 폴더 구조: logs_tuning/환경/알고리즘
-    local log_dir="logs_tuning/${env_name}/${algo_name}"
+    # 폴더 구조: logs_prev/logs_tuning/환경/알고리즘
+    local log_dir="logs_prev/logs_tuning/${env_name}/${algo_name}"
     mkdir -p "$log_dir"
 
     echo "[GPU ${gpu_id}] 시작: 환경=${env_name} | 알고리즘=${algo_name} | 기법=${method_name}"
@@ -39,7 +39,7 @@ run_job() {
         --dataset cifar100 --n_clients 100 --sample_fraction 0.1 \
         --epochs 5 --lr 0.1 --batch_size 64 --round 500 --seed 0 \
         --device "cuda:${gpu_id}" \
-        --logdir "logs_tuning" \
+        --logdir "logs_prev/logs_tuning" \
         --log_file_name "${env_name}/${algo_name}/${method_name}" \
         $env_flags $method_flags $algo_flags \
         > "${log_dir}/${method_name}_terminal.log" 2>&1 &

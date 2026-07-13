@@ -45,7 +45,7 @@ FEATURE_BETA="${FEATURE_BETA:-0.01}"
 LAMBDA_MAX="${LAMBDA_MAX:-3.00}"
 WARMUP="${WARMUP:-250}"
 SKEW_MIN_SCALE="${SKEW_MIN_SCALE:-0.00}"
-LOG_ROOT="${LOG_ROOT:-logs_client_skew_power_lambda_sweep}"
+LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_client_skew_power_lambda_sweep}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 ENVS=(${ENVS_OVERRIDE:-iid beta_0.5 beta_0.3 beta_0.1})

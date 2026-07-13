@@ -41,7 +41,7 @@ fi
 SEED="${SEED:-0}"
 BETA_VAL="${BYOT_BETA_VAL:-0.01}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
-LOG_ROOT="${LOG_ROOT:-logs_fixed_alpha_high}"
+LOG_ROOT="${LOG_ROOT:-logs/reliability/logs_fixed_alpha_high}"
 
 ENVS=(${ENVS_OVERRIDE:-beta_0.1 beta_0.3 beta_0.5})
 ALPHAS=(${ALPHAS:-0.50:0p50 0.70:0p70 1.00:1p00})

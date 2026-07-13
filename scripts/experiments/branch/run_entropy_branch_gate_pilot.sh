@@ -34,7 +34,7 @@ SEED="${SEED:-0}"
 BYOT_ALPHA_VAL="${BYOT_ALPHA_VAL:-1.0}"
 BYOT_BETA_VAL="${BYOT_BETA_VAL:-0.01}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
-LOG_ROOT="${LOG_ROOT:-logs_entropy_branch_gate_pilot}"
+LOG_ROOT="${LOG_ROOT:-logs/branch/logs_entropy_branch_gate_pilot}"
 ENVS=(${ENVS_OVERRIDE:-beta_0.1 beta_0.3 beta_0.5 iid})
 
 # Format:

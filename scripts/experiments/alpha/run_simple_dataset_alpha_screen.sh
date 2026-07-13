@@ -44,7 +44,7 @@ BATCH_SIZE="${BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
-LOG_ROOT="${LOG_ROOT:-logs_simple_dataset_alpha_screen}"
+LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_simple_dataset_alpha_screen}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 SETTINGS=(${SETTINGS_OVERRIDE:-fmnist_resnet18 bloodmnist_resnet18 imagenet100_64_resnet18})

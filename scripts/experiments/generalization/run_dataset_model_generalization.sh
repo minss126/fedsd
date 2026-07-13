@@ -37,7 +37,7 @@ NUM_WORKERS="${NUM_WORKERS:-2}"
 BYOT_ALPHA_VAL="${BYOT_ALPHA_VAL:-1.0}"
 BYOT_BETA_VAL="${BYOT_BETA_VAL:-0.01}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
-LOG_ROOT="${LOG_ROOT:-logs_dataset_model_generalization}"
+LOG_ROOT="${LOG_ROOT:-logs/generalization/logs_dataset_model_generalization}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 WANDB_FLAGS=""

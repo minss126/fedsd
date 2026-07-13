@@ -281,7 +281,7 @@ def plot_adaptive_delta(rows, out_dir):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root-dir", default="logs_client_reliability_extended")
+    parser.add_argument("--root-dir", default="logs/reliability/logs_client_reliability_extended")
     parser.add_argument("--base-algo", default="fedavg")
     parser.add_argument("--out-dir", default="results_analysis/client_reliability_alpha_extended")
     args = parser.parse_args()

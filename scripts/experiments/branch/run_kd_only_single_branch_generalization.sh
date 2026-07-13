@@ -47,7 +47,7 @@ BATCH_SIZE="${BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
-LOG_ROOT="${LOG_ROOT:-logs_kd_only_single_branch_generalization}"
+LOG_ROOT="${LOG_ROOT:-logs/branch/logs_kd_only_single_branch_generalization}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 SETTINGS=(${SETTINGS_OVERRIDE:-cifar100_resnet18})

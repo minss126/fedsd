@@ -6,7 +6,7 @@ cd "$REPO_ROOT"
 # FedAvg version of the gradient-level drift probe.
 # This isolates the FedSD/KD gradient mismatch without FedProx proximal regularization.
 #
-# Results are isolated under logs_probe_fedavg/.
+# Results are isolated under logs/drift/logs_probe_fedavg/.
 #
 # wandb is enabled by default for experiment tracking.
 # Disable if needed:
@@ -16,7 +16,7 @@ GPUS=(0 1 2 3)
 NUM_GPUS=${#GPUS[@]}
 JOB_COUNT=0
 
-LOG_ROOT="${LOG_ROOT:-logs_probe_fedavg}"
+LOG_ROOT="${LOG_ROOT:-logs/drift/logs_probe_fedavg}"
 BASE_ALGO_NAME="fedavg"
 BASE_ALGO_FLAGS=""
 

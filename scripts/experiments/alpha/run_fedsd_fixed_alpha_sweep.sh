@@ -8,7 +8,7 @@ cd "$REPO_ROOT"
 # This tests whether changing the KD alpha alone is a meaningful performance axis.
 #
 # Existing alpha=0.05 control:
-#   logs_tuning/beta_0.3/fedprox/fedsd_fixed_alpha
+#   logs_prev/logs_tuning/beta_0.3/fedprox/fedsd_fixed_alpha
 #
 # New runs below intentionally avoid that name so existing results are not overwritten.
 #
@@ -29,7 +29,7 @@ SEED="0"
 BETA_VAL="0.01"
 TEMP_VAL="0.5"
 
-LOG_DIR="logs_tuning/${ENV_NAME}/${BASE_ALGO_NAME}"
+LOG_DIR="logs_prev/logs_tuning/${ENV_NAME}/${BASE_ALGO_NAME}"
 mkdir -p "$LOG_DIR"
 
 WANDB_FLAGS=""
@@ -53,7 +53,7 @@ run_job() {
         --dataset cifar100 --n_clients 100 --sample_fraction 0.1 \
         --epochs 5 --lr 0.1 --batch_size 64 --round 500 --seed "${SEED}" \
         --device "cuda:${gpu_id}" \
-        --logdir "logs_tuning" \
+        --logdir "logs_prev/logs_tuning" \
         --log_file_name "${ENV_NAME}/${BASE_ALGO_NAME}/${method_name}" \
         --model resnet18_byot --alg fedbyot \
         --kd_conf_threshold 0.0 \

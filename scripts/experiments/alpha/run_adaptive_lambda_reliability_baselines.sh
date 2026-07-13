@@ -5,31 +5,26 @@ set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-# Bias-aware KD-only BYOT lambda pilot.
+# Missing reliability-only baselines for adaptive KD-only lambda.
 #
-# Motivation:
-#   Confidence alone can mean either reliable KD or local overconfidence.
-#   These variants multiply teacher true-label confidence by branch-teacher
-#   distribution agreement, so lambda is large only when the teacher is
-#   confident and the branch is not strongly disagreeing with it.
+# Purpose:
+#   Existing representative results already include:
+#     - rel_conf_p2       ~= label_prob * confidence-like reliability
+#     - rel_predskew_p2   ~= label_prob * prediction_entropy^2
+#     - server_drift
 #
-# Loss:
-#   L = CE_teacher + lambda * KD_branch + beta_feat * L_feat
+#   This script fills the missing simple baselines:
+#     1) label_prob_only
+#     2) confidence_only
 #
-# Adaptive lambda range:
-#   byot_alpha = 3.0, client_alpha_min/max = 0/1, mode=multiply
-#   => effective lambda in [0, 3].
+# Shared:
+#   CIFAR-100 / ResNet18-BYOT / FedAvg / KD-only / full B1+B2+B3
+#   lambda_round(t) = lambda_max * min(1, t / warmup)
+#   lambda_max=3, warmup=250
 #
-# Default matrix:
-#   CIFAR-100 / ResNet18-BYOT / FedAvg / kd_only
-#   partitions: iid, beta_0.5, beta_0.3, beta_0.1
-#   methods:
-#     client_label_prob_branch_js_0_3
-#     client_label_prob_entropy_branch_js_0_3
-#     round_client_label_prob_entropy_branch_js_0_3_w250
-#   total: 12 runs
+# Default jobs: 4 partitions * 2 methods = 8.
 
-GPUS=(${GPUS_OVERRIDE:-0 1 2 3})
+GPUS=(${GPUS_OVERRIDE:-0 1})
 NUM_GPUS=${#GPUS[@]}
 if [ "$NUM_GPUS" -lt 1 ]; then
     echo "No GPU ids provided. Set GPUS_OVERRIDE." >&2
@@ -54,15 +49,11 @@ TEMP_VAL="${TEMP_VAL:-0.5}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
 LAMBDA_MAX="${LAMBDA_MAX:-3.00}"
 WARMUP="${WARMUP:-250}"
-LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_bias_aware_lambda_pilot}"
+LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_adaptive_lambda_reliability_baselines}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 ENVS=(${ENVS_OVERRIDE:-iid beta_0.5 beta_0.3 beta_0.1})
-METHODS=(
-    "teacher_label_prob_branch_js|none|client_label_prob_branch_js_0_3"
-    "teacher_label_prob_entropy_branch_js|none|client_label_prob_entropy_branch_js_0_3"
-    "teacher_label_prob_entropy_branch_js|linear|round_client_label_prob_entropy_branch_js_0_3_w${WARMUP}"
-)
+METHODS=(${METHODS_OVERRIDE:-label_prob_only confidence_only})
 
 WANDB_FLAGS=""
 if [ "${USE_WANDB:-1}" = "1" ]; then
@@ -94,6 +85,22 @@ env_flags() {
     esac
 }
 
+method_flags() {
+    local method_name=$1
+    case "$method_name" in
+        label_prob_only)
+            echo "--byot_client_proxy teacher_label_prob --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0 --alpha_min_scale 0.0"
+            ;;
+        confidence_only)
+            echo "--byot_client_proxy teacher_conf --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0 --alpha_min_scale 0.0"
+            ;;
+        *)
+            echo "Unknown method: ${method_name}" >&2
+            exit 1
+            ;;
+    esac
+}
+
 has_completed_log() {
     local log_file=$1
     [ -f "$log_file" ] && grep -q "Round $((ROUNDS - 1)) result" "$log_file"
@@ -102,15 +109,12 @@ has_completed_log() {
 run_job() {
     local gpu_id=$1
     local env_name=$2
-    local proxy=$3
-    local schedule=$4
-    local method_name=$5
+    local method_name=$3
     local log_dir="${LOG_ROOT}/${env_name}/fedavg"
     local log_file="${log_dir}/${method_name}.log"
-    local flags
-    local schedule_flags=""
+    local partition_args
+    local adaptive_args
 
-    flags="$(env_flags "$env_name")"
     mkdir -p "$log_dir"
 
     if [ "$SKIP_EXISTING" = "1" ] && has_completed_log "$log_file"; then
@@ -118,14 +122,14 @@ run_job() {
         return
     fi
 
-    if [ "$schedule" != "none" ]; then
-        schedule_flags="--byot_round_lambda_schedule ${schedule} --byot_round_lambda_min 0.00 --byot_round_lambda_warmup ${WARMUP}"
-    fi
+    partition_args="$(env_flags "$env_name")"
+    adaptive_args="$(method_flags "$method_name")"
 
-    echo "[GPU ${gpu_id}] start: ${env_name} | ${method_name} | proxy=${proxy} | lambda_max=${LAMBDA_MAX}"
+    echo "[GPU ${gpu_id}] start: ${env_name} | ${method_name}"
 
     "${PYTHON_BIN}" main.py \
         --dataset cifar100 --datadir ./data \
+        --num_classes 100 \
         --n_clients 100 --sample_fraction 0.1 \
         --epochs "${LOCAL_EPOCHS}" --lr "${LR}" --batch_size "${BATCH_SIZE}" \
         --num_workers "${NUM_WORKERS}" \
@@ -141,12 +145,10 @@ run_job() {
         --byot_alpha "${LAMBDA_MAX}" \
         --byot_beta "${FEATURE_BETA}" \
         --temperature "${TEMP_VAL}" \
-        --byot_client_proxy "${proxy}" \
-        --byot_client_alpha_min 0.00 \
-        --byot_client_alpha_max 1.00 \
-        --byot_client_alpha_mode multiply \
-        ${schedule_flags} \
-        ${flags} ${WANDB_FLAGS} \
+        --byot_round_lambda_schedule linear \
+        --byot_round_lambda_min 0.00 \
+        --byot_round_lambda_warmup "${WARMUP}" \
+        ${adaptive_args} ${partition_args} ${WANDB_FLAGS} \
         > "${log_dir}/${method_name}_terminal.log" 2>&1
 
     echo "[GPU ${gpu_id}] complete: ${env_name} | ${method_name}"
@@ -159,8 +161,8 @@ run_queue() {
 
     for job in "${jobs[@]}"; do
         [ -z "$job" ] && continue
-        IFS='|' read -r env_name proxy schedule method_name <<< "$job"
-        run_job "$gpu_id" "$env_name" "$proxy" "$schedule" "$method_name"
+        IFS='|' read -r env_name method_name <<< "$job"
+        run_job "$gpu_id" "$env_name" "$method_name"
     done
 }
 
@@ -171,21 +173,19 @@ done
 
 job_count=0
 for env_name in "${ENVS[@]}"; do
-    for method_spec in "${METHODS[@]}"; do
-        IFS='|' read -r proxy schedule method_name <<< "$method_spec"
+    for method_name in "${METHODS[@]}"; do
         gpu_idx=$((job_count % NUM_GPUS))
-        QUEUES[$gpu_idx]+="${env_name}|${proxy}|${schedule}|${method_name}"$'\n'
+        QUEUES[$gpu_idx]+="${env_name}|${method_name}"$'\n'
         job_count=$((job_count + 1))
     done
 done
 
-echo "========== Bias-aware KD Lambda Pilot =========="
-echo "gpus=${GPUS[*]}, rounds=${ROUNDS}, local_epochs=${LOCAL_EPOCHS}, seed=${SEED}"
+echo "========== Adaptive Lambda Reliability Baselines =========="
+echo "gpus=${GPUS[*]}, rounds=${ROUNDS}, seed=${SEED}, jobs=${job_count}"
 echo "envs=${ENVS[*]}"
 echo "methods=${METHODS[*]}"
-echo "lambda_max=${LAMBDA_MAX}, feature_beta=${FEATURE_BETA}, temp=${TEMP_VAL}, warmup=${WARMUP}"
+echo "lambda_max=${LAMBDA_MAX}, warmup=${WARMUP}"
 echo "log_root=${LOG_ROOT}, skip_existing=${SKIP_EXISTING}, wandb=${USE_WANDB:-1}"
-echo "jobs=${job_count}"
 
 pids=()
 for ((i = 0; i < NUM_GPUS; i++)); do
@@ -197,4 +197,4 @@ for ((i = 0; i < NUM_GPUS; i++)); do
 done
 
 wait "${pids[@]}"
-echo "Bias-aware KD lambda pilot complete (${job_count} jobs)"
+echo "Adaptive lambda reliability baselines complete (${job_count} jobs)"

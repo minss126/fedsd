@@ -75,7 +75,7 @@ def adaptive_row(path):
 
     return summarize(
         data=data,
-        source="logs_client_reliability_high_alpha",
+        source="logs/reliability/logs_client_reliability_high_alpha",
         partition=partition,
         base=base,
         method_type="adaptive",
@@ -161,13 +161,13 @@ def best_by(rows, group_keys, metric="last_10_acc"):
 def main():
     rows = []
 
-    for path in sorted(Path("logs_fixed_alpha_high").glob("beta_*/fedavg/fixed_alpha*.pkl")):
-        rows.append(fixed_row(path, "logs_fixed_alpha_high"))
+    for path in sorted(Path("logs/reliability/logs_fixed_alpha_high").glob("beta_*/fedavg/fixed_alpha*.pkl")):
+        rows.append(fixed_row(path, "logs/reliability/logs_fixed_alpha_high"))
 
-    for path in sorted(Path("logs_fixed_alpha_high_base").glob("beta_*/*/fixed_alpha*.pkl")):
-        rows.append(fixed_row(path, "logs_fixed_alpha_high_base"))
+    for path in sorted(Path("logs/reliability/logs_fixed_alpha_high_base").glob("beta_*/*/fixed_alpha*.pkl")):
+        rows.append(fixed_row(path, "logs/reliability/logs_fixed_alpha_high_base"))
 
-    for path in sorted(Path("logs_client_reliability_high_alpha").glob("beta_*/fedavg/client_*.pkl")):
+    for path in sorted(Path("logs/reliability/logs_client_reliability_high_alpha").glob("beta_*/fedavg/client_*.pkl")):
         rows.append(adaptive_row(path))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)

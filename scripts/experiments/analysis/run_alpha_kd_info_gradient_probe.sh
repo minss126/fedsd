@@ -55,7 +55,7 @@ FEATURE_BETA="${FEATURE_BETA:-0.01}"
 PROBE_INTERVAL="${PROBE_INTERVAL:-10}"
 PROBE_BATCHES="${PROBE_BATCHES:-1}"
 CIFAR10_BETA="${CIFAR10_BETA:-0.5}"
-LOG_ROOT="${LOG_ROOT:-logs_alpha_kd_info_gradient_probe_r500}"
+LOG_ROOT="${LOG_ROOT:-logs/analysis/logs_alpha_kd_info_gradient_probe_r500}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 ALPHAS=(${ALPHAS_OVERRIDE:-0.00 1.00})

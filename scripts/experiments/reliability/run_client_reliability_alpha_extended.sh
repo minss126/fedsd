@@ -41,7 +41,7 @@ BETA_VAL="${BYOT_BETA_VAL:-0.01}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
 CLIENT_ALPHA_MIN="${CLIENT_ALPHA_MIN:-0.01}"
 CLIENT_ALPHA_MAX="${CLIENT_ALPHA_MAX:-0.30}"
-LOG_ROOT="${LOG_ROOT:-logs_client_reliability_extended}"
+LOG_ROOT="${LOG_ROOT:-logs/reliability/logs_client_reliability_extended}"
 
 WANDB_FLAGS=""
 if [ "${USE_WANDB:-1}" = "1" ]; then

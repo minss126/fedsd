@@ -5,24 +5,32 @@ set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-# Compact adaptive KD-only lambda candidates.
+# Signal-composition and power ablation for adaptive KD lambda.
 #
-# Goal:
-#   Try a small set of method-level candidates rather than a large ablation.
+# All jobs share the same round schedule:
+#   lambda_round(t) = 3 * min(1, t / 250)
+#
+# The ablation varies two independent factors:
+#   1) signal: single teacher signal vs. a combined signal
+#   2) power: r^1 vs. r^2, where r is the client-level signal
 #
 # Methods:
-#   rel_conf_p2:
-#     lambda = lambda_round(t) * [E p_T(y|x) * confidence]^2
-#   rel_predskew_p2:
-#     lambda = lambda_round(t) * E p_T(y|x) * prediction_entropy(client)^2
-#   server_drift:
-#     lambda = lambda_round(t) * 1 / (1 + tau * previous_round_relative_update_drift)
+#   label_prob_p{1,2}
+#       r = mean_x p_T(y | x)
+#   teacher_certainty_p{1,2}
+#       r = mean_x [1 - H(p_T(. | x)) / log(C)]
+#   label_prob_x_certainty_p{1,2}
+#       r = mean_x [p_T(y | x) * (1 - H(p_T(. | x)) / log(C))]
+#   label_prob_x_client_pred_entropy_p{1,2}
+#       lambda = lambda_round * mean_x p_T(y | x)
+#                * [H(mean_x p_T(. | x)) / log(C)]^p
 #
-# Shared:
-#   KD-only branch objective, full B1+B2+B3, CIFAR-100/ResNet18-BYOT/FedAvg.
-#   lambda_round(t) = lambda_max * min(1, t / warmup), lambda_max=3, warmup=250.
+# Default plan: 4 partitions * 8 methods = 32 runs.
 #
-# Total default jobs: 4 partitions * 3 methods = 12.
+# Examples:
+#   USE_WANDB=0 bash scripts/experiments/alpha/run_signal_power_ablation.sh
+#   ENVS_OVERRIDE="beta_0.1 beta_0.3" USE_WANDB=0 bash scripts/experiments/alpha/run_signal_power_ablation.sh
+#   METHODS_OVERRIDE="label_prob_x_certainty_p1 label_prob_x_certainty_p2" bash scripts/experiments/alpha/run_signal_power_ablation.sh
 
 GPUS=(${GPUS_OVERRIDE:-0 1 2 3})
 NUM_GPUS=${#GPUS[@]}
@@ -49,13 +57,11 @@ TEMP_VAL="${TEMP_VAL:-0.5}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
 LAMBDA_MAX="${LAMBDA_MAX:-3.00}"
 WARMUP="${WARMUP:-250}"
-SERVER_TAU="${SERVER_TAU:-1.0}"
-SERVER_MIN_SCALE="${SERVER_MIN_SCALE:-0.0}"
-LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_compact_adaptive_lambda_methods}"
+LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_signal_power_ablation}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 ENVS=(${ENVS_OVERRIDE:-iid beta_0.5 beta_0.3 beta_0.1})
-METHODS=(${METHODS_OVERRIDE:-rel_conf_p2 rel_predskew_p2 server_drift})
+METHODS=(${METHODS_OVERRIDE:-label_prob_p1 label_prob_p2 teacher_certainty_p1 teacher_certainty_p2 label_prob_x_certainty_p1 label_prob_x_certainty_p2 label_prob_x_client_pred_entropy_p1 label_prob_x_client_pred_entropy_p2})
 
 WANDB_FLAGS=""
 if [ "${USE_WANDB:-1}" = "1" ]; then
@@ -66,43 +72,36 @@ if [ "${USE_WANDB:-1}" = "1" ]; then
 fi
 
 env_flags() {
-    local env_name=$1
-    case "$env_name" in
-        iid)
-            echo "--partition iid"
-            ;;
-        beta_0.1)
-            echo "--partition noniid --beta 0.1"
-            ;;
-        beta_0.3)
-            echo "--partition noniid --beta 0.3"
-            ;;
-        beta_0.5)
-            echo "--partition noniid --beta 0.5"
-            ;;
-        *)
-            echo "Unknown env: ${env_name}" >&2
-            exit 1
-            ;;
+    case "$1" in
+        iid) echo "--partition iid" ;;
+        beta_0.1) echo "--partition noniid --beta 0.1" ;;
+        beta_0.3) echo "--partition noniid --beta 0.3" ;;
+        beta_0.5) echo "--partition noniid --beta 0.5" ;;
+        *) echo "Unknown env: $1" >&2; exit 1 ;;
     esac
 }
 
+client_signal_flags() {
+    local proxy=$1
+    local power=$2
+    echo "--byot_client_proxy ${proxy} --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power ${power} --alpha_min_scale 0.0"
+}
+
 method_flags() {
-    local method_name=$1
-    case "$method_name" in
-        rel_conf_p2)
-            echo "--byot_client_proxy teacher_label_prob_entropy --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 2.0 --alpha_min_scale 0.0"
+    case "$1" in
+        label_prob_p1) client_signal_flags teacher_label_prob 1.0 ;;
+        label_prob_p2) client_signal_flags teacher_label_prob 2.0 ;;
+        teacher_certainty_p1) client_signal_flags teacher_entropy 1.0 ;;
+        teacher_certainty_p2) client_signal_flags teacher_entropy 2.0 ;;
+        label_prob_x_certainty_p1) client_signal_flags teacher_label_prob_entropy 1.0 ;;
+        label_prob_x_certainty_p2) client_signal_flags teacher_label_prob_entropy 2.0 ;;
+        label_prob_x_client_pred_entropy_p1)
+            echo "$(client_signal_flags teacher_label_prob 1.0) --byot_client_skew_proxy prediction_entropy --byot_client_skew_min_scale 0.00 --byot_client_skew_power 1.0"
             ;;
-        rel_predskew_p2)
-            echo "--byot_client_proxy teacher_label_prob --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0 --alpha_min_scale 0.0 --byot_client_skew_proxy prediction_entropy --byot_client_skew_min_scale 0.00 --byot_client_skew_power 2.0"
+        label_prob_x_client_pred_entropy_p2)
+            echo "$(client_signal_flags teacher_label_prob 1.0) --byot_client_skew_proxy prediction_entropy --byot_client_skew_min_scale 0.00 --byot_client_skew_power 2.0"
             ;;
-        server_drift)
-            echo "--byot_server_lambda_adaptive --byot_server_lambda_tau ${SERVER_TAU} --byot_server_lambda_min_scale ${SERVER_MIN_SCALE} --log_client_drift --drift_log_interval 1"
-            ;;
-        *)
-            echo "Unknown method: ${method_name}" >&2
-            exit 1
-            ;;
+        *) echo "Unknown method: $1" >&2; exit 1 ;;
     esac
 }
 
@@ -121,7 +120,6 @@ run_job() {
     local adaptive_args
 
     mkdir -p "$log_dir"
-
     if [ "$SKIP_EXISTING" = "1" ] && has_completed_log "$log_file"; then
         echo "[skip] ${env_name} | ${method_name}"
         return
@@ -129,11 +127,11 @@ run_job() {
 
     partition_args="$(env_flags "$env_name")"
     adaptive_args="$(method_flags "$method_name")"
-
     echo "[GPU ${gpu_id}] start: ${env_name} | ${method_name}"
 
     "${PYTHON_BIN}" main.py \
         --dataset cifar100 --datadir ./data \
+        --num_classes 100 \
         --n_clients 100 --sample_fraction 0.1 \
         --epochs "${LOCAL_EPOCHS}" --lr "${LR}" --batch_size "${BATCH_SIZE}" \
         --num_workers "${NUM_WORKERS}" \
@@ -162,6 +160,7 @@ run_queue() {
     local gpu_id=$1
     shift
     local jobs=("$@")
+    local job env_name method_name
 
     for job in "${jobs[@]}"; do
         [ -z "$job" ] && continue
@@ -184,11 +183,11 @@ for env_name in "${ENVS[@]}"; do
     done
 done
 
-echo "========== Compact Adaptive Lambda Methods =========="
+echo "========== Signal/Power Adaptive Lambda Ablation =========="
 echo "gpus=${GPUS[*]}, rounds=${ROUNDS}, seed=${SEED}, jobs=${job_count}"
 echo "envs=${ENVS[*]}"
 echo "methods=${METHODS[*]}"
-echo "lambda_max=${LAMBDA_MAX}, warmup=${WARMUP}, server_tau=${SERVER_TAU}"
+echo "lambda_max=${LAMBDA_MAX}, warmup=${WARMUP}"
 echo "log_root=${LOG_ROOT}, skip_existing=${SKIP_EXISTING}, wandb=${USE_WANDB:-1}"
 
 pids=()
@@ -201,4 +200,4 @@ for ((i = 0; i < NUM_GPUS; i++)); do
 done
 
 wait "${pids[@]}"
-echo "Compact adaptive lambda methods complete (${job_count} jobs)"
+echo "Signal/power ablation complete (${job_count} jobs)"

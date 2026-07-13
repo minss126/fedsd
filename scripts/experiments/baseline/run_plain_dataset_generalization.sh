@@ -46,7 +46,7 @@ SEED="${SEED:-0}"
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-5}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
-LOG_ROOT="${LOG_ROOT:-logs_plain_dataset_generalization}"
+LOG_ROOT="${LOG_ROOT:-logs/baseline/logs_plain_dataset_generalization}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 SETTINGS=(${SETTINGS_OVERRIDE:-cifar10_resnet18 fmnist_resnet18 tinyimagenet_resnet18})

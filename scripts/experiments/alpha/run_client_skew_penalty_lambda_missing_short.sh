@@ -36,7 +36,7 @@ LAMBDA_MAX="${LAMBDA_MAX:-3.00}"
 WARMUP="${WARMUP:-250}"
 SKEW_MIN_SCALE="${SKEW_MIN_SCALE:-0.00}"
 SKEW_POWER="${SKEW_POWER:-1.00}"
-LOG_ROOT="${LOG_ROOT:-logs_client_skew_penalty_lambda_pilot}"
+LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_client_skew_penalty_lambda_pilot}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 # Primary missing/important runs:

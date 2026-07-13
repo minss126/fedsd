@@ -11,7 +11,7 @@ cd "$REPO_ROOT"
 #   iid, beta_0.5, beta_0.3
 #
 # Already-run beta=0.1 results are expected in:
-#   logs_classwise_lambda_beta01/
+#   logs/alpha/logs_classwise_lambda_beta01/
 #
 # Methods:
 #   class_count:
@@ -49,7 +49,7 @@ BATCH_SIZE="${BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
-LOG_ROOT="${LOG_ROOT:-logs_classwise_lambda_partition_sweep}"
+LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_classwise_lambda_partition_sweep}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 ENVS=(${ENVS_OVERRIDE:-iid beta_0.5 beta_0.3})

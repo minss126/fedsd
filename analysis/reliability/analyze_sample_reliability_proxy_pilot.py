@@ -173,7 +173,7 @@ def plot_metric(rows, out_dir, metric, ylabel, filename):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root-dir", default="logs_reliability/beta_0.3/fedavg")
+    parser.add_argument("--root-dir", default="logs/reliability/logs_reliability/beta_0.3/fedavg")
     parser.add_argument("--out-dir", default="results_analysis/sample_reliability_proxy_pilot")
     args = parser.parse_args()
 

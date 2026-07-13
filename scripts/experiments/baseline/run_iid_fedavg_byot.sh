@@ -5,7 +5,7 @@ cd "$REPO_ROOT"
 
 
 # Re-run IID/FedAvg BYOT variants with the current tuning hyperparameters.
-# This fixes the old logs/iid/fedavg fallback runs that used different epochs/alpha/beta.
+# This fixes the old logs_prev/logs/iid/fedavg fallback runs that used different epochs/alpha/beta.
 
 GPUS=(0 1 2 3)
 NUM_GPUS=${#GPUS[@]}
@@ -16,7 +16,7 @@ TEMP_VAL="0.5"
 ALPHA_VAL="0.05"
 BETA_VAL="0.01"
 
-LOG_DIR="logs_tuning/iid/fedavg"
+LOG_DIR="logs_prev/logs_tuning/iid/fedavg"
 mkdir -p "$LOG_DIR"
 
 run_job() {
@@ -32,7 +32,7 @@ run_job() {
         --dataset cifar100 --n_clients 100 --sample_fraction 0.1 \
         --epochs 5 --lr 0.1 --batch_size 64 --round 500 --seed 0 \
         --device "cuda:${gpu_id}" \
-        --logdir "logs_tuning" \
+        --logdir "logs_prev/logs_tuning" \
         --log_file_name "iid/fedavg/${method_name}" \
         --partition iid \
         $method_flags \

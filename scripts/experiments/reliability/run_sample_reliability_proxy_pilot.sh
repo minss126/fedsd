@@ -39,7 +39,7 @@ ALPHA_VAL="${ALPHA_VAL:-0.05}"
 BETA_VAL="${BETA_VAL:-0.01}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
 MIN_SCALE="${MIN_SCALE:-0.0}"
-LOG_ROOT="${LOG_ROOT:-logs_reliability}"
+LOG_ROOT="${LOG_ROOT:-logs/reliability/logs_reliability}"
 LOG_DIR="${LOG_ROOT}/${ENV_NAME}/${BASE_ALGO}"
 
 mkdir -p "$LOG_DIR"

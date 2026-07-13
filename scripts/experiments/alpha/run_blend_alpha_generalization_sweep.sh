@@ -43,7 +43,7 @@ BATCH_SIZE="${BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
-LOG_ROOT="${LOG_ROOT:-logs_blend_alpha_generalization}"
+LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_blend_alpha_generalization}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 REUSE_EXISTING="${REUSE_EXISTING:-1}"
 
@@ -140,31 +140,31 @@ existing_source_base() {
 
     case "${setting}:${partition_name}:${alpha_tag}" in
         cifar100_resnet18:iid:0p70)
-            echo "logs_iid_fedavg_compare/iid/fedavg/fixed_alpha0p70"
+            echo "logs/reliability/logs_iid_fedavg_compare/iid/fedavg/fixed_alpha0p70"
             ;;
         cifar100_resnet18:iid:1p00)
-            echo "logs_iid_fedavg_compare/iid/fedavg/fixed_alpha1p00"
+            echo "logs/reliability/logs_iid_fedavg_compare/iid/fedavg/fixed_alpha1p00"
             ;;
         cifar100_resnet18:beta_0.1:0p30|cifar100_resnet18:beta_0.3:0p30|cifar100_resnet18:beta_0.5:0p30)
-            echo "logs_client_reliability_extended/${partition_name}/fedavg/fixed_alpha0p30"
+            echo "logs/reliability/logs_client_reliability_extended/${partition_name}/fedavg/fixed_alpha0p30"
             ;;
         cifar100_resnet18:beta_0.3:0p00)
-            echo "logs_client_reliability_extended/beta_0.3/fedavg/fixed_alpha0p00"
+            echo "logs/reliability/logs_client_reliability_extended/beta_0.3/fedavg/fixed_alpha0p00"
             ;;
         cifar100_resnet18:beta_0.1:0p70|cifar100_resnet18:beta_0.3:0p70|cifar100_resnet18:beta_0.5:0p70)
-            echo "logs_fixed_alpha_high/${partition_name}/fedavg/fixed_alpha0p70"
+            echo "logs/reliability/logs_fixed_alpha_high/${partition_name}/fedavg/fixed_alpha0p70"
             ;;
         cifar100_resnet18:beta_0.1:1p00|cifar100_resnet18:beta_0.3:1p00|cifar100_resnet18:beta_0.5:1p00)
-            echo "logs_fixed_alpha_high/${partition_name}/fedavg/fixed_alpha1p00"
+            echo "logs/reliability/logs_fixed_alpha_high/${partition_name}/fedavg/fixed_alpha1p00"
             ;;
         cifar10_resnet18:iid:1p00|cifar10_resnet18:beta_0.5:1p00|cifar10_resnet18:beta_0.1:1p00)
-            echo "logs_dataset_model_generalization/cifar10_resnet18/${partition_name}/fedavg/fedsd_alpha1p00"
+            echo "logs/generalization/logs_dataset_model_generalization/cifar10_resnet18/${partition_name}/fedavg/fedsd_alpha1p00"
             ;;
         cifar100_mobilenet:iid:1p00|cifar100_mobilenet:beta_0.5:1p00|cifar100_mobilenet:beta_0.1:1p00)
-            echo "logs_dataset_model_generalization/cifar100_mobilenet/${partition_name}/fedavg/fedsd_alpha1p00"
+            echo "logs/generalization/logs_dataset_model_generalization/cifar100_mobilenet/${partition_name}/fedavg/fedsd_alpha1p00"
             ;;
         tinyimagenet_resnet18:iid:1p00|tinyimagenet_resnet18:beta_0.5:1p00|tinyimagenet_resnet18:beta_0.1:1p00)
-            echo "logs_dataset_model_generalization/tinyimagenet_resnet18/${partition_name}/fedavg/fedsd_alpha1p00"
+            echo "logs/generalization/logs_dataset_model_generalization/tinyimagenet_resnet18/${partition_name}/fedavg/fedsd_alpha1p00"
             ;;
         *)
             echo ""

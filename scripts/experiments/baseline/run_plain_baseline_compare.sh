@@ -42,7 +42,7 @@ SEED="${SEED:-0}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
 FEDPROX_MU="${FEDPROX_MU:-0.01}"
 MOON_MU="${MOON_MU:-1.0}"
-LOG_ROOT="${LOG_ROOT:-logs_plain_baseline_compare}"
+LOG_ROOT="${LOG_ROOT:-logs/baseline/logs_plain_baseline_compare}"
 
 ENVS=(${ENVS_OVERRIDE:-beta_0.1 beta_0.3 beta_0.5})
 ALGOS=(${ALGOS:-fedavg fedprox moon})

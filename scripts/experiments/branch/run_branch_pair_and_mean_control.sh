@@ -37,7 +37,7 @@ SEED="${SEED:-0}"
 BYOT_ALPHA_VAL="${BYOT_ALPHA_VAL:-1.0}"
 BYOT_BETA_VAL="${BYOT_BETA_VAL:-0.01}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
-LOG_ROOT="${LOG_ROOT:-logs_branch_mean_control}"
+LOG_ROOT="${LOG_ROOT:-logs/branch/logs_branch_mean_control}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 WANDB_FLAGS=""

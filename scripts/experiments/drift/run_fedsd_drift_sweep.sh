@@ -12,7 +12,7 @@ cd "$REPO_ROOT"
 #   partition in {iid, beta_0.5, beta_0.3, beta_0.1}
 #   alpha in {0.00, 0.01, 0.05, 0.10, 0.30}
 #
-# Results are isolated under logs_drift/ to avoid mixing with previous runs.
+# Results are isolated under logs/drift/logs_drift/ to avoid mixing with previous runs.
 #
 # wandb is enabled by default for experiment tracking.
 # Disable if needed:
@@ -22,7 +22,7 @@ GPUS=(0 1 2 3)
 NUM_GPUS=${#GPUS[@]}
 JOB_COUNT=0
 
-LOG_ROOT="${LOG_ROOT:-logs_drift}"
+LOG_ROOT="${LOG_ROOT:-logs/drift/logs_drift}"
 BASE_ALGO_NAME="fedprox"
 BASE_ALGO_FLAGS="--use_fedprox --mu 0.01"
 

@@ -190,7 +190,7 @@ def main():
     parser.add_argument(
         "--roots",
         nargs="+",
-        default=["logs_client_reliability_extended", "logs_fixed_alpha_high"],
+        default=["logs/reliability/logs_client_reliability_extended", "logs/reliability/logs_fixed_alpha_high"],
         help="Log roots to merge. Later roots override duplicate partition/alpha pairs.",
     )
     parser.add_argument("--base-algo", default="fedavg")

@@ -5,26 +5,49 @@ set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-# Compact adaptive KD-only lambda candidates.
+# Extended adaptive lambda method sweep.
 #
-# Goal:
-#   Try a small set of method-level candidates rather than a large ablation.
+# Purpose:
+#   Queue all currently needed adaptive-lambda checks at once:
+#     1) missing reliability-only baselines
+#     2) new reliability definitions
+#     3) softened server-drift variants
 #
-# Methods:
-#   rel_conf_p2:
-#     lambda = lambda_round(t) * [E p_T(y|x) * confidence]^2
-#   rel_predskew_p2:
-#     lambda = lambda_round(t) * E p_T(y|x) * prediction_entropy(client)^2
-#   server_drift:
-#     lambda = lambda_round(t) * 1 / (1 + tau * previous_round_relative_update_drift)
+# Existing reference methods are not rerun here:
+#   - rel_predskew_p2 in logs/alpha/logs_compact_adaptive_lambda_methods
+#   - rel_conf_p2 in logs/alpha/logs_compact_adaptive_lambda_methods
+#   - server_drift in logs/alpha/logs_compact_adaptive_lambda_methods
 #
 # Shared:
-#   KD-only branch objective, full B1+B2+B3, CIFAR-100/ResNet18-BYOT/FedAvg.
-#   lambda_round(t) = lambda_max * min(1, t / warmup), lambda_max=3, warmup=250.
+#   CIFAR-100 / ResNet18-BYOT / FedAvg / KD-only / full B1+B2+B3
+#   lambda_round(t) = lambda_max * min(1, t / warmup)
+#   lambda_max=3, warmup=250
 #
-# Total default jobs: 4 partitions * 3 methods = 12.
+# Methods:
+#   label_prob_only:
+#     lambda_k = lambda_round * E[p_T(y|x)]
+#
+#   confidence_only:
+#     lambda_k = lambda_round * E[max_c p_T(c|x)]
+#
+#   margin_only:
+#     lambda_k = lambda_round * E[p_T(top1|x) - p_T(top2|x)]
+#
+#   correctness_only:
+#     lambda_k = lambda_round * E[1(argmax p_T(x) = y)]
+#
+#   entropy_certainty_only:
+#     lambda_k = lambda_round * E[1 - H(p_T(.|x))/log C]
+#
+#   server_drift_soft:
+#     lambda_t = lambda_round / (1 + 0.1 * relative_update_drift_{t-1})
+#
+#   server_drift_soft_floor:
+#     lambda_t = lambda_round * max(0.3, 1 / (1 + 0.1 * relative_update_drift_{t-1}))
+#
+# Default jobs: 4 partitions * 7 methods = 28.
 
-GPUS=(${GPUS_OVERRIDE:-0 1 2 3})
+GPUS=(${GPUS_OVERRIDE:-0 1})
 NUM_GPUS=${#GPUS[@]}
 if [ "$NUM_GPUS" -lt 1 ]; then
     echo "No GPU ids provided. Set GPUS_OVERRIDE." >&2
@@ -49,13 +72,13 @@ TEMP_VAL="${TEMP_VAL:-0.5}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
 LAMBDA_MAX="${LAMBDA_MAX:-3.00}"
 WARMUP="${WARMUP:-250}"
-SERVER_TAU="${SERVER_TAU:-1.0}"
-SERVER_MIN_SCALE="${SERVER_MIN_SCALE:-0.0}"
-LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_compact_adaptive_lambda_methods}"
+SERVER_TAU_SOFT="${SERVER_TAU_SOFT:-0.1}"
+SERVER_FLOOR="${SERVER_FLOOR:-0.3}"
+LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_adaptive_lambda_extended_methods}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 ENVS=(${ENVS_OVERRIDE:-iid beta_0.5 beta_0.3 beta_0.1})
-METHODS=(${METHODS_OVERRIDE:-rel_conf_p2 rel_predskew_p2 server_drift})
+METHODS=(${METHODS_OVERRIDE:-label_prob_only confidence_only margin_only correctness_only entropy_certainty_only server_drift_soft server_drift_soft_floor})
 
 WANDB_FLAGS=""
 if [ "${USE_WANDB:-1}" = "1" ]; then
@@ -90,14 +113,26 @@ env_flags() {
 method_flags() {
     local method_name=$1
     case "$method_name" in
-        rel_conf_p2)
-            echo "--byot_client_proxy teacher_label_prob_entropy --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 2.0 --alpha_min_scale 0.0"
+        label_prob_only)
+            echo "--byot_client_proxy teacher_label_prob --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0 --alpha_min_scale 0.0"
             ;;
-        rel_predskew_p2)
-            echo "--byot_client_proxy teacher_label_prob --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0 --alpha_min_scale 0.0 --byot_client_skew_proxy prediction_entropy --byot_client_skew_min_scale 0.00 --byot_client_skew_power 2.0"
+        confidence_only)
+            echo "--byot_client_proxy teacher_conf --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0 --alpha_min_scale 0.0"
             ;;
-        server_drift)
-            echo "--byot_server_lambda_adaptive --byot_server_lambda_tau ${SERVER_TAU} --byot_server_lambda_min_scale ${SERVER_MIN_SCALE} --log_client_drift --drift_log_interval 1"
+        margin_only)
+            echo "--byot_client_proxy teacher_margin --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0 --alpha_min_scale 0.0"
+            ;;
+        correctness_only)
+            echo "--byot_client_proxy teacher_correctness --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0 --alpha_min_scale 0.0"
+            ;;
+        entropy_certainty_only)
+            echo "--byot_client_proxy teacher_entropy --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00 --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0 --alpha_min_scale 0.0"
+            ;;
+        server_drift_soft)
+            echo "--byot_server_lambda_adaptive --byot_server_lambda_tau ${SERVER_TAU_SOFT} --byot_server_lambda_min_scale 0.0 --log_client_drift --drift_log_interval 1"
+            ;;
+        server_drift_soft_floor)
+            echo "--byot_server_lambda_adaptive --byot_server_lambda_tau ${SERVER_TAU_SOFT} --byot_server_lambda_min_scale ${SERVER_FLOOR} --log_client_drift --drift_log_interval 1"
             ;;
         *)
             echo "Unknown method: ${method_name}" >&2
@@ -134,6 +169,7 @@ run_job() {
 
     "${PYTHON_BIN}" main.py \
         --dataset cifar100 --datadir ./data \
+        --num_classes 100 \
         --n_clients 100 --sample_fraction 0.1 \
         --epochs "${LOCAL_EPOCHS}" --lr "${LR}" --batch_size "${BATCH_SIZE}" \
         --num_workers "${NUM_WORKERS}" \
@@ -184,11 +220,11 @@ for env_name in "${ENVS[@]}"; do
     done
 done
 
-echo "========== Compact Adaptive Lambda Methods =========="
+echo "========== Extended Adaptive Lambda Methods =========="
 echo "gpus=${GPUS[*]}, rounds=${ROUNDS}, seed=${SEED}, jobs=${job_count}"
 echo "envs=${ENVS[*]}"
 echo "methods=${METHODS[*]}"
-echo "lambda_max=${LAMBDA_MAX}, warmup=${WARMUP}, server_tau=${SERVER_TAU}"
+echo "lambda_max=${LAMBDA_MAX}, warmup=${WARMUP}, server_tau_soft=${SERVER_TAU_SOFT}, server_floor=${SERVER_FLOOR}"
 echo "log_root=${LOG_ROOT}, skip_existing=${SKIP_EXISTING}, wandb=${USE_WANDB:-1}"
 
 pids=()
@@ -201,4 +237,4 @@ for ((i = 0; i < NUM_GPUS; i++)); do
 done
 
 wait "${pids[@]}"
-echo "Compact adaptive lambda methods complete (${job_count} jobs)"
+echo "Extended adaptive lambda methods complete (${job_count} jobs)"

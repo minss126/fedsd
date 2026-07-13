@@ -28,7 +28,7 @@ fi
 SEED="${SEED:-0}"
 BYOT_BETA_VAL="${BYOT_BETA_VAL:-0.01}"
 TEMP_VAL="${TEMP_VAL:-0.5}"
-LOG_ROOT="${LOG_ROOT:-logs_iid_fedavg_compare}"
+LOG_ROOT="${LOG_ROOT:-logs/reliability/logs_iid_fedavg_compare}"
 
 FIXED_ALPHAS=(${FIXED_ALPHAS:-0.50:0p50 0.70:0p70 1.00:1p00})
 ADAPTIVE_SPECS=(${ADAPTIVE_SPECS:-branch_js:0.50:1.00:client_branch_js_0p50_1p00})
