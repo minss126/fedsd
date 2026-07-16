@@ -4016,6 +4016,7 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     total_byot_alpha_mean = 0.0
     total_byot_alpha_min = 0.0
     total_byot_alpha_max = 0.0
+    client_byot_alpha_stats = {}
     total_correct_conf = 0.0
     total_zero_kd = 0.0 
     total_kd_std = 0.0  
@@ -4200,6 +4201,11 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
         total_byot_alpha_mean += byot_alpha_mean
         total_byot_alpha_min += byot_alpha_min
         total_byot_alpha_max += byot_alpha_max
+        client_byot_alpha_stats[int(net_id)] = {
+            "mean": float(byot_alpha_mean),
+            "min": float(byot_alpha_min),
+            "max": float(byot_alpha_max),
+        }
         total_correct_conf += correct_conf
         total_zero_kd += zero_kd_classes 
         total_kd_std += kd_std           
@@ -4220,6 +4226,7 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     avg_byot_alpha_min = total_byot_alpha_min / num_clients
     avg_byot_alpha_max = total_byot_alpha_max / num_clients
     avg_entropy = total_entropy / num_clients
+    args._last_client_byot_alpha_stats = client_byot_alpha_stats
     args._last_train_branch_frequency_stats = finalize_train_branch_freq_stats(total_branch_freq_stats)
     
     # [NEW] 시간 및 연산 효율 평균

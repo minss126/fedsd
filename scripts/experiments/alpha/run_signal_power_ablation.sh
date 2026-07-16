@@ -59,6 +59,7 @@ LAMBDA_MAX="${LAMBDA_MAX:-3.00}"
 WARMUP="${WARMUP:-250}"
 LOG_ROOT="${LOG_ROOT:-logs/alpha/logs_signal_power_ablation}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
+EXTRA_FLAGS="${EXTRA_FLAGS:-}"
 
 ENVS=(${ENVS_OVERRIDE:-iid beta_0.5 beta_0.3 beta_0.1})
 METHODS=(${METHODS_OVERRIDE:-label_prob_p1 label_prob_p2 teacher_certainty_p1 teacher_certainty_p2 label_prob_x_certainty_p1 label_prob_x_certainty_p2 label_prob_x_client_pred_entropy_p1 label_prob_x_client_pred_entropy_p2})
@@ -77,6 +78,7 @@ env_flags() {
         beta_0.1) echo "--partition noniid --beta 0.1" ;;
         beta_0.3) echo "--partition noniid --beta 0.3" ;;
         beta_0.5) echo "--partition noniid --beta 0.5" ;;
+        noniid_grouping) echo "--partition noniid_grouping --partition_groups ${PARTITION_GROUPS:-8}" ;;
         *) echo "Unknown env: $1" >&2; exit 1 ;;
     esac
 }
@@ -150,7 +152,7 @@ run_job() {
         --byot_round_lambda_schedule linear \
         --byot_round_lambda_min 0.00 \
         --byot_round_lambda_warmup "${WARMUP}" \
-        ${adaptive_args} ${partition_args} ${WANDB_FLAGS} \
+        ${adaptive_args} ${partition_args} ${EXTRA_FLAGS} ${WANDB_FLAGS} \
         > "${log_dir}/${method_name}_terminal.log" 2>&1
 
     echo "[GPU ${gpu_id}] complete: ${env_name} | ${method_name}"
@@ -188,7 +190,7 @@ echo "gpus=${GPUS[*]}, rounds=${ROUNDS}, seed=${SEED}, jobs=${job_count}"
 echo "envs=${ENVS[*]}"
 echo "methods=${METHODS[*]}"
 echo "lambda_max=${LAMBDA_MAX}, warmup=${WARMUP}"
-echo "log_root=${LOG_ROOT}, skip_existing=${SKIP_EXISTING}, wandb=${USE_WANDB:-1}"
+echo "log_root=${LOG_ROOT}, skip_existing=${SKIP_EXISTING}, wandb=${USE_WANDB:-1}, extra_flags=${EXTRA_FLAGS}"
 
 pids=()
 for ((i = 0; i < NUM_GPUS; i++)); do

@@ -67,6 +67,43 @@ TRAIN_BRANCH_FREQ_KEYS = [
     for branch_idx in (1, 2, 3)
     for metric in ("count", *TRAIN_BRANCH_FREQ_METRICS)
 ]
+CLIENT_GROUP_LAMBDA_METRICS = ("count", "mean", "std", "min", "max")
+
+
+def compute_client_group_lambda_stats(args):
+    """Aggregate per-client effective BYOT alpha/lambda by noniid_grouping group."""
+    if getattr(args, "partition", None) != "noniid_grouping":
+        return {}
+
+    client_stats = getattr(args, "_last_client_byot_alpha_stats", {}) or {}
+    if not client_stats:
+        return {}
+
+    num_clients = int(getattr(args, "n_clients", 0))
+    num_groups = min(int(getattr(args, "partition_groups", 8)), max(num_clients, 1))
+    groups = np.array_split(np.arange(num_clients), num_groups)
+
+    stats = {}
+    for group_idx, clients in enumerate(groups):
+        values = [
+            float(client_stats[int(client_id)]["mean"])
+            for client_id in clients
+            if int(client_id) in client_stats
+        ]
+        prefix = f"client_group_lambda_g{group_idx}"
+        stats[f"{prefix}_count"] = len(values)
+        if values:
+            arr = np.asarray(values, dtype=float)
+            stats[f"{prefix}_mean"] = float(arr.mean())
+            stats[f"{prefix}_std"] = float(arr.std())
+            stats[f"{prefix}_min"] = float(arr.min())
+            stats[f"{prefix}_max"] = float(arr.max())
+        else:
+            stats[f"{prefix}_mean"] = None
+            stats[f"{prefix}_std"] = None
+            stats[f"{prefix}_min"] = None
+            stats[f"{prefix}_max"] = None
+    return stats
 
 # python main.py --seed 0 --model mobilenet --last_fc --alg fedavg
 
@@ -1050,6 +1087,8 @@ def get_args():
                         help='Local target count ratio below this value is treated as low-frequency.')
     parser.add_argument('--train_branch_freq_high_ratio', type=float, default=1.5,
                         help='Local target count ratio above this value is treated as high-frequency.')
+    parser.add_argument('--log_client_group_lambda', action='store_true',
+                        help='For noniid_grouping, log selected-client effective BYOT alpha/lambda by partition group.')
     
     
     parser.add_argument('--min_threshold', type=float, default=0.8, help='시작 임계값 (Dynamic Threshold용)')
@@ -1254,6 +1293,11 @@ def main():
     if getattr(args, "log_train_branch_frequency_stats", False):
         for train_branch_key in TRAIN_BRANCH_FREQ_KEYS:
             pkl_dict[train_branch_key] = []
+    if getattr(args, "log_client_group_lambda", False):
+        num_group_logs = min(int(getattr(args, "partition_groups", 8)), max(int(getattr(args, "n_clients", 1)), 1))
+        for group_idx in range(num_group_logs):
+            for metric in CLIENT_GROUP_LAMBDA_METRICS:
+                pkl_dict[f"client_group_lambda_g{group_idx}_{metric}"] = []
     last_10 = []
     lr = args.lr
 
@@ -1364,6 +1408,14 @@ def main():
         pkl_dict['byot_effective_alpha_min'].append(avg_byot_alpha_min)
         pkl_dict['byot_effective_alpha_max'].append(avg_byot_alpha_max)
         pkl_dict['byot_server_lambda_scale'].append(server_lambda_scale)
+        client_group_lambda_stats = {}
+        if getattr(args, "log_client_group_lambda", False):
+            client_group_lambda_stats = compute_client_group_lambda_stats(args)
+            num_group_logs = min(int(getattr(args, "partition_groups", 8)), max(int(getattr(args, "n_clients", 1)), 1))
+            for group_idx in range(num_group_logs):
+                for metric in CLIENT_GROUP_LAMBDA_METRICS:
+                    key = f"client_group_lambda_g{group_idx}_{metric}"
+                    pkl_dict.setdefault(key, []).append(client_group_lambda_stats.get(key))
         if getattr(args, "log_train_branch_frequency_stats", False):
             train_branch_stats = getattr(args, "_last_train_branch_frequency_stats", {}) or {}
             for train_branch_key in TRAIN_BRANCH_FREQ_KEYS:
@@ -1508,6 +1560,9 @@ def main():
                 metrics[f"drift/{drift_key}"] = drift_value
             for gradient_key, gradient_value in gradient_probe_metrics.items():
                 metrics[f"gradient_probe/{gradient_key}"] = gradient_value
+            for group_key, group_value in client_group_lambda_stats.items():
+                if group_value is not None:
+                    metrics[f"client_group_lambda/{group_key}"] = group_value
             if getattr(args, "log_train_branch_frequency_stats", False):
                 for train_branch_key in TRAIN_BRANCH_FREQ_KEYS:
                     train_branch_values = pkl_dict.get(train_branch_key)
