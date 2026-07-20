@@ -1711,7 +1711,9 @@ def fedbyot_selective(net, global_model, prev_net, train_dataloader, optimizer, 
 
 def fedbyot_selective_ce_fallback(net, global_model, prev_net, train_dataloader, optimizer, device, args):
     temperature = float(getattr(args, "temperature", 0.5))
-    alpha = float(getattr(args, "byot_alpha", 0.15))
+    alpha = get_effective_byot_alpha(train_dataloader, args)
+    alpha = estimate_client_byot_alpha(net, train_dataloader, device, args, alpha)
+    alpha *= get_client_skew_scale(net, train_dataloader, device, args)
     beta = float(getattr(args, "byot_beta", 0.05))
     threshold = float(getattr(args, "kd_conf_threshold", 0.8))
     proxy = getattr(args, "byot_sample_proxy", "none")
@@ -1733,6 +1735,7 @@ def fedbyot_selective_ce_fallback(net, global_model, prev_net, train_dataloader,
     min_effective_alpha = None
     max_effective_alpha = None
     class_kd_counts = torch.zeros(int(getattr(args, "num_classes", 100)), device=device)
+    branch_freq_stats = None
 
     net.train()
 
