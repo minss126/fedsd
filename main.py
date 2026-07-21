@@ -67,6 +67,23 @@ TRAIN_BRANCH_FREQ_KEYS = [
     for branch_idx in (1, 2, 3)
     for metric in ("count", *TRAIN_BRANCH_FREQ_METRICS)
 ]
+CLIENT_BRANCH_FREQ_METRICS = (
+    "true_label_prob",
+    "entropy_norm",
+    "confidence",
+    "acc",
+    "teacher_js",
+    "local_count",
+    "local_ratio",
+)
+CLIENT_BRANCH_FREQ_SUMMARIES = ("count", "mean", "std", "min", "max")
+CLIENT_BRANCH_FREQ_KEYS = [
+    f"client_pretrain_branch_freq_{group}_b{branch_idx}_{metric}_{summary}"
+    for group in TRAIN_BRANCH_FREQ_GROUPS
+    for branch_idx in (1, 2, 3)
+    for metric in CLIENT_BRANCH_FREQ_METRICS
+    for summary in CLIENT_BRANCH_FREQ_SUMMARIES
+]
 CLIENT_GROUP_LAMBDA_METRICS = ("count", "mean", "std", "min", "max")
 
 
@@ -104,6 +121,90 @@ def compute_client_group_lambda_stats(args):
             stats[f"{prefix}_min"] = None
             stats[f"{prefix}_max"] = None
     return stats
+
+
+def compute_client_pretrain_branch_frequency_stats(
+    nets_this_round, dataloaders_this_round, device, args, train_module
+):
+    """Summarize branch logits per client before any local update.
+
+    Each selected client starts from the same global model in a FedAvg round.
+    Keeping client-level group means until this function returns lets us measure
+    client disagreement caused by different local class distributions, without
+    writing per-example logits to disk.
+    """
+    max_batches = int(getattr(args, "client_branch_freq_probe_batches", 0))
+    values = {
+        f"{group}_b{branch_idx}_{metric}": []
+        for group in TRAIN_BRANCH_FREQ_GROUPS
+        for branch_idx in (1, 2, 3)
+        for metric in CLIENT_BRANCH_FREQ_METRICS
+    }
+
+    for client_id, model in nets_this_round.items():
+        dataloader = dataloaders_this_round.get(client_id)
+        if dataloader is None:
+            continue
+
+        class_counts, _, expected_class_count = train_module.get_local_class_counts(
+            dataloader, args, device
+        )
+        if class_counts is None or expected_class_count is None:
+            continue
+
+        client_stats = train_module.init_train_branch_freq_stats()
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for batch_idx, (x, target) in enumerate(dataloader):
+                if max_batches > 0 and batch_idx >= max_batches:
+                    break
+                x = x.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True).long()
+                out = model(x)
+                if not (isinstance(out, tuple) and len(out) == 8):
+                    continue
+                output, m1, m2, m3 = out[:4]
+                teacher_prob = F.softmax(output / float(args.temperature), dim=1)
+                train_module.update_train_branch_freq_stats(
+                    client_stats,
+                    [m1, m2, m3],
+                    teacher_prob,
+                    target,
+                    class_counts,
+                    expected_class_count,
+                    args,
+                )
+        if was_training:
+            model.train()
+
+        finalized = train_module.finalize_train_branch_freq_stats(client_stats)
+        for group in TRAIN_BRANCH_FREQ_GROUPS:
+            for branch_idx in (1, 2, 3):
+                prefix = f"train_branch_freq_{group}_b{branch_idx}"
+                count = float(finalized.get(f"{prefix}_count", 0.0) or 0.0)
+                if count <= 0.0:
+                    continue
+                for metric in CLIENT_BRANCH_FREQ_METRICS:
+                    value = finalized.get(f"{prefix}_{metric}")
+                    if value is not None:
+                        values[f"{group}_b{branch_idx}_{metric}"].append(float(value))
+
+    summary = {}
+    for group in TRAIN_BRANCH_FREQ_GROUPS:
+        for branch_idx in (1, 2, 3):
+            for metric in CLIENT_BRANCH_FREQ_METRICS:
+                prefix = f"client_pretrain_branch_freq_{group}_b{branch_idx}_{metric}"
+                arr = np.asarray(values[f"{group}_b{branch_idx}_{metric}"], dtype=float)
+                summary[f"{prefix}_count"] = int(arr.size)
+                for stat in ("mean", "std", "min", "max"):
+                    summary[f"{prefix}_{stat}"] = None
+                if arr.size:
+                    summary[f"{prefix}_mean"] = float(arr.mean())
+                    summary[f"{prefix}_std"] = float(arr.std())
+                    summary[f"{prefix}_min"] = float(arr.min())
+                    summary[f"{prefix}_max"] = float(arr.max())
+    return summary
 
 # python main.py --seed 0 --model mobilenet --last_fc --alg fedavg
 
@@ -1087,6 +1188,12 @@ def get_args():
                         help='Local target count ratio below this value is treated as low-frequency.')
     parser.add_argument('--train_branch_freq_high_ratio', type=float, default=1.5,
                         help='Local target count ratio above this value is treated as high-frequency.')
+    parser.add_argument('--log_client_branch_frequency_stats', action='store_true',
+                        help='Before local training, summarize branch-frequency logits per selected client.')
+    parser.add_argument('--client_branch_freq_probe_interval', type=int, default=10,
+                        help='Record client-wise pre-training branch-frequency summaries every N rounds.')
+    parser.add_argument('--client_branch_freq_probe_batches', type=int, default=0,
+                        help='Local batches per selected client for the pre-training frequency probe; 0 uses all batches.')
     parser.add_argument('--log_client_group_lambda', action='store_true',
                         help='For noniid_grouping, log selected-client effective BYOT alpha/lambda by partition group.')
     
@@ -1293,6 +1400,9 @@ def main():
     if getattr(args, "log_train_branch_frequency_stats", False):
         for train_branch_key in TRAIN_BRANCH_FREQ_KEYS:
             pkl_dict[train_branch_key] = []
+    if getattr(args, "log_client_branch_frequency_stats", False):
+        for client_branch_key in CLIENT_BRANCH_FREQ_KEYS:
+            pkl_dict[client_branch_key] = []
     if getattr(args, "log_client_group_lambda", False):
         num_group_logs = min(int(getattr(args, "partition_groups", 8)), max(int(getattr(args, "n_clients", 1)), 1))
         for group_idx in range(num_group_logs):
@@ -1363,6 +1473,22 @@ def main():
                     f"RelCombined={gradient_probe_metrics['gradient_combined_relative']:.6f}"
                 )
 
+        client_branch_frequency_stats = {}
+        should_probe_client_branch_frequency = (
+            getattr(args, 'log_client_branch_frequency_stats', False)
+            and getattr(args, 'client_branch_freq_probe_interval', 1) > 0
+            and round % getattr(args, 'client_branch_freq_probe_interval', 1) == 0
+        )
+        if should_probe_client_branch_frequency:
+            client_branch_frequency_stats = compute_client_pretrain_branch_frequency_stats(
+                nets_this_round, dataloaders_this_round, device, args, train_module
+            )
+            logger.info(
+                "Client branch-frequency probe: "
+                f"low/B1 clients="
+                f"{client_branch_frequency_stats.get('client_pretrain_branch_freq_low_b1_entropy_norm_count', 0)}"
+            )
+
         old_w = copy.deepcopy(global_model.state_dict())
         
         args.current_round = round + 1
@@ -1420,6 +1546,11 @@ def main():
             train_branch_stats = getattr(args, "_last_train_branch_frequency_stats", {}) or {}
             for train_branch_key in TRAIN_BRANCH_FREQ_KEYS:
                 pkl_dict.setdefault(train_branch_key, []).append(train_branch_stats.get(train_branch_key))
+        if getattr(args, "log_client_branch_frequency_stats", False):
+            for client_branch_key in CLIENT_BRANCH_FREQ_KEYS:
+                pkl_dict.setdefault(client_branch_key, []).append(
+                    client_branch_frequency_stats.get(client_branch_key)
+                )
         for gradient_key in [
             'gradient_probe_clients',
             'gradient_ce_divergence',
