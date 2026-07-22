@@ -331,7 +331,21 @@ def get_client_skew_scale(net, train_dataloader, device, args):
     reliability = _clamp_unit(reliability)
     power = max(float(getattr(args, "byot_client_skew_power", 1.0)), 1e-8)
     min_scale = _clamp_unit(getattr(args, "byot_client_skew_min_scale", 0.0))
-    return min_scale + (1.0 - min_scale) * (reliability ** power)
+    max_scale = max(float(getattr(args, "byot_client_skew_max_scale", 10.0)), min_scale)
+    powered = reliability ** power
+
+    correction_mode = getattr(args, "byot_client_skew_correction_mode", "multiply")
+    if correction_mode == "normalize":
+        norm_value = max(float(getattr(args, "byot_client_skew_norm_value", 1.0)), 1e-8)
+        scale = powered / norm_value
+    elif correction_mode == "residual":
+        center = float(getattr(args, "byot_client_skew_center", 1.0))
+        gamma = float(getattr(args, "byot_client_skew_gamma", 1.0))
+        scale = 1.0 + gamma * (powered - center)
+    else:
+        scale = min_scale + (1.0 - min_scale) * powered
+
+    return min(max(scale, min_scale), max_scale)
 
 def get_byot_branch_alphas(args, device):
     raw = str(getattr(args, "byot_branch_alphas", "") or "").strip()

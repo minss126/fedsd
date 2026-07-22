@@ -38,16 +38,21 @@ LOW_RATIO="${LOW_RATIO:-0.5}"
 HIGH_RATIO="${HIGH_RATIO:-1.5}"
 PROBE_INTERVAL="${PROBE_INTERVAL:-10}"
 PROBE_BATCHES="${PROBE_BATCHES:-0}"
+POSTLOCAL_REF_PROBE_INTERVAL="${POSTLOCAL_REF_PROBE_INTERVAL:-10}"
+POSTLOCAL_REF_SAMPLES_PER_CLASS="${POSTLOCAL_REF_SAMPLES_PER_CLASS:-8}"
 LOG_ROOT="${LOG_ROOT:-logs/analysis/logs_client_pretrain_branch_frequency_r500}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 ALPHAS=(${ALPHAS_OVERRIDE:-0.00 1.00})
-# Minimal matrix: complex task under moderate/severe non-IID plus the C10
-# contrast under moderate non-IID.  With two seeds this is 3 x 2 x 2 = 12 jobs.
+# C100/C10 comparison across IID, moderate non-IID, and severe non-IID.
+# With two alpha values and two seeds this is 6 x 2 x 2 = 24 jobs.
 CASES=(
+    "cifar100|100|iid|--partition iid"
     "cifar100|100|beta_0.5|--partition noniid --beta 0.5"
     "cifar100|100|beta_0.1|--partition noniid --beta 0.1"
+    "cifar10|10|iid|--partition iid"
     "cifar10|10|beta_0.5|--partition noniid --beta 0.5"
+    "cifar10|10|beta_0.1|--partition noniid --beta 0.1"
 )
 
 WANDB_FLAGS=""
@@ -55,6 +60,18 @@ if [ "${USE_WANDB:-0}" = "1" ]; then
     WANDB_FLAGS="--use_wandb --wandb_project ${WANDB_PROJECT:-dxfl}"
     if [ -n "${WANDB_ENTITY:-}" ]; then
         WANDB_FLAGS="${WANDB_FLAGS} --wandb_entity ${WANDB_ENTITY}"
+    fi
+fi
+
+POSTLOCAL_FLAGS=()
+if [ "${ENABLE_POSTLOCAL_BRANCH_DISTRIBUTION:-0}" = "1" ]; then
+    POSTLOCAL_FLAGS=(
+        --log_postlocal_branch_distribution_stats
+        --postlocal_ref_probe_interval "${POSTLOCAL_REF_PROBE_INTERVAL}"
+        --postlocal_ref_samples_per_class "${POSTLOCAL_REF_SAMPLES_PER_CLASS}"
+    )
+    if [ "${SAVE_POSTLOCAL_FULL_LOGITS:-0}" = "1" ]; then
+        POSTLOCAL_FLAGS+=(--save_postlocal_full_logits)
     fi
 fi
 
@@ -114,6 +131,7 @@ run_job() {
         --log_client_branch_frequency_stats \
         --client_branch_freq_probe_interval "${PROBE_INTERVAL}" \
         --client_branch_freq_probe_batches "${PROBE_BATCHES}" \
+        "${POSTLOCAL_FLAGS[@]}" \
         ${env_flags} ${WANDB_FLAGS} \
         > "${log_dir}/${method_name}_terminal.log" 2>&1
     echo "[GPU ${gpu_id}] complete: ${setting} | alpha=${alpha} | seed=${seed}"
@@ -151,6 +169,7 @@ echo "========== Client Pretrain Branch-Frequency Probe =========="
 echo "gpus=${GPUS[*]}, rounds=${ROUNDS}, local_epochs=${LOCAL_EPOCHS}, seeds=${SEEDS[*]}"
 echo "cases=${CASES[*]}"
 echo "alphas=${ALPHAS[*]}, probe_interval=${PROBE_INTERVAL}, probe_batches=${PROBE_BATCHES}"
+echo "postlocal_distribution=${ENABLE_POSTLOCAL_BRANCH_DISTRIBUTION:-0}, postlocal_interval=${POSTLOCAL_REF_PROBE_INTERVAL}, postlocal_samples_per_class=${POSTLOCAL_REF_SAMPLES_PER_CLASS}, save_full_logits=${SAVE_POSTLOCAL_FULL_LOGITS:-0}"
 echo "low_ratio=${LOW_RATIO}, high_ratio=${HIGH_RATIO}, log_root=${LOG_ROOT}"
 echo "jobs=${job_count}, skip_existing=${SKIP_EXISTING}, wandb=${USE_WANDB:-0}"
 

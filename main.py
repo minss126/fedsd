@@ -84,6 +84,38 @@ CLIENT_BRANCH_FREQ_KEYS = [
     for metric in CLIENT_BRANCH_FREQ_METRICS
     for summary in CLIENT_BRANCH_FREQ_SUMMARIES
 ]
+CLIENT_TEACHER_FREQ_METRICS = (
+    "true_label_prob",
+    "entropy_norm",
+    "confidence",
+    "acc",
+    "local_count",
+    "local_ratio",
+)
+CLIENT_TEACHER_FREQ_KEYS = [
+    f"client_pretrain_teacher_freq_{group}_{metric}_{summary}"
+    for group in TRAIN_BRANCH_FREQ_GROUPS
+    for metric in CLIENT_TEACHER_FREQ_METRICS
+    for summary in CLIENT_BRANCH_FREQ_SUMMARIES
+]
+POSTLOCAL_REF_HEADS = ("teacher", "b1", "b2", "b3")
+POSTLOCAL_REF_METRICS = (
+    "sample_count",
+    "divergence_sample_count",
+    "client_count_mean",
+    "entropy_norm",
+    "true_label_prob",
+    "confidence",
+    "acc",
+    "js_to_mean",
+    "prob_l2_var",
+)
+POSTLOCAL_REF_KEYS = [
+    f"postlocal_ref_{group}_{head}_{metric}"
+    for group in TRAIN_BRANCH_FREQ_GROUPS
+    for head in POSTLOCAL_REF_HEADS
+    for metric in POSTLOCAL_REF_METRICS
+]
 CLIENT_GROUP_LAMBDA_METRICS = ("count", "mean", "std", "min", "max")
 
 
@@ -140,6 +172,11 @@ def compute_client_pretrain_branch_frequency_stats(
         for branch_idx in (1, 2, 3)
         for metric in CLIENT_BRANCH_FREQ_METRICS
     }
+    teacher_values = {
+        f"{group}_{metric}": []
+        for group in TRAIN_BRANCH_FREQ_GROUPS
+        for metric in CLIENT_TEACHER_FREQ_METRICS
+    }
 
     for client_id, model in nets_this_round.items():
         dataloader = dataloaders_this_round.get(client_id)
@@ -153,6 +190,10 @@ def compute_client_pretrain_branch_frequency_stats(
             continue
 
         client_stats = train_module.init_train_branch_freq_stats()
+        teacher_stats = {
+            group: {"count": 0.0, **{metric: 0.0 for metric in CLIENT_TEACHER_FREQ_METRICS}}
+            for group in TRAIN_BRANCH_FREQ_GROUPS
+        }
         was_training = model.training
         model.eval()
         with torch.no_grad():
@@ -175,6 +216,41 @@ def compute_client_pretrain_branch_frequency_stats(
                     expected_class_count,
                     args,
                 )
+
+                # Teacher statistics use exactly the same client-local frequency
+                # groups as the branch statistics, but are accumulated separately.
+                num_classes = max(int(teacher_prob.size(1)), 2)
+                log_c = math.log(num_classes)
+                target_counts = class_counts[target].float()
+                local_ratio = target_counts / max(float(expected_class_count), 1e-12)
+                group_masks = {
+                    "low": local_ratio < float(args.train_branch_freq_low_ratio),
+                    "mid": (
+                        (local_ratio >= float(args.train_branch_freq_low_ratio))
+                        & (local_ratio <= float(args.train_branch_freq_high_ratio))
+                    ),
+                    "high": local_ratio > float(args.train_branch_freq_high_ratio),
+                }
+                teacher_entropy = -(
+                    teacher_prob * torch.log(teacher_prob + 1e-8)
+                ).sum(dim=1) / log_c
+                teacher_true_prob = teacher_prob.gather(1, target.view(-1, 1)).squeeze(1)
+                teacher_confidence, teacher_pred = teacher_prob.max(dim=1)
+                teacher_metrics = {
+                    "true_label_prob": teacher_true_prob,
+                    "entropy_norm": teacher_entropy,
+                    "confidence": teacher_confidence,
+                    "acc": (teacher_pred == target).float(),
+                    "local_count": target_counts,
+                    "local_ratio": local_ratio,
+                }
+                for group, mask in group_masks.items():
+                    if not mask.any():
+                        continue
+                    count = float(mask.float().sum().item())
+                    teacher_stats[group]["count"] += count
+                    for metric, tensor in teacher_metrics.items():
+                        teacher_stats[group][metric] += float(tensor[mask].sum().item())
         if was_training:
             model.train()
 
@@ -189,6 +265,14 @@ def compute_client_pretrain_branch_frequency_stats(
                     value = finalized.get(f"{prefix}_{metric}")
                     if value is not None:
                         values[f"{group}_b{branch_idx}_{metric}"].append(float(value))
+        for group in TRAIN_BRANCH_FREQ_GROUPS:
+            count = teacher_stats[group]["count"]
+            if count <= 0.0:
+                continue
+            for metric in CLIENT_TEACHER_FREQ_METRICS:
+                teacher_values[f"{group}_{metric}"].append(
+                    teacher_stats[group][metric] / count
+                )
 
     summary = {}
     for group in TRAIN_BRANCH_FREQ_GROUPS:
@@ -204,7 +288,221 @@ def compute_client_pretrain_branch_frequency_stats(
                     summary[f"{prefix}_std"] = float(arr.std())
                     summary[f"{prefix}_min"] = float(arr.min())
                     summary[f"{prefix}_max"] = float(arr.max())
+    for group in TRAIN_BRANCH_FREQ_GROUPS:
+        for metric in CLIENT_TEACHER_FREQ_METRICS:
+            prefix = f"client_pretrain_teacher_freq_{group}_{metric}"
+            arr = np.asarray(teacher_values[f"{group}_{metric}"], dtype=float)
+            summary[f"{prefix}_count"] = int(arr.size)
+            for stat in ("mean", "std", "min", "max"):
+                summary[f"{prefix}_{stat}"] = None
+            if arr.size:
+                summary[f"{prefix}_mean"] = float(arr.mean())
+                summary[f"{prefix}_std"] = float(arr.std())
+                summary[f"{prefix}_min"] = float(arr.min())
+                summary[f"{prefix}_max"] = float(arr.max())
     return summary
+
+
+def compute_postlocal_reference_distribution_stats(
+    nets_this_round, dataloaders_this_round, reference_dataloader, device, args, train_module,
+    capture_full_logits=False,
+):
+    """Measure post-local client-model prediction divergence on common inputs.
+
+    A target class is assigned to low/mid/high separately for each client from
+    its local class counts.  For a common reference example (x, y), the
+    probability vectors of post-local client models whose local class y belongs
+    to the same group are compared to their group mean.  This avoids confusing
+    different client input distributions with client-model disagreement.
+    """
+    max_per_class = int(getattr(args, "postlocal_ref_samples_per_class", 8))
+    if reference_dataloader is None or max_per_class <= 0:
+        return {}, None
+
+    client_ids = list(nets_this_round.keys())
+    if len(client_ids) < 2:
+        return {}, None
+
+    num_classes = int(getattr(args, "num_classes", 0))
+    if num_classes <= 1:
+        return {}, None
+    low_ratio = float(args.train_branch_freq_low_ratio)
+    high_ratio = float(args.train_branch_freq_high_ratio)
+    temperature = float(args.temperature)
+    client_groups = {}
+    for client_id in client_ids:
+        class_counts, _, expected = train_module.get_local_class_counts(
+            dataloaders_this_round.get(client_id), args, device
+        )
+        if class_counts is None or expected is None or expected <= 0.0:
+            continue
+        ratios = (class_counts / max(float(expected), 1e-12)).detach().cpu().numpy()
+        groups = np.full(num_classes, 1, dtype=np.int8)  # mid
+        groups[ratios < low_ratio] = 0
+        groups[ratios > high_ratio] = 2
+        client_groups[client_id] = groups
+    client_ids = [client_id for client_id in client_ids if client_id in client_groups]
+    if len(client_ids) < 2:
+        return {}, None
+
+    group_names = TRAIN_BRANCH_FREQ_GROUPS
+    accum = {
+        group: {
+            head: {metric: 0.0 for metric in POSTLOCAL_REF_METRICS}
+            for head in POSTLOCAL_REF_HEADS
+        }
+        for group in group_names
+    }
+    per_class_seen = np.zeros(num_classes, dtype=np.int64)
+    raw_logits = None
+    raw_labels = []
+    raw_reference_positions = []
+    if capture_full_logits:
+        raw_logits = {
+            client_id: {head: [] for head in POSTLOCAL_REF_HEADS}
+            for client_id in client_ids
+        }
+    reference_position = 0
+    was_training = {client_id: nets_this_round[client_id].training for client_id in client_ids}
+    for client_id in client_ids:
+        nets_this_round[client_id].eval()
+
+    try:
+        with torch.no_grad():
+            for x, target in reference_dataloader:
+                batch_positions = torch.arange(
+                    reference_position, reference_position + x.size(0), dtype=torch.long
+                )
+                reference_position += x.size(0)
+                target_cpu = target.detach().cpu().long()
+                selected = []
+                for sample_idx, label in enumerate(target_cpu.tolist()):
+                    if 0 <= label < num_classes and per_class_seen[label] < max_per_class:
+                        selected.append(sample_idx)
+                        per_class_seen[label] += 1
+                if not selected:
+                    if np.all(per_class_seen >= max_per_class):
+                        break
+                    continue
+
+                index = torch.tensor(selected, device=x.device, dtype=torch.long)
+                x_selected = x.index_select(0, index).to(device, non_blocking=True)
+                target_selected = target.index_select(0, index).to(device, non_blocking=True).long()
+                probs_by_head = {head: [] for head in POSTLOCAL_REF_HEADS}
+                for client_id in client_ids:
+                    out = nets_this_round[client_id](x_selected)
+                    if not (isinstance(out, tuple) and len(out) == 8):
+                        continue
+                    output, m1, m2, m3 = out[:4]
+                    for head, logits in zip(POSTLOCAL_REF_HEADS, (output, m1, m2, m3)):
+                        probs_by_head[head].append(F.softmax(logits / temperature, dim=1))
+                        if capture_full_logits:
+                            raw_logits[client_id][head].append(
+                                logits.detach().cpu().to(torch.float16)
+                            )
+                if any(len(probs_by_head[head]) != len(client_ids) for head in POSTLOCAL_REF_HEADS):
+                    continue
+
+                if capture_full_logits:
+                    raw_labels.append(target_selected.detach().cpu())
+                    raw_reference_positions.append(batch_positions.index_select(0, index.cpu()))
+
+                for head in POSTLOCAL_REF_HEADS:
+                    probs_by_head[head] = torch.stack(probs_by_head[head], dim=0)
+                for sample_idx, label in enumerate(target_selected.tolist()):
+                    for group_idx, group in enumerate(group_names):
+                        model_indices = [
+                            idx for idx, client_id in enumerate(client_ids)
+                            if client_groups[client_id][label] == group_idx
+                        ]
+                        if not model_indices:
+                            continue
+                        model_index = torch.tensor(model_indices, device=device, dtype=torch.long)
+                        for head in POSTLOCAL_REF_HEADS:
+                            probs = probs_by_head[head].index_select(0, model_index)[:, sample_idx, :]
+                            mean_prob = probs.mean(dim=0, keepdim=True)
+                            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1) / math.log(num_classes)
+                            true_prob = probs[:, label]
+                            confidence, pred = probs.max(dim=1)
+                            metric = accum[group][head]
+                            # Scalar quantities average over all client-model/reference pairs.
+                            metric["entropy_norm"] += float(entropy.sum().item())
+                            metric["true_label_prob"] += float(true_prob.sum().item())
+                            metric["confidence"] += float(confidence.sum().item())
+                            metric["acc"] += float((pred == label).float().sum().item())
+                            metric["client_count_mean"] += float(len(model_indices))
+                            metric["sample_count"] += 1.0
+                            # These are true distribution-level disagreement metrics.  They
+                            # require at least two post-local client models for the group.
+                            if len(model_indices) >= 2:
+                                js = (probs * (torch.log(probs + 1e-8) - torch.log(mean_prob + 1e-8))).sum(dim=1)
+                                metric["js_to_mean"] += float((js / math.log(num_classes)).mean().item())
+                                metric["prob_l2_var"] += float(((probs - mean_prob) ** 2).sum(dim=1).mean().item())
+                            else:
+                                # Mark an unusable single-client sample for these two metrics.
+                                metric.setdefault("_divergence_samples", 0.0)
+                                continue
+                            metric["_divergence_samples"] = metric.get("_divergence_samples", 0.0) + 1.0
+                if np.all(per_class_seen >= max_per_class):
+                    break
+    finally:
+        for client_id in client_ids:
+            if was_training[client_id]:
+                nets_this_round[client_id].train()
+
+    result = {}
+    for group in group_names:
+        for head in POSTLOCAL_REF_HEADS:
+            metric = accum[group][head]
+            sample_count = metric["sample_count"]
+            prefix = f"postlocal_ref_{group}_{head}"
+            result[f"{prefix}_sample_count"] = int(sample_count)
+            result[f"{prefix}_divergence_sample_count"] = int(
+                metric.get("_divergence_samples", 0.0)
+            )
+            result[f"{prefix}_client_count_mean"] = (
+                metric["client_count_mean"] / sample_count if sample_count else None
+            )
+            for name in ("entropy_norm", "true_label_prob", "confidence", "acc"):
+                result[f"{prefix}_{name}"] = metric[name] / sample_count if sample_count else None
+            divergence_samples = metric.get("_divergence_samples", 0.0)
+            for name in ("js_to_mean", "prob_l2_var"):
+                result[f"{prefix}_{name}"] = (
+                    metric[name] / divergence_samples if divergence_samples else None
+                )
+    raw_snapshot = None
+    if capture_full_logits and raw_labels:
+        head_logits = []
+        for client_id in client_ids:
+            head_logits.append(torch.stack([
+                torch.cat(raw_logits[client_id][head], dim=0)
+                for head in POSTLOCAL_REF_HEADS
+            ], dim=0))
+        raw_snapshot = {
+            "format": "postlocal_full_logits_v1",
+            "head_order": list(POSTLOCAL_REF_HEADS),
+            "client_ids": torch.tensor(client_ids, dtype=torch.long),
+            "reference_positions": torch.cat(raw_reference_positions, dim=0),
+            "reference_labels": torch.cat(raw_labels, dim=0),
+            "local_frequency_groups": torch.tensor(
+                np.stack([client_groups[client_id] for client_id in client_ids]), dtype=torch.int8
+            ),
+            "group_order": list(TRAIN_BRANCH_FREQ_GROUPS),
+            # Shape: [selected_client, teacher/B1/B2/B3, reference_sample, class]
+            "logits": torch.stack(head_logits, dim=0),
+        }
+    return result, raw_snapshot
+
+
+def save_postlocal_full_logits(raw_snapshot, args, round_idx):
+    """Persist raw post-local logits separately from compact per-round pkl stats."""
+    if raw_snapshot is None:
+        return None
+    output_dir = os.path.join(args.logdir, f"{args.log_file_name}_full_logits")
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"round_{round_idx:04d}.pt")
+    torch.save(raw_snapshot, output_path)
+    return output_path
 
 # python main.py --seed 0 --model mobilenet --last_fc --alg fedavg
 
@@ -1094,6 +1392,20 @@ def get_args():
                         help='Minimum skew-penalty scale when client labels are extremely concentrated.')
     parser.add_argument('--byot_client_skew_power', type=float, default=1.0,
                         help='Power applied to the client skew reliability before scaling BYOT alpha/lambda.')
+    parser.add_argument('--byot_client_skew_correction_mode', default='multiply',
+                        choices=['multiply', 'normalize', 'residual'],
+                        help='How the client skew score is converted into a lambda scale. '
+                             'multiply keeps the original min+(1-min)*score behavior; '
+                             'normalize divides the powered score by --byot_client_skew_norm_value; '
+                             'residual uses 1 + gamma * (score - center).')
+    parser.add_argument('--byot_client_skew_norm_value', type=float, default=1.0,
+                        help='Denominator for --byot_client_skew_correction_mode normalize.')
+    parser.add_argument('--byot_client_skew_center', type=float, default=1.0,
+                        help='Center value for --byot_client_skew_correction_mode residual.')
+    parser.add_argument('--byot_client_skew_gamma', type=float, default=1.0,
+                        help='Residual strength for --byot_client_skew_correction_mode residual.')
+    parser.add_argument('--byot_client_skew_max_scale', type=float, default=10.0,
+                        help='Maximum client skew scale after correction.')
     parser.add_argument('--byot_class_proxy', default='none',
                         choices=['none', 'label_count', 'teacher_label_prob',
                                  'teacher_correctness', 'teacher_label_prob_count'],
@@ -1194,6 +1506,14 @@ def get_args():
                         help='Record client-wise pre-training branch-frequency summaries every N rounds.')
     parser.add_argument('--client_branch_freq_probe_batches', type=int, default=0,
                         help='Local batches per selected client for the pre-training frequency probe; 0 uses all batches.')
+    parser.add_argument('--log_postlocal_branch_distribution_stats', action='store_true',
+                        help='After local training and before aggregation, measure client-model probability-vector divergence on common reference samples.')
+    parser.add_argument('--postlocal_ref_probe_interval', type=int, default=10,
+                        help='Record post-local common-reference distribution divergence every N rounds.')
+    parser.add_argument('--postlocal_ref_samples_per_class', type=int, default=8,
+                        help='Common test/reference samples per class used in each post-local divergence probe.')
+    parser.add_argument('--save_postlocal_full_logits', action='store_true',
+                        help='Save full float16 logits for every selected client/head/reference sample at post-local probe rounds.')
     parser.add_argument('--log_client_group_lambda', action='store_true',
                         help='For noniid_grouping, log selected-client effective BYOT alpha/lambda by partition group.')
     
@@ -1403,6 +1723,11 @@ def main():
     if getattr(args, "log_client_branch_frequency_stats", False):
         for client_branch_key in CLIENT_BRANCH_FREQ_KEYS:
             pkl_dict[client_branch_key] = []
+        for teacher_freq_key in CLIENT_TEACHER_FREQ_KEYS:
+            pkl_dict[teacher_freq_key] = []
+    if getattr(args, "log_postlocal_branch_distribution_stats", False):
+        for postlocal_key in POSTLOCAL_REF_KEYS:
+            pkl_dict[postlocal_key] = []
     if getattr(args, "log_client_group_lambda", False):
         num_group_logs = min(int(getattr(args, "partition_groups", 8)), max(int(getattr(args, "n_clients", 1)), 1))
         for group_idx in range(num_group_logs):
@@ -1523,6 +1848,30 @@ def main():
             avg_byot_alpha_min = avg_byot_alpha_mean
             avg_byot_alpha_max = avg_byot_alpha_mean
 
+        postlocal_reference_stats = {}
+        postlocal_full_logit_path = None
+        should_probe_postlocal_reference = (
+            getattr(args, 'log_postlocal_branch_distribution_stats', False)
+            and getattr(args, 'postlocal_ref_probe_interval', 1) > 0
+            and round % getattr(args, 'postlocal_ref_probe_interval', 1) == 0
+        )
+        if should_probe_postlocal_reference:
+            postlocal_reference_stats, postlocal_raw_logits = compute_postlocal_reference_distribution_stats(
+                nets_this_round, dataloaders_this_round, global_test_dataloader,
+                device, args, train_module,
+                capture_full_logits=getattr(args, 'save_postlocal_full_logits', False),
+            )
+            if getattr(args, 'save_postlocal_full_logits', False):
+                postlocal_full_logit_path = save_postlocal_full_logits(
+                    postlocal_raw_logits, args, round
+                )
+            logger.info(
+                "Post-local reference distribution probe: "
+                f"low/B3 JS={postlocal_reference_stats.get('postlocal_ref_low_b3_js_to_mean')}"
+            )
+            if postlocal_full_logit_path:
+                logger.info(f"Saved full post-local logits: {postlocal_full_logit_path}")
+
         # 로그 저장
         pkl_dict['avg_train_loss'].append(avg_loss)
         pkl_dict['efficiency'].append(avg_ratio)
@@ -1550,6 +1899,15 @@ def main():
             for client_branch_key in CLIENT_BRANCH_FREQ_KEYS:
                 pkl_dict.setdefault(client_branch_key, []).append(
                     client_branch_frequency_stats.get(client_branch_key)
+                )
+            for teacher_freq_key in CLIENT_TEACHER_FREQ_KEYS:
+                pkl_dict.setdefault(teacher_freq_key, []).append(
+                    client_branch_frequency_stats.get(teacher_freq_key)
+                )
+        if getattr(args, "log_postlocal_branch_distribution_stats", False):
+            for postlocal_key in POSTLOCAL_REF_KEYS:
+                pkl_dict.setdefault(postlocal_key, []).append(
+                    postlocal_reference_stats.get(postlocal_key)
                 )
         for gradient_key in [
             'gradient_probe_clients',
