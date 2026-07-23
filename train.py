@@ -267,7 +267,7 @@ def get_effective_byot_alpha(train_dataloader, args):
 
     return alpha
 
-def get_client_skew_scale(net, train_dataloader, device, args):
+def estimate_client_skew_reliability(net, train_dataloader, device, args):
     proxy = getattr(args, "byot_client_skew_proxy", "none")
     if proxy == "none":
         return 1.0
@@ -328,6 +328,9 @@ def get_client_skew_scale(net, train_dataloader, device, args):
         else:
             return 1.0
 
+    return _clamp_unit(reliability)
+
+def get_client_skew_scale_from_reliability(reliability, args):
     reliability = _clamp_unit(reliability)
     power = max(float(getattr(args, "byot_client_skew_power", 1.0)), 1e-8)
     min_scale = _clamp_unit(getattr(args, "byot_client_skew_min_scale", 0.0))
@@ -346,6 +349,32 @@ def get_client_skew_scale(net, train_dataloader, device, args):
         scale = min_scale + (1.0 - min_scale) * powered
 
     return min(max(scale, min_scale), max_scale)
+
+def get_client_skew_scale(net, train_dataloader, device, args):
+    reliability = estimate_client_skew_reliability(net, train_dataloader, device, args)
+    return get_client_skew_scale_from_reliability(reliability, args)
+
+def get_byot_lambda_granularity_gate(skew_reliability, args):
+    mode = getattr(args, "byot_lambda_gate_mode", "none")
+    if mode == "none":
+        return 0.0
+
+    tau = _clamp_unit(getattr(args, "byot_lambda_gate_tau", 0.75))
+    # Low entropy/reliability means stronger skew, so it should move toward
+    # the client-wise adaptive lambda branch.
+    if mode == "hard":
+        gate = 1.0 if float(skew_reliability) < tau else 0.0
+    elif mode == "soft":
+        temperature = max(float(getattr(args, "byot_lambda_gate_temperature", 0.05)), 1e-8)
+        gate = 1.0 / (1.0 + math.exp((float(skew_reliability) - tau) / temperature))
+    else:
+        return 0.0
+
+    warmup = int(getattr(args, "byot_lambda_gate_warmup", 0))
+    if warmup > 0:
+        current_round = int(getattr(args, "current_round", 0))
+        gate *= _clamp_unit(current_round / max(1, warmup))
+    return _clamp_unit(gate)
 
 def get_byot_branch_alphas(args, device):
     raw = str(getattr(args, "byot_branch_alphas", "") or "").strip()
@@ -1261,9 +1290,11 @@ def fedacg(net, global_model, prev_global_model, train_dataloader, optimizer, de
 
 def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, args):
     temperature = args.temperature
-    alpha = get_effective_byot_alpha(train_dataloader, args)
-    alpha = estimate_client_byot_alpha(net, train_dataloader, device, args, alpha)
-    alpha *= get_client_skew_scale(net, train_dataloader, device, args)
+    base_alpha = get_effective_byot_alpha(train_dataloader, args)
+    alpha = estimate_client_byot_alpha(net, train_dataloader, device, args, base_alpha)
+    skew_reliability = estimate_client_skew_reliability(net, train_dataloader, device, args)
+    alpha *= get_client_skew_scale_from_reliability(skew_reliability, args)
+    lambda_gate = get_byot_lambda_granularity_gate(skew_reliability, args)
     class_alpha = estimate_class_byot_alpha(net, train_dataloader, device, args, alpha)
     branch_objective = getattr(args, "byot_branch_objective", "blend")
     branch_alphas = get_byot_branch_alphas(args, device)
@@ -1357,6 +1388,10 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                     sample_alpha = class_alpha[target].to(device)
                 else:
                     sample_alpha = get_sample_byot_alpha(alpha, teacher_prob, [m1, m2, m3], target, args)
+                    if sample_alpha is not None and lambda_gate > 0.0:
+                        sample_only_alpha = get_sample_byot_alpha(base_alpha, teacher_prob, [m1, m2, m3], target, args)
+                        if sample_only_alpha is not None:
+                            sample_alpha = (1.0 - lambda_gate) * sample_only_alpha + lambda_gate * alpha
                 if not active_branch_indices:
                     alpha_mean = 0.0
                     alpha_min = 0.0

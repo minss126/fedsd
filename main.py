@@ -1406,6 +1406,18 @@ def get_args():
                         help='Residual strength for --byot_client_skew_correction_mode residual.')
     parser.add_argument('--byot_client_skew_max_scale', type=float, default=10.0,
                         help='Maximum client skew scale after correction.')
+    parser.add_argument('--byot_lambda_gate_mode', default='none',
+                        choices=['none', 'hard', 'soft'],
+                        help='Gate between sample-wise and client-wise BYOT lambda control. '
+                             'none keeps the current lambda behavior; hard/soft interpolate from '
+                             'sample-wise lambda to client-wise adaptive lambda when client skew is severe.')
+    parser.add_argument('--byot_lambda_gate_tau', type=float, default=0.75,
+                        help='Client skew reliability threshold for --byot_lambda_gate_mode. '
+                             'Lower reliability than tau moves toward client-wise adaptive lambda.')
+    parser.add_argument('--byot_lambda_gate_temperature', type=float, default=0.05,
+                        help='Soft gate temperature for --byot_lambda_gate_mode soft.')
+    parser.add_argument('--byot_lambda_gate_warmup', type=int, default=0,
+                        help='Optional round warmup before fully applying the lambda granularity gate.')
     parser.add_argument('--byot_class_proxy', default='none',
                         choices=['none', 'label_count', 'teacher_label_prob',
                                  'teacher_correctness', 'teacher_label_prob_count'],
