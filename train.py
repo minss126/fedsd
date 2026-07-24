@@ -359,6 +359,9 @@ def get_byot_lambda_granularity_gate(skew_reliability, args):
     if mode == "none":
         return 0.0
 
+    if getattr(args, "byot_lambda_gate_scope", "client") == "round":
+        skew_reliability = float(getattr(args, "byot_lambda_gate_global_reliability", skew_reliability))
+
     tau = _clamp_unit(getattr(args, "byot_lambda_gate_tau", 0.75))
     # Low entropy/reliability means stronger skew, so it should move toward
     # the client-wise adaptive lambda branch.
@@ -1295,6 +1298,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
     skew_reliability = estimate_client_skew_reliability(net, train_dataloader, device, args)
     alpha *= get_client_skew_scale_from_reliability(skew_reliability, args)
     lambda_gate = get_byot_lambda_granularity_gate(skew_reliability, args)
+    lambda_gate_enabled = getattr(args, "byot_lambda_gate_mode", "none") != "none"
     class_alpha = estimate_class_byot_alpha(net, train_dataloader, device, args, alpha)
     branch_objective = getattr(args, "byot_branch_objective", "blend")
     branch_alphas = get_byot_branch_alphas(args, device)
@@ -1387,11 +1391,12 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                 elif class_alpha is not None:
                     sample_alpha = class_alpha[target].to(device)
                 else:
-                    sample_alpha = get_sample_byot_alpha(alpha, teacher_prob, [m1, m2, m3], target, args)
-                    if sample_alpha is not None and lambda_gate > 0.0:
-                        sample_only_alpha = get_sample_byot_alpha(base_alpha, teacher_prob, [m1, m2, m3], target, args)
-                        if sample_only_alpha is not None:
-                            sample_alpha = (1.0 - lambda_gate) * sample_only_alpha + lambda_gate * alpha
+                    if lambda_gate_enabled:
+                        sample_alpha = get_sample_byot_alpha(base_alpha, teacher_prob, [m1, m2, m3], target, args)
+                        if sample_alpha is not None:
+                            sample_alpha = (1.0 - lambda_gate) * sample_alpha + lambda_gate * alpha
+                    else:
+                        sample_alpha = get_sample_byot_alpha(alpha, teacher_prob, [m1, m2, m3], target, args)
                 if not active_branch_indices:
                     alpha_mean = 0.0
                     alpha_min = 0.0

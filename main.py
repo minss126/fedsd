@@ -47,6 +47,69 @@ BRANCH_LOGIT_PROBE_KEYS = [
     for metric in BRANCH_LOGIT_PROBE_METRICS
 ]
 
+# The legacy gradient probe compares (teacher CE + branch CE) against branch KD.
+# The decomposed probe below additionally records the three objective components
+# separately, because only branch CE and branch KD are controlled by byot_alpha.
+GRADIENT_PROBE_COMPONENTS = (
+    "teacher_ce",
+    "branch_ce",
+    "branch_kd",
+    "feature",
+    "configured_total",
+)
+GRADIENT_PROBE_STATS = (
+    "divergence",
+    "relative",
+    "norm",
+    "norm_sq",
+    "mean_norm",
+    "cosine",
+)
+GRADIENT_PROBE_PAIR_STATS = (
+    "cross",
+    "corr",
+    "cosine",
+    "distance",
+    "kd_ce_norm_ratio",
+)
+LEGACY_GRADIENT_PROBE_KEYS = (
+    "gradient_probe_clients",
+    *[
+        f"gradient_{component}_{stat}"
+        for component in ("ce", "kd", "combined")
+        for stat in GRADIENT_PROBE_STATS
+    ],
+    *[f"gradient_ce_kd_{stat}" for stat in GRADIENT_PROBE_PAIR_STATS],
+)
+
+def _parse_gradient_probe_scopes(args):
+    raw = str(getattr(args, "gradient_probe_scopes", "all,shared_backbone") or "").strip()
+    scopes = [value.strip() for value in raw.split(",") if value.strip()]
+    valid = {"all", "shared_backbone"}
+    if not scopes:
+        raise ValueError("--gradient_probe_scopes must contain at least one scope.")
+    invalid = [scope for scope in scopes if scope not in valid]
+    if invalid:
+        raise ValueError(
+            "Unsupported --gradient_probe_scopes value(s): "
+            f"{','.join(invalid)}. Supported: all,shared_backbone."
+        )
+    return list(dict.fromkeys(scopes))
+
+def _decomposed_gradient_probe_keys(args):
+    keys = []
+    for scope in _parse_gradient_probe_scopes(args):
+        for component in GRADIENT_PROBE_COMPONENTS:
+            keys.extend(
+                f"gradient_{scope}_{component}_{stat}"
+                for stat in GRADIENT_PROBE_STATS
+            )
+        keys.extend(
+            f"gradient_{scope}_branch_ce_kd_{stat}"
+            for stat in GRADIENT_PROBE_PAIR_STATS
+        )
+    return keys
+
 TRAIN_BRANCH_FREQ_GROUPS = ("low", "mid", "high")
 TRAIN_BRANCH_FREQ_METRICS = (
     "true_label_prob",
@@ -464,7 +527,12 @@ def compute_postlocal_reference_distribution_stats(
                 metric["client_count_mean"] / sample_count if sample_count else None
             )
             for name in ("entropy_norm", "true_label_prob", "confidence", "acc"):
-                result[f"{prefix}_{name}"] = metric[name] / sample_count if sample_count else None
+                # Scalar sums contain one contribution per client model, unlike
+                # divergence metrics which are already averaged within a sample.
+                result[f"{prefix}_{name}"] = (
+                    metric[name] / metric["client_count_mean"]
+                    if metric["client_count_mean"] else None
+                )
             divergence_samples = metric.get("_divergence_samples", 0.0)
             for name in ("js_to_mean", "prob_l2_var"):
                 result[f"{prefix}_{name}"] = (
@@ -573,9 +641,13 @@ def compute_client_update_drift(old_w, nets_this_round, fed_avg_freqs, eps=1e-12
             "client_update_cosine": cosine_sum,
         }
 
-def _flatten_current_grads(model):
+def _flatten_current_grads(model, parameter_names=None):
+    """Flatten the current gradients, optionally over a named parameter subset."""
+    selected = None if parameter_names is None else set(parameter_names)
     grads = []
-    for param in model.parameters():
+    for name, param in model.named_parameters():
+        if selected is not None and name not in selected:
+            continue
         if param.grad is None:
             grads.append(torch.zeros_like(param, device='cpu').flatten())
         else:
@@ -584,30 +656,155 @@ def _flatten_current_grads(model):
         return torch.empty(0)
     return torch.cat(grads)
 
-def _gradient_probe_losses(model, x, target, temperature):
-    out = model(x)
-    if isinstance(out, tuple) and len(out) == 8:
-        output, m1, m2, m3, _, _, _, _ = out
-        ce_loss = (
-            F.cross_entropy(output, target)
-            + F.cross_entropy(m1, target)
-            + F.cross_entropy(m2, target)
-            + F.cross_entropy(m3, target)
-        )
-        with torch.no_grad():
-            teacher_prob = F.softmax(output / temperature, dim=1)
-        kd_loss = (
-            F.kl_div(F.log_softmax(m1 / temperature, dim=1), teacher_prob, reduction='batchmean')
-            + F.kl_div(F.log_softmax(m2 / temperature, dim=1), teacher_prob, reduction='batchmean')
-            + F.kl_div(F.log_softmax(m3 / temperature, dim=1), teacher_prob, reduction='batchmean')
-        ) * (temperature ** 2)
-        return ce_loss, kd_loss
+def _gradient_probe_scope_parameter_names(model, scope):
+    """Return the parameter subset for a probe scope.
 
-    if isinstance(out, tuple):
-        output = out[-1]
-    else:
-        output = out
-    return F.cross_entropy(output, target), None
+    ``shared_backbone`` deliberately excludes the teacher classifier and all
+    branch-only adapters/classifiers. For ResNet18_BYOT this leaves conv1/bn1
+    and residual layers 1--4: the feature extractor shared by the teacher and
+    the branch paths, rather than a branch head's private classifier.
+    """
+    if scope == "all":
+        return None
+    if scope != "shared_backbone":
+        raise ValueError(f"Unknown gradient probe scope: {scope}")
+
+    branch_or_head_tokens = (
+        "bottleneck",
+        "downsample1_1",
+        "downsample2_1",
+        "downsample3_1",
+        "middle_fc",
+        "branch1",
+        "branch2",
+        "branch3",
+        "adapter",
+        "classifier",
+    )
+    names = []
+    for name, _ in model.named_parameters():
+        is_teacher_head = name == "fc.weight" or name == "fc.bias" or ".fc." in name
+        if is_teacher_head or any(token in name for token in branch_or_head_tokens):
+            continue
+        names.append(name)
+    if not names:
+        raise ValueError(
+            "No parameters selected for gradient probe scope 'shared_backbone'. "
+            "Use --gradient_probe_scopes all for this model."
+        )
+    return names
+
+def _gradient_probe_active_branch_indices(args):
+    raw = str(getattr(args, "byot_active_branches", "1,2,3") or "1,2,3").strip()
+    values = [value.strip() for value in raw.split(",") if value.strip()]
+    indices = []
+    for value in values:
+        branch_id = int(value)
+        if branch_id < 1 or branch_id > 3:
+            raise ValueError("--byot_active_branches only supports branch ids 1,2,3.")
+        index = branch_id - 1
+        if index not in indices:
+            indices.append(index)
+    return indices
+
+def _reduce_gradient_probe_branch_loss(loss, active_branch_indices, args):
+    if getattr(args, "byot_branch_loss_reduction", "sum") == "mean":
+        return loss / max(1, len(active_branch_indices))
+    return loss
+
+def _gradient_probe_loss_components(model, x, target, args):
+    """Compute the BYOT losses as separately differentiable components.
+
+    The branch CE and branch KD definitions mirror ``train.fedbyot`` for the
+    static, scalar-alpha configuration used by the analysis script. Teacher
+    probabilities are detached, exactly as in training.
+    """
+    out = model(x)
+    if not (isinstance(out, tuple) and len(out) == 8):
+        return None
+
+    output, m1, m2, m3, final_fea, f1, f2, f3 = out
+    temperature = float(getattr(args, "temperature", 0.5))
+    active_branch_indices = _gradient_probe_active_branch_indices(args)
+    branch_logits = (m1, m2, m3)
+    branch_features = (f1, f2, f3)
+
+    teacher_ce = F.cross_entropy(output, target)
+    if not active_branch_indices:
+        return {
+            "teacher_ce": teacher_ce,
+            "branch_ce": None,
+            "branch_kd": None,
+            "feature": None,
+        }
+
+    branch_ce_losses = [F.cross_entropy(logits, target) for logits in branch_logits]
+    branch_ce = sum(branch_ce_losses[index] for index in active_branch_indices)
+    branch_ce = _reduce_gradient_probe_branch_loss(branch_ce, active_branch_indices, args)
+
+    with torch.no_grad():
+        teacher_prob = F.softmax(output / temperature, dim=1)
+    branch_kd_losses = [
+        F.kl_div(
+            F.log_softmax(logits / temperature, dim=1),
+            teacher_prob,
+            reduction="batchmean",
+        ) * (temperature ** 2)
+        for logits in branch_logits
+    ]
+    branch_kd = sum(branch_kd_losses[index] for index in active_branch_indices)
+    branch_kd = _reduce_gradient_probe_branch_loss(branch_kd, active_branch_indices, args)
+
+    feature_losses = [F.mse_loss(feature, final_fea.detach()) for feature in branch_features]
+    feature = sum(feature_losses[index] for index in active_branch_indices)
+    feature = _reduce_gradient_probe_branch_loss(feature, active_branch_indices, args)
+
+    return {
+        "teacher_ce": teacher_ce,
+        "branch_ce": branch_ce,
+        "branch_kd": branch_kd,
+        "feature": feature,
+    }
+
+def _average_probe_component_gradients(model, dataloader, device, args, max_batches, scopes):
+    """Average each decomposed BYOT gradient over the requested client batches."""
+    scope_parameter_names = {
+        scope: _gradient_probe_scope_parameter_names(model, scope)
+        for scope in scopes
+    }
+    gradients = {
+        component: {scope: [] for scope in scopes}
+        for component in ("teacher_ce", "branch_ce", "branch_kd", "feature")
+    }
+
+    for batch_idx, (x, target) in enumerate(dataloader):
+        if batch_idx >= max_batches:
+            break
+        x, target = x.to(device), target.to(device).long()
+        components = _gradient_probe_loss_components(model, x, target, args)
+        if components is None:
+            continue
+        active_components = [
+            (name, loss) for name, loss in components.items() if loss is not None
+        ]
+        for component_idx, (name, loss) in enumerate(active_components):
+            model.zero_grad(set_to_none=True)
+            loss.backward(retain_graph=component_idx < len(active_components) - 1)
+            for scope, parameter_names in scope_parameter_names.items():
+                gradients[name][scope].append(
+                    _flatten_current_grads(model, parameter_names)
+                )
+        model.zero_grad(set_to_none=True)
+
+    averaged = {}
+    for component, by_scope in gradients.items():
+        averaged[component] = {}
+        for scope, vectors in by_scope.items():
+            if vectors:
+                averaged[component][scope] = torch.stack(vectors, dim=0).mean(dim=0)
+            else:
+                averaged[component][scope] = None
+    return averaged
 
 def _average_kd_info_probe(model, dataloader, device, args, max_batches):
     metrics = {
@@ -816,30 +1013,6 @@ def _average_branch_logit_probe(
         ) / 3.0
     return result
 
-def _average_probe_gradient(model, dataloader, device, args, loss_kind, max_batches):
-    grads = []
-    temperature = float(getattr(args, 'temperature', 0.5))
-    for batch_idx, (x, target) in enumerate(dataloader):
-        if batch_idx >= max_batches:
-            break
-        x, target = x.to(device), target.to(device).long()
-        model.zero_grad(set_to_none=True)
-        ce_loss, kd_loss = _gradient_probe_losses(model, x, target, temperature)
-        if loss_kind == 'ce':
-            loss = ce_loss
-        elif loss_kind == 'kd':
-            if kd_loss is None:
-                continue
-            loss = kd_loss
-        else:
-            raise ValueError(f"Unknown probe loss kind: {loss_kind}")
-        loss.backward()
-        grads.append(_flatten_current_grads(model))
-    model.zero_grad(set_to_none=True)
-    if not grads:
-        return None
-    return torch.stack(grads, dim=0).mean(dim=0)
-
 def _weighted_gradient_stats(gradients, weights, eps=1e-12):
     valid = [(grad, float(weight)) for grad, weight in zip(gradients, weights) if grad is not None]
     if not valid:
@@ -917,16 +1090,62 @@ def _weighted_centered_cross_stats(left_gradients, right_gradients, weights, eps
         "corr": corr,
     }
 
+def _weighted_gradient_pair_stats(left_gradients, right_gradients, weights, eps=1e-12):
+    """Relationship between two loss gradients on the same sampled clients."""
+    cross_stats = _weighted_centered_cross_stats(left_gradients, right_gradients, weights, eps)
+    valid = [
+        (left, right, float(weight))
+        for left, right, weight in zip(left_gradients, right_gradients, weights)
+        if left is not None and right is not None
+    ]
+    if not valid:
+        return None
+
+    total_weight = sum(weight for _, _, weight in valid)
+    if total_weight <= 0:
+        return None
+
+    cosine = 0.0
+    distance = 0.0
+    right_left_norm_ratio = 0.0
+    for left, right, weight in valid:
+        weight = weight / total_weight
+        left_norm = torch.norm(left)
+        right_norm = torch.norm(right)
+        cosine += weight * float(
+            torch.sum(left * right).item() / (left_norm.item() * right_norm.item() + eps)
+        )
+        distance += weight * float(
+            torch.norm(left - right).item() / (left_norm.item() + right_norm.item() + eps)
+        )
+        right_left_norm_ratio += weight * float(right_norm.item() / (left_norm.item() + eps))
+
+    result = {
+        "cosine": cosine,
+        "distance": distance,
+        "kd_ce_norm_ratio": right_left_norm_ratio,
+    }
+    if cross_stats is not None:
+        result.update(cross_stats)
+    return result
+
 def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_avg_freqs, device, args):
-    """
-    Probe gradient dissimilarity at the round-start global model.
-    CE and KD gradients are measured separately, then combined as CE + alpha * KD
-    to match the theorem-level FedSD objective decomposition.
+    """Probe decomposed BYOT gradients at the shared round-start global model.
+
+    In addition to preserving the legacy ``CE=(teacher CE + branch CE)`` vs.
+    ``KD=branch KD`` fields, this records teacher CE, branch CE, branch KD,
+    feature imitation, and the configured training total independently.  The
+    latter is exact for the static-alpha blend/kd_only configurations used by
+    the analysis script.
     """
     max_batches = max(1, int(getattr(args, 'gradient_probe_batches', 1)))
     alpha = float(getattr(args, 'byot_alpha', 0.0))
-    ce_gradients = []
-    kd_gradients = []
+    feature_beta = float(getattr(args, "byot_beta", 0.0))
+    scopes = _parse_gradient_probe_scopes(args)
+    component_gradients = {
+        scope: {component: [] for component in GRADIENT_PROBE_COMPONENTS}
+        for scope in scopes
+    }
     kd_info_sums = {}
     branch_logit_sums = {}
     used_weights = []
@@ -950,16 +1169,41 @@ def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_av
             client_id=client_id,
             save_examples=save_branch_examples_this_round and idx < max_example_clients,
         )
-        ce_grad = _average_probe_gradient(model, dataloader, device, args, 'ce', max_batches)
-        kd_grad = _average_probe_gradient(model, dataloader, device, args, 'kd', max_batches)
+        client_component_gradients = _average_probe_component_gradients(
+            model, dataloader, device, args, max_batches, scopes
+        )
         if was_training:
             model.train()
-        if ce_grad is None:
+        if client_component_gradients["teacher_ce"][scopes[0]] is None:
             continue
-        if kd_grad is None:
-            kd_grad = torch.zeros_like(ce_grad)
-        ce_gradients.append(ce_grad)
-        kd_gradients.append(kd_grad)
+
+        for scope in scopes:
+            teacher_ce = client_component_gradients["teacher_ce"][scope]
+            branch_ce = client_component_gradients["branch_ce"][scope]
+            branch_kd = client_component_gradients["branch_kd"][scope]
+            feature = client_component_gradients["feature"][scope]
+            if branch_ce is None:
+                branch_ce = torch.zeros_like(teacher_ce)
+            if branch_kd is None:
+                branch_kd = torch.zeros_like(teacher_ce)
+            if feature is None:
+                feature = torch.zeros_like(teacher_ce)
+
+            if getattr(args, "byot_branch_objective", "blend") == "kd_only":
+                configured_total = teacher_ce + alpha * branch_kd + feature_beta * feature
+            else:
+                configured_total = (
+                    teacher_ce
+                    + (1.0 - alpha) * branch_ce
+                    + alpha * branch_kd
+                    + feature_beta * feature
+                )
+            component_gradients[scope]["teacher_ce"].append(teacher_ce)
+            component_gradients[scope]["branch_ce"].append(branch_ce)
+            component_gradients[scope]["branch_kd"].append(branch_kd)
+            component_gradients[scope]["feature"].append(feature)
+            component_gradients[scope]["configured_total"].append(configured_total)
+
         weight = float(fed_avg_freqs[idx])
         used_weights.append(weight)
         if kd_info is not None:
@@ -969,47 +1213,57 @@ def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_av
             for key, value in branch_logit_info.items():
                 branch_logit_sums[key] = branch_logit_sums.get(key, 0.0) + weight * value
 
-    ce_stats = _weighted_gradient_stats(ce_gradients, used_weights)
-    kd_stats = _weighted_gradient_stats(kd_gradients, used_weights)
-    combined = [ce_grad + alpha * kd_grad for ce_grad, kd_grad in zip(ce_gradients, kd_gradients)]
-    combined_stats = _weighted_gradient_stats(combined, used_weights)
-    cross_stats = _weighted_centered_cross_stats(ce_gradients, kd_gradients, used_weights)
-
-    if ce_stats is None or kd_stats is None or combined_stats is None:
+    if not used_weights:
         return {}
 
-    metrics = {"gradient_probe_clients": len(ce_gradients)}
-    for prefix, stats in [
-        ("gradient_ce", ce_stats),
-        ("gradient_kd", kd_stats),
-        ("gradient_combined", combined_stats),
-    ]:
-        for key, value in stats.items():
-            metrics[f"{prefix}_{key}"] = value
-    if cross_stats is not None:
-        metrics["gradient_ce_kd_cross"] = cross_stats["cross"]
-        metrics["gradient_ce_kd_corr"] = cross_stats["corr"]
+    metrics = {"gradient_probe_clients": len(used_weights)}
+    for scope in scopes:
+        for component in GRADIENT_PROBE_COMPONENTS:
+            stats = _weighted_gradient_stats(component_gradients[scope][component], used_weights)
+            if stats is not None:
+                for key, value in stats.items():
+                    metrics[f"gradient_{scope}_{component}_{key}"] = value
+        pair_stats = _weighted_gradient_pair_stats(
+            component_gradients[scope]["branch_ce"],
+            component_gradients[scope]["branch_kd"],
+            used_weights,
+        )
+        if pair_stats is not None:
+            for key, value in pair_stats.items():
+                metrics[f"gradient_{scope}_branch_ce_kd_{key}"] = value
+
+    # Preserve legacy fields so existing analysis notebooks do not break.
+    if "all" in component_gradients:
+        legacy_ce = [
+            teacher_ce + branch_ce
+            for teacher_ce, branch_ce in zip(
+                component_gradients["all"]["teacher_ce"],
+                component_gradients["all"]["branch_ce"],
+            )
+        ]
+        legacy_kd = component_gradients["all"]["branch_kd"]
+        legacy_combined = [
+            ce_grad + alpha * kd_grad
+            for ce_grad, kd_grad in zip(legacy_ce, legacy_kd)
+        ]
+        for prefix, gradients in (
+            ("gradient_ce", legacy_ce),
+            ("gradient_kd", legacy_kd),
+            ("gradient_combined", legacy_combined),
+        ):
+            stats = _weighted_gradient_stats(gradients, used_weights)
+            if stats is not None:
+                for key, value in stats.items():
+                    metrics[f"{prefix}_{key}"] = value
+        legacy_pair_stats = _weighted_gradient_pair_stats(legacy_ce, legacy_kd, used_weights)
+        if legacy_pair_stats is not None:
+            for key, value in legacy_pair_stats.items():
+                metrics[f"gradient_ce_kd_{key}"] = value
+
     for key, value in kd_info_sums.items():
         metrics[f"kd_info_{key}"] = value
     for key, value in branch_logit_sums.items():
         metrics[key] = value
-
-    ce_kd_cosine = 0.0
-    ce_kd_distance = 0.0
-    kd_ce_norm_ratio = 0.0
-    weight_total = sum(used_weights)
-    if weight_total > 0:
-        for ce_grad, kd_grad, weight in zip(ce_gradients, kd_gradients, used_weights):
-            weight = weight / weight_total
-            ce_norm = torch.norm(ce_grad)
-            kd_norm = torch.norm(kd_grad)
-            denom = ce_norm * kd_norm + 1e-12
-            ce_kd_cosine += weight * float(torch.sum(ce_grad * kd_grad).item() / denom.item())
-            ce_kd_distance += weight * float(torch.norm(ce_grad - kd_grad).item() / (ce_norm.item() + kd_norm.item() + 1e-12))
-            kd_ce_norm_ratio += weight * float(kd_norm.item() / (ce_norm.item() + 1e-12))
-        metrics["gradient_ce_kd_cosine"] = ce_kd_cosine
-        metrics["gradient_ce_kd_distance"] = ce_kd_distance
-        metrics["gradient_kd_ce_norm_ratio"] = kd_ce_norm_ratio
 
     return metrics
 
@@ -1411,6 +1665,10 @@ def get_args():
                         help='Gate between sample-wise and client-wise BYOT lambda control. '
                              'none keeps the current lambda behavior; hard/soft interpolate from '
                              'sample-wise lambda to client-wise adaptive lambda when client skew is severe.')
+    parser.add_argument('--byot_lambda_gate_scope', default='client',
+                        choices=['client', 'round'],
+                        help='Whether the lambda granularity gate is computed from each client skew score '
+                             'or from the selected clients round-level mean skew score.')
     parser.add_argument('--byot_lambda_gate_tau', type=float, default=0.75,
                         help='Client skew reliability threshold for --byot_lambda_gate_mode. '
                              'Lower reliability than tau moves toward client-wise adaptive lambda.')
@@ -1496,6 +1754,9 @@ def get_args():
                         help='Probe gradient dissimilarity every N rounds when --log_gradient_probe is enabled.')
     parser.add_argument('--gradient_probe_batches', type=int, default=1,
                         help='Number of local batches per sampled client used for gradient probing.')
+    parser.add_argument('--gradient_probe_scopes', default='all,shared_backbone',
+                        help='Comma-separated parameter scopes for decomposed BYOT gradients: '
+                             'all, shared_backbone. shared_backbone excludes teacher/branch heads.')
     parser.add_argument('--log_branch_logit_examples', action='store_true',
                         help='Save branch/teacher top-k probability examples as JSONL during gradient probes.')
     parser.add_argument('--branch_logit_example_rounds', default='0,100,250,last',
@@ -1727,6 +1988,8 @@ def main():
         'byot_server_lambda_scale': [],
         'max': 0, 'avg_10': 0, 'avg_30': 0, 'avg_50': 0
     }
+    for gradient_key in _decomposed_gradient_probe_keys(args):
+        pkl_dict[gradient_key] = []
     for branch_logit_key in BRANCH_LOGIT_PROBE_KEYS:
         pkl_dict[branch_logit_key] = []
     if getattr(args, "log_train_branch_frequency_stats", False):
@@ -1788,6 +2051,37 @@ def main():
         for client_idx, net in nets_this_round.items():
             net.load_state_dict(global_w)
 
+        if (
+            getattr(args, "byot_lambda_gate_mode", "none") != "none"
+            and getattr(args, "byot_lambda_gate_scope", "client") == "round"
+        ):
+            round_skew_scores = []
+            round_skew_weights = []
+            for client_idx, net in nets_this_round.items():
+                dataloader = dataloaders_this_round.get(client_idx)
+                if dataloader is None:
+                    continue
+                score = train_module.estimate_client_skew_reliability(
+                    net, dataloader, device, args
+                )
+                round_skew_scores.append(float(score))
+                round_skew_weights.append(float(len(dataloader.dataset)))
+            if round_skew_scores:
+                weights = np.asarray(round_skew_weights, dtype=np.float64)
+                scores = np.asarray(round_skew_scores, dtype=np.float64)
+                if weights.sum() > 0.0:
+                    args.byot_lambda_gate_global_reliability = float(
+                        np.average(scores, weights=weights)
+                    )
+                else:
+                    args.byot_lambda_gate_global_reliability = float(scores.mean())
+            else:
+                args.byot_lambda_gate_global_reliability = 1.0
+            logger.info(
+                "Round lambda granularity gate reliability: "
+                f"{args.byot_lambda_gate_global_reliability:.6f}"
+            )
+
         # Gradient dissimilarity probe at the shared round-start model.
         total_batches = sum([len(dataloaders_this_round[j]) for j in dataloaders_this_round if dataloaders_this_round[j] is not None])
         fed_avg_freqs = [len(dataloaders_this_round[j]) / total_batches if dataloaders_this_round[j] is not None else 0.0 for j in dataloaders_this_round]
@@ -1804,10 +2098,10 @@ def main():
             if gradient_probe_metrics:
                 logger.info(
                     "Gradient probe: "
-                    f"CE={gradient_probe_metrics['gradient_ce_divergence']:.6f}, "
-                    f"KD={gradient_probe_metrics['gradient_kd_divergence']:.6f}, "
-                    f"Combined={gradient_probe_metrics['gradient_combined_divergence']:.6f}, "
-                    f"RelCombined={gradient_probe_metrics['gradient_combined_relative']:.6f}"
+                    f"branchCE(all)={gradient_probe_metrics.get('gradient_all_branch_ce_divergence', float('nan')):.6f}, "
+                    f"branchKD(all)={gradient_probe_metrics.get('gradient_all_branch_kd_divergence', float('nan')):.6f}, "
+                    f"total(all)={gradient_probe_metrics.get('gradient_all_configured_total_divergence', float('nan')):.6f}, "
+                    f"CE-KD cosine(shared)={gradient_probe_metrics.get('gradient_shared_backbone_branch_ce_kd_cosine', float('nan')):.6f}"
                 )
 
         client_branch_frequency_stats = {}
@@ -1953,6 +2247,7 @@ def main():
             'kd_info_teacher_top2_margin',
             'kd_info_teacher_confidence',
             *BRANCH_LOGIT_PROBE_KEYS,
+            *_decomposed_gradient_probe_keys(args),
         ]:
             pkl_dict[gradient_key].append(gradient_probe_metrics.get(gradient_key))
 
