@@ -5,8 +5,6 @@ import time
 import pickle
 import random
 import os 
-import math
-import json
 import numpy as np 
 
 import sys
@@ -27,627 +25,130 @@ from models.mobilenet_v2 import MobileNetV2, MobileNetV2BYOT
 
 import fl_utils 
 
-BRANCH_LOGIT_PROBE_METRICS = [
-    "entropy_norm",
-    "true_label_prob",
-    "non_target_mass",
-    "top2_margin",
-    "confidence",
-    "acc",
-    "teacher_js",
-    "teacher_kl",
-    "entropy_gap",
-]
-BRANCH_LOGIT_PROBE_KEYS = [
-    f"branch_logit_b{branch_idx}_{metric}"
-    for branch_idx in (1, 2, 3)
-    for metric in BRANCH_LOGIT_PROBE_METRICS
-] + [
-    f"branch_logit_avg_{metric}"
-    for metric in BRANCH_LOGIT_PROBE_METRICS
-]
-
-# The legacy gradient probe compares (teacher CE + branch CE) against branch KD.
-# The decomposed probe below additionally records the three objective components
-# separately, because only branch CE and branch KD are controlled by byot_alpha.
-GRADIENT_PROBE_COMPONENTS = (
-    "teacher_ce",
-    "branch_ce",
-    "branch_kd",
-    "feature",
-    "configured_total",
-)
-GRADIENT_PROBE_STATS = (
-    "divergence",
-    "relative",
-    "norm",
-    "norm_sq",
-    "mean_norm",
-    "cosine",
-)
-GRADIENT_PROBE_PAIR_STATS = (
-    "cross",
-    "corr",
-    "cosine",
-    "distance",
-    "kd_ce_norm_ratio",
-)
-LEGACY_GRADIENT_PROBE_KEYS = (
-    "gradient_probe_clients",
-    *[
-        f"gradient_{component}_{stat}"
-        for component in ("ce", "kd", "combined")
-        for stat in GRADIENT_PROBE_STATS
-    ],
-    *[f"gradient_ce_kd_{stat}" for stat in GRADIENT_PROBE_PAIR_STATS],
-)
-
-def _parse_gradient_probe_scopes(args):
-    raw = str(getattr(args, "gradient_probe_scopes", "all,shared_backbone") or "").strip()
-    scopes = [value.strip() for value in raw.split(",") if value.strip()]
-    valid = {"all", "shared_backbone"}
-    if not scopes:
-        raise ValueError("--gradient_probe_scopes must contain at least one scope.")
-    invalid = [scope for scope in scopes if scope not in valid]
-    if invalid:
-        raise ValueError(
-            "Unsupported --gradient_probe_scopes value(s): "
-            f"{','.join(invalid)}. Supported: all,shared_backbone."
-        )
-    return list(dict.fromkeys(scopes))
-
-def _decomposed_gradient_probe_keys(args):
-    keys = []
-    for scope in _parse_gradient_probe_scopes(args):
-        for component in GRADIENT_PROBE_COMPONENTS:
-            keys.extend(
-                f"gradient_{scope}_{component}_{stat}"
-                for stat in GRADIENT_PROBE_STATS
-            )
-        keys.extend(
-            f"gradient_{scope}_branch_ce_kd_{stat}"
-            for stat in GRADIENT_PROBE_PAIR_STATS
-        )
-    return keys
-
-TRAIN_BRANCH_FREQ_GROUPS = ("low", "mid", "high")
-TRAIN_BRANCH_FREQ_METRICS = (
-    "true_label_prob",
-    "entropy_norm",
-    "confidence",
-    "acc",
-    "teacher_js",
-    "prob_mass_low",
-    "prob_mass_mid",
-    "prob_mass_high",
-    "high_low_mass_ratio",
-    "local_count",
-    "local_ratio",
-)
-TRAIN_BRANCH_FREQ_KEYS = [
-    f"train_branch_freq_{group}_b{branch_idx}_{metric}"
-    for group in TRAIN_BRANCH_FREQ_GROUPS
-    for branch_idx in (1, 2, 3)
-    for metric in ("count", *TRAIN_BRANCH_FREQ_METRICS)
-]
-CLIENT_BRANCH_FREQ_METRICS = (
-    "true_label_prob",
-    "entropy_norm",
-    "confidence",
-    "acc",
-    "teacher_js",
-    "local_count",
-    "local_ratio",
-)
-CLIENT_BRANCH_FREQ_SUMMARIES = ("count", "mean", "std", "min", "max")
-CLIENT_BRANCH_FREQ_KEYS = [
-    f"client_pretrain_branch_freq_{group}_b{branch_idx}_{metric}_{summary}"
-    for group in TRAIN_BRANCH_FREQ_GROUPS
-    for branch_idx in (1, 2, 3)
-    for metric in CLIENT_BRANCH_FREQ_METRICS
-    for summary in CLIENT_BRANCH_FREQ_SUMMARIES
-]
-CLIENT_TEACHER_FREQ_METRICS = (
-    "true_label_prob",
-    "entropy_norm",
-    "confidence",
-    "acc",
-    "local_count",
-    "local_ratio",
-)
-CLIENT_TEACHER_FREQ_KEYS = [
-    f"client_pretrain_teacher_freq_{group}_{metric}_{summary}"
-    for group in TRAIN_BRANCH_FREQ_GROUPS
-    for metric in CLIENT_TEACHER_FREQ_METRICS
-    for summary in CLIENT_BRANCH_FREQ_SUMMARIES
-]
-POSTLOCAL_REF_HEADS = ("teacher", "b1", "b2", "b3")
-POSTLOCAL_REF_METRICS = (
-    "sample_count",
-    "divergence_sample_count",
-    "client_count_mean",
-    "entropy_norm",
-    "true_label_prob",
-    "confidence",
-    "acc",
-    "js_to_mean",
-    "prob_l2_var",
-)
-POSTLOCAL_REF_KEYS = [
-    f"postlocal_ref_{group}_{head}_{metric}"
-    for group in TRAIN_BRANCH_FREQ_GROUPS
-    for head in POSTLOCAL_REF_HEADS
-    for metric in POSTLOCAL_REF_METRICS
-]
-CLIENT_GROUP_LAMBDA_METRICS = ("count", "mean", "std", "min", "max")
-
-
-def compute_client_group_lambda_stats(args):
-    """Aggregate per-client effective BYOT alpha/lambda by noniid_grouping group."""
-    if getattr(args, "partition", None) != "noniid_grouping":
-        return {}
-
-    client_stats = getattr(args, "_last_client_byot_alpha_stats", {}) or {}
-    if not client_stats:
-        return {}
-
-    num_clients = int(getattr(args, "n_clients", 0))
-    num_groups = min(int(getattr(args, "partition_groups", 8)), max(num_clients, 1))
-    groups = np.array_split(np.arange(num_clients), num_groups)
-
-    stats = {}
-    for group_idx, clients in enumerate(groups):
-        values = [
-            float(client_stats[int(client_id)]["mean"])
-            for client_id in clients
-            if int(client_id) in client_stats
-        ]
-        prefix = f"client_group_lambda_g{group_idx}"
-        stats[f"{prefix}_count"] = len(values)
-        if values:
-            arr = np.asarray(values, dtype=float)
-            stats[f"{prefix}_mean"] = float(arr.mean())
-            stats[f"{prefix}_std"] = float(arr.std())
-            stats[f"{prefix}_min"] = float(arr.min())
-            stats[f"{prefix}_max"] = float(arr.max())
-        else:
-            stats[f"{prefix}_mean"] = None
-            stats[f"{prefix}_std"] = None
-            stats[f"{prefix}_min"] = None
-            stats[f"{prefix}_max"] = None
-    return stats
-
-
-def compute_client_pretrain_branch_frequency_stats(
-    nets_this_round, dataloaders_this_round, device, args, train_module
-):
-    """Summarize branch logits per client before any local update.
-
-    Each selected client starts from the same global model in a FedAvg round.
-    Keeping client-level group means until this function returns lets us measure
-    client disagreement caused by different local class distributions, without
-    writing per-example logits to disk.
-    """
-    max_batches = int(getattr(args, "client_branch_freq_probe_batches", 0))
-    values = {
-        f"{group}_b{branch_idx}_{metric}": []
-        for group in TRAIN_BRANCH_FREQ_GROUPS
-        for branch_idx in (1, 2, 3)
-        for metric in CLIENT_BRANCH_FREQ_METRICS
-    }
-    teacher_values = {
-        f"{group}_{metric}": []
-        for group in TRAIN_BRANCH_FREQ_GROUPS
-        for metric in CLIENT_TEACHER_FREQ_METRICS
-    }
-
-    for client_id, model in nets_this_round.items():
-        dataloader = dataloaders_this_round.get(client_id)
-        if dataloader is None:
-            continue
-
-        class_counts, _, expected_class_count = train_module.get_local_class_counts(
-            dataloader, args, device
-        )
-        if class_counts is None or expected_class_count is None:
-            continue
-
-        client_stats = train_module.init_train_branch_freq_stats()
-        teacher_stats = {
-            group: {"count": 0.0, **{metric: 0.0 for metric in CLIENT_TEACHER_FREQ_METRICS}}
-            for group in TRAIN_BRANCH_FREQ_GROUPS
-        }
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            for batch_idx, (x, target) in enumerate(dataloader):
-                if max_batches > 0 and batch_idx >= max_batches:
-                    break
-                x = x.to(device, non_blocking=True)
-                target = target.to(device, non_blocking=True).long()
-                out = model(x)
-                if not (isinstance(out, tuple) and len(out) == 8):
-                    continue
-                output, m1, m2, m3 = out[:4]
-                teacher_prob = F.softmax(output / float(args.temperature), dim=1)
-                train_module.update_train_branch_freq_stats(
-                    client_stats,
-                    [m1, m2, m3],
-                    teacher_prob,
-                    target,
-                    class_counts,
-                    expected_class_count,
-                    args,
-                )
-
-                # Teacher statistics use exactly the same client-local frequency
-                # groups as the branch statistics, but are accumulated separately.
-                num_classes = max(int(teacher_prob.size(1)), 2)
-                log_c = math.log(num_classes)
-                target_counts = class_counts[target].float()
-                local_ratio = target_counts / max(float(expected_class_count), 1e-12)
-                group_masks = {
-                    "low": local_ratio < float(args.train_branch_freq_low_ratio),
-                    "mid": (
-                        (local_ratio >= float(args.train_branch_freq_low_ratio))
-                        & (local_ratio <= float(args.train_branch_freq_high_ratio))
-                    ),
-                    "high": local_ratio > float(args.train_branch_freq_high_ratio),
-                }
-                teacher_entropy = -(
-                    teacher_prob * torch.log(teacher_prob + 1e-8)
-                ).sum(dim=1) / log_c
-                teacher_true_prob = teacher_prob.gather(1, target.view(-1, 1)).squeeze(1)
-                teacher_confidence, teacher_pred = teacher_prob.max(dim=1)
-                teacher_metrics = {
-                    "true_label_prob": teacher_true_prob,
-                    "entropy_norm": teacher_entropy,
-                    "confidence": teacher_confidence,
-                    "acc": (teacher_pred == target).float(),
-                    "local_count": target_counts,
-                    "local_ratio": local_ratio,
-                }
-                for group, mask in group_masks.items():
-                    if not mask.any():
-                        continue
-                    count = float(mask.float().sum().item())
-                    teacher_stats[group]["count"] += count
-                    for metric, tensor in teacher_metrics.items():
-                        teacher_stats[group][metric] += float(tensor[mask].sum().item())
-        if was_training:
-            model.train()
-
-        finalized = train_module.finalize_train_branch_freq_stats(client_stats)
-        for group in TRAIN_BRANCH_FREQ_GROUPS:
-            for branch_idx in (1, 2, 3):
-                prefix = f"train_branch_freq_{group}_b{branch_idx}"
-                count = float(finalized.get(f"{prefix}_count", 0.0) or 0.0)
-                if count <= 0.0:
-                    continue
-                for metric in CLIENT_BRANCH_FREQ_METRICS:
-                    value = finalized.get(f"{prefix}_{metric}")
-                    if value is not None:
-                        values[f"{group}_b{branch_idx}_{metric}"].append(float(value))
-        for group in TRAIN_BRANCH_FREQ_GROUPS:
-            count = teacher_stats[group]["count"]
-            if count <= 0.0:
-                continue
-            for metric in CLIENT_TEACHER_FREQ_METRICS:
-                teacher_values[f"{group}_{metric}"].append(
-                    teacher_stats[group][metric] / count
-                )
-
-    summary = {}
-    for group in TRAIN_BRANCH_FREQ_GROUPS:
-        for branch_idx in (1, 2, 3):
-            for metric in CLIENT_BRANCH_FREQ_METRICS:
-                prefix = f"client_pretrain_branch_freq_{group}_b{branch_idx}_{metric}"
-                arr = np.asarray(values[f"{group}_b{branch_idx}_{metric}"], dtype=float)
-                summary[f"{prefix}_count"] = int(arr.size)
-                for stat in ("mean", "std", "min", "max"):
-                    summary[f"{prefix}_{stat}"] = None
-                if arr.size:
-                    summary[f"{prefix}_mean"] = float(arr.mean())
-                    summary[f"{prefix}_std"] = float(arr.std())
-                    summary[f"{prefix}_min"] = float(arr.min())
-                    summary[f"{prefix}_max"] = float(arr.max())
-    for group in TRAIN_BRANCH_FREQ_GROUPS:
-        for metric in CLIENT_TEACHER_FREQ_METRICS:
-            prefix = f"client_pretrain_teacher_freq_{group}_{metric}"
-            arr = np.asarray(teacher_values[f"{group}_{metric}"], dtype=float)
-            summary[f"{prefix}_count"] = int(arr.size)
-            for stat in ("mean", "std", "min", "max"):
-                summary[f"{prefix}_{stat}"] = None
-            if arr.size:
-                summary[f"{prefix}_mean"] = float(arr.mean())
-                summary[f"{prefix}_std"] = float(arr.std())
-                summary[f"{prefix}_min"] = float(arr.min())
-                summary[f"{prefix}_max"] = float(arr.max())
-    return summary
-
-
-def compute_postlocal_reference_distribution_stats(
-    nets_this_round, dataloaders_this_round, reference_dataloader, device, args, train_module,
-    capture_full_logits=False,
-):
-    """Measure post-local client-model prediction divergence on common inputs.
-
-    A target class is assigned to low/mid/high separately for each client from
-    its local class counts.  For a common reference example (x, y), the
-    probability vectors of post-local client models whose local class y belongs
-    to the same group are compared to their group mean.  This avoids confusing
-    different client input distributions with client-model disagreement.
-    """
-    max_per_class = int(getattr(args, "postlocal_ref_samples_per_class", 8))
-    if reference_dataloader is None or max_per_class <= 0:
-        return {}, None
-
-    client_ids = list(nets_this_round.keys())
-    if len(client_ids) < 2:
-        return {}, None
-
-    num_classes = int(getattr(args, "num_classes", 0))
-    if num_classes <= 1:
-        return {}, None
-    low_ratio = float(args.train_branch_freq_low_ratio)
-    high_ratio = float(args.train_branch_freq_high_ratio)
-    temperature = float(args.temperature)
-    client_groups = {}
-    for client_id in client_ids:
-        class_counts, _, expected = train_module.get_local_class_counts(
-            dataloaders_this_round.get(client_id), args, device
-        )
-        if class_counts is None or expected is None or expected <= 0.0:
-            continue
-        ratios = (class_counts / max(float(expected), 1e-12)).detach().cpu().numpy()
-        groups = np.full(num_classes, 1, dtype=np.int8)  # mid
-        groups[ratios < low_ratio] = 0
-        groups[ratios > high_ratio] = 2
-        client_groups[client_id] = groups
-    client_ids = [client_id for client_id in client_ids if client_id in client_groups]
-    if len(client_ids) < 2:
-        return {}, None
-
-    group_names = TRAIN_BRANCH_FREQ_GROUPS
-    accum = {
-        group: {
-            head: {metric: 0.0 for metric in POSTLOCAL_REF_METRICS}
-            for head in POSTLOCAL_REF_HEADS
-        }
-        for group in group_names
-    }
-    per_class_seen = np.zeros(num_classes, dtype=np.int64)
-    raw_logits = None
-    raw_labels = []
-    raw_reference_positions = []
-    if capture_full_logits:
-        raw_logits = {
-            client_id: {head: [] for head in POSTLOCAL_REF_HEADS}
-            for client_id in client_ids
-        }
-    reference_position = 0
-    was_training = {client_id: nets_this_round[client_id].training for client_id in client_ids}
-    for client_id in client_ids:
-        nets_this_round[client_id].eval()
-
-    try:
-        with torch.no_grad():
-            for x, target in reference_dataloader:
-                batch_positions = torch.arange(
-                    reference_position, reference_position + x.size(0), dtype=torch.long
-                )
-                reference_position += x.size(0)
-                target_cpu = target.detach().cpu().long()
-                selected = []
-                for sample_idx, label in enumerate(target_cpu.tolist()):
-                    if 0 <= label < num_classes and per_class_seen[label] < max_per_class:
-                        selected.append(sample_idx)
-                        per_class_seen[label] += 1
-                if not selected:
-                    if np.all(per_class_seen >= max_per_class):
-                        break
-                    continue
-
-                index = torch.tensor(selected, device=x.device, dtype=torch.long)
-                x_selected = x.index_select(0, index).to(device, non_blocking=True)
-                target_selected = target.index_select(0, index).to(device, non_blocking=True).long()
-                probs_by_head = {head: [] for head in POSTLOCAL_REF_HEADS}
-                for client_id in client_ids:
-                    out = nets_this_round[client_id](x_selected)
-                    if not (isinstance(out, tuple) and len(out) == 8):
-                        continue
-                    output, m1, m2, m3 = out[:4]
-                    for head, logits in zip(POSTLOCAL_REF_HEADS, (output, m1, m2, m3)):
-                        probs_by_head[head].append(F.softmax(logits / temperature, dim=1))
-                        if capture_full_logits:
-                            raw_logits[client_id][head].append(
-                                logits.detach().cpu().to(torch.float16)
-                            )
-                if any(len(probs_by_head[head]) != len(client_ids) for head in POSTLOCAL_REF_HEADS):
-                    continue
-
-                if capture_full_logits:
-                    raw_labels.append(target_selected.detach().cpu())
-                    raw_reference_positions.append(batch_positions.index_select(0, index.cpu()))
-
-                for head in POSTLOCAL_REF_HEADS:
-                    probs_by_head[head] = torch.stack(probs_by_head[head], dim=0)
-                for sample_idx, label in enumerate(target_selected.tolist()):
-                    for group_idx, group in enumerate(group_names):
-                        model_indices = [
-                            idx for idx, client_id in enumerate(client_ids)
-                            if client_groups[client_id][label] == group_idx
-                        ]
-                        if not model_indices:
-                            continue
-                        model_index = torch.tensor(model_indices, device=device, dtype=torch.long)
-                        for head in POSTLOCAL_REF_HEADS:
-                            probs = probs_by_head[head].index_select(0, model_index)[:, sample_idx, :]
-                            mean_prob = probs.mean(dim=0, keepdim=True)
-                            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1) / math.log(num_classes)
-                            true_prob = probs[:, label]
-                            confidence, pred = probs.max(dim=1)
-                            metric = accum[group][head]
-                            # Scalar quantities average over all client-model/reference pairs.
-                            metric["entropy_norm"] += float(entropy.sum().item())
-                            metric["true_label_prob"] += float(true_prob.sum().item())
-                            metric["confidence"] += float(confidence.sum().item())
-                            metric["acc"] += float((pred == label).float().sum().item())
-                            metric["client_count_mean"] += float(len(model_indices))
-                            metric["sample_count"] += 1.0
-                            # These are true distribution-level disagreement metrics.  They
-                            # require at least two post-local client models for the group.
-                            if len(model_indices) >= 2:
-                                js = (probs * (torch.log(probs + 1e-8) - torch.log(mean_prob + 1e-8))).sum(dim=1)
-                                metric["js_to_mean"] += float((js / math.log(num_classes)).mean().item())
-                                metric["prob_l2_var"] += float(((probs - mean_prob) ** 2).sum(dim=1).mean().item())
-                            else:
-                                # Mark an unusable single-client sample for these two metrics.
-                                metric.setdefault("_divergence_samples", 0.0)
-                                continue
-                            metric["_divergence_samples"] = metric.get("_divergence_samples", 0.0) + 1.0
-                if np.all(per_class_seen >= max_per_class):
-                    break
-    finally:
-        for client_id in client_ids:
-            if was_training[client_id]:
-                nets_this_round[client_id].train()
-
-    result = {}
-    for group in group_names:
-        for head in POSTLOCAL_REF_HEADS:
-            metric = accum[group][head]
-            sample_count = metric["sample_count"]
-            prefix = f"postlocal_ref_{group}_{head}"
-            result[f"{prefix}_sample_count"] = int(sample_count)
-            result[f"{prefix}_divergence_sample_count"] = int(
-                metric.get("_divergence_samples", 0.0)
-            )
-            result[f"{prefix}_client_count_mean"] = (
-                metric["client_count_mean"] / sample_count if sample_count else None
-            )
-            for name in ("entropy_norm", "true_label_prob", "confidence", "acc"):
-                # Scalar sums contain one contribution per client model, unlike
-                # divergence metrics which are already averaged within a sample.
-                result[f"{prefix}_{name}"] = (
-                    metric[name] / metric["client_count_mean"]
-                    if metric["client_count_mean"] else None
-                )
-            divergence_samples = metric.get("_divergence_samples", 0.0)
-            for name in ("js_to_mean", "prob_l2_var"):
-                result[f"{prefix}_{name}"] = (
-                    metric[name] / divergence_samples if divergence_samples else None
-                )
-    raw_snapshot = None
-    if capture_full_logits and raw_labels:
-        head_logits = []
-        for client_id in client_ids:
-            head_logits.append(torch.stack([
-                torch.cat(raw_logits[client_id][head], dim=0)
-                for head in POSTLOCAL_REF_HEADS
-            ], dim=0))
-        raw_snapshot = {
-            "format": "postlocal_full_logits_v1",
-            "head_order": list(POSTLOCAL_REF_HEADS),
-            "client_ids": torch.tensor(client_ids, dtype=torch.long),
-            "reference_positions": torch.cat(raw_reference_positions, dim=0),
-            "reference_labels": torch.cat(raw_labels, dim=0),
-            "local_frequency_groups": torch.tensor(
-                np.stack([client_groups[client_id] for client_id in client_ids]), dtype=torch.int8
-            ),
-            "group_order": list(TRAIN_BRANCH_FREQ_GROUPS),
-            # Shape: [selected_client, teacher/B1/B2/B3, reference_sample, class]
-            "logits": torch.stack(head_logits, dim=0),
-        }
-    return result, raw_snapshot
-
-
-def save_postlocal_full_logits(raw_snapshot, args, round_idx):
-    """Persist raw post-local logits separately from compact per-round pkl stats."""
-    if raw_snapshot is None:
-        return None
-    output_dir = os.path.join(args.logdir, f"{args.log_file_name}_full_logits")
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f"round_{round_idx:04d}.pt")
-    torch.save(raw_snapshot, output_path)
-    return output_path
-
 # python main.py --seed 0 --model mobilenet --last_fc --alg fedavg
 
-def compute_client_update_drift(old_w, nets_this_round, fed_avg_freqs, eps=1e-12):
-    """
-    Measure how far local client updates deviate from the weighted mean update.
-    This is an update-space proxy for client drift, computed after local training
-    and before aggregation.
-    """
-    client_ids = list(nets_this_round.keys())
-    if not client_ids:
-        return {}
+LAYERWISE_UPDATE_GROUPS = (
+    "stem",
+    "layer1",
+    "layer2",
+    "layer3",
+    "layer4",
+    "branch_private",
+    "teacher_head",
+    "other",
+)
 
-    float_keys = [
-        key for key, value in old_w.items()
-        if torch.is_floating_point(value)
-    ]
+
+def _layerwise_update_group(key):
+    if key.startswith(("conv1.", "bn1.")):
+        return "stem"
+    for layer_name in ("layer1", "layer2", "layer3", "layer4"):
+        if key.startswith(f"{layer_name}."):
+            return layer_name
+    if key.startswith("fc."):
+        return "teacher_head"
+    if any(token in key for token in ("bottleneck", "middle_fc", "downsample")):
+        return "branch_private"
+    return "other"
+
+
+def _compute_update_drift_for_keys(old_w, nets_this_round, fed_avg_freqs, keys, eps=1e-12):
+    """Compute weighted pre-aggregation update geometry for one parameter group."""
+    client_ids = list(nets_this_round.keys())
+    if not client_ids or not keys:
+        return None
+
+    mean_update = {}
+    for key in keys:
+        mean = torch.zeros_like(old_w[key], device='cpu')
+        old_value = old_w[key].detach().cpu()
+        for idx, client_id in enumerate(client_ids):
+            local_value = nets_this_round[client_id].state_dict()[key].detach().cpu()
+            mean += float(fed_avg_freqs[idx]) * (local_value - old_value)
+        mean_update[key] = mean
+
+    mean_norm_sq = sum(
+        float(torch.sum(update * update).item()) for update in mean_update.values()
+    )
+    mean_norm = mean_norm_sq ** 0.5
+    update_norm = 0.0
+    update_norm_sq = 0.0
+    divergence = 0.0
+    cosine_sum = 0.0
+
+    for idx, client_id in enumerate(client_ids):
+        weight = float(fed_avg_freqs[idx])
+        state = nets_this_round[client_id].state_dict()
+        client_norm_sq = 0.0
+        client_dot_mean = 0.0
+        client_divergence = 0.0
+        for key in keys:
+            update = state[key].detach().cpu() - old_w[key].detach().cpu()
+            centered = update - mean_update[key]
+            client_norm_sq += float(torch.sum(update * update).item())
+            client_dot_mean += float(torch.sum(update * mean_update[key]).item())
+            client_divergence += float(torch.sum(centered * centered).item())
+
+        client_norm = client_norm_sq ** 0.5
+        update_norm += weight * client_norm
+        update_norm_sq += weight * client_norm_sq
+        divergence += weight * client_divergence
+        if client_norm > 0.0 and mean_norm > 0.0:
+            cosine_sum += weight * (client_dot_mean / (client_norm * mean_norm + eps))
+
+    return {
+        "norm": update_norm,
+        "norm_sq": update_norm_sq,
+        "mean_norm": mean_norm,
+        "divergence": divergence,
+        "relative_drift": divergence / (mean_norm_sq + eps),
+        "cosine": cosine_sum,
+    }
+
+
+def compute_client_update_drift(old_w, nets_this_round, fed_avg_freqs, layerwise=False, eps=1e-12):
+    """Measure total and optionally layer-wise client update disagreement.
+
+    The layer-wise metrics separate the shared trunk blocks from branch-private
+    modules.  They are required to test whether a branch-loss intervention
+    changes the actual representation update geometry, rather than merely its
+    output probabilities.
+    """
+    float_keys = [key for key, value in old_w.items() if torch.is_floating_point(value)]
     if not float_keys:
         return {}
 
     with torch.no_grad():
-        mean_update = {}
-        for key in float_keys:
-            mean = torch.zeros_like(old_w[key], device='cpu')
-            old_value = old_w[key].detach().cpu()
-            for idx, client_id in enumerate(client_ids):
-                local_value = nets_this_round[client_id].state_dict()[key].detach().cpu()
-                mean += float(fed_avg_freqs[idx]) * (local_value - old_value)
-            mean_update[key] = mean
-
-        update_norm = 0.0
-        update_norm_sq = 0.0
-        divergence = 0.0
-        cosine_sum = 0.0
-        mean_norm_sq = 0.0
-
-        for key in float_keys:
-            mean_norm_sq += float(torch.sum(mean_update[key] * mean_update[key]).item())
-        mean_norm = mean_norm_sq ** 0.5
-
-        for idx, client_id in enumerate(client_ids):
-            weight = float(fed_avg_freqs[idx])
-            client_norm_sq = 0.0
-            client_dot_mean = 0.0
-            client_divergence = 0.0
-            state = nets_this_round[client_id].state_dict()
-
-            for key in float_keys:
-                update = state[key].detach().cpu() - old_w[key].detach().cpu()
-                centered = update - mean_update[key]
-                client_norm_sq += float(torch.sum(update * update).item())
-                client_dot_mean += float(torch.sum(update * mean_update[key]).item())
-                client_divergence += float(torch.sum(centered * centered).item())
-
-            client_norm = client_norm_sq ** 0.5
-            update_norm += weight * client_norm
-            update_norm_sq += weight * client_norm_sq
-            divergence += weight * client_divergence
-            if client_norm > 0.0 and mean_norm > 0.0:
-                cosine_sum += weight * (client_dot_mean / (client_norm * mean_norm + eps))
-
-        return {
-            "client_update_norm": update_norm,
-            "client_update_norm_sq": update_norm_sq,
-            "client_mean_update_norm": mean_norm,
-            "client_update_divergence": divergence,
-            "client_relative_drift": divergence / (mean_norm_sq + eps),
-            "client_update_cosine": cosine_sum,
+        total_stats = _compute_update_drift_for_keys(
+            old_w, nets_this_round, fed_avg_freqs, float_keys, eps
+        )
+        if total_stats is None:
+            return {}
+        metrics = {
+            "client_update_norm": total_stats["norm"],
+            "client_update_norm_sq": total_stats["norm_sq"],
+            "client_mean_update_norm": total_stats["mean_norm"],
+            "client_update_divergence": total_stats["divergence"],
+            "client_relative_drift": total_stats["relative_drift"],
+            "client_update_cosine": total_stats["cosine"],
         }
+        if not layerwise:
+            return metrics
 
-def _flatten_current_grads(model, parameter_names=None):
-    """Flatten the current gradients, optionally over a named parameter subset."""
-    selected = None if parameter_names is None else set(parameter_names)
+        for group in LAYERWISE_UPDATE_GROUPS:
+            group_keys = [key for key in float_keys if _layerwise_update_group(key) == group]
+            stats = _compute_update_drift_for_keys(
+                old_w, nets_this_round, fed_avg_freqs, group_keys, eps
+            )
+            for stat_name in ("norm", "norm_sq", "mean_norm", "divergence", "relative_drift", "cosine"):
+                metrics[f"layer_update_{group}_{stat_name}"] = (
+                    None if stats is None else stats[stat_name]
+                )
+        return metrics
+
+def _flatten_current_grads(model):
     grads = []
-    for name, param in model.named_parameters():
-        if selected is not None and name not in selected:
-            continue
+    for param in model.parameters():
         if param.grad is None:
             grads.append(torch.zeros_like(param, device='cpu').flatten())
         else:
@@ -656,362 +157,54 @@ def _flatten_current_grads(model, parameter_names=None):
         return torch.empty(0)
     return torch.cat(grads)
 
-def _gradient_probe_scope_parameter_names(model, scope):
-    """Return the parameter subset for a probe scope.
-
-    ``shared_backbone`` deliberately excludes the teacher classifier and all
-    branch-only adapters/classifiers. For ResNet18_BYOT this leaves conv1/bn1
-    and residual layers 1--4: the feature extractor shared by the teacher and
-    the branch paths, rather than a branch head's private classifier.
-    """
-    if scope == "all":
-        return None
-    if scope != "shared_backbone":
-        raise ValueError(f"Unknown gradient probe scope: {scope}")
-
-    branch_or_head_tokens = (
-        "bottleneck",
-        "downsample1_1",
-        "downsample2_1",
-        "downsample3_1",
-        "middle_fc",
-        "branch1",
-        "branch2",
-        "branch3",
-        "adapter",
-        "classifier",
-    )
-    names = []
-    for name, _ in model.named_parameters():
-        is_teacher_head = name == "fc.weight" or name == "fc.bias" or ".fc." in name
-        if is_teacher_head or any(token in name for token in branch_or_head_tokens):
-            continue
-        names.append(name)
-    if not names:
-        raise ValueError(
-            "No parameters selected for gradient probe scope 'shared_backbone'. "
-            "Use --gradient_probe_scopes all for this model."
-        )
-    return names
-
-def _gradient_probe_active_branch_indices(args):
-    raw = str(getattr(args, "byot_active_branches", "1,2,3") or "1,2,3").strip()
-    values = [value.strip() for value in raw.split(",") if value.strip()]
-    indices = []
-    for value in values:
-        branch_id = int(value)
-        if branch_id < 1 or branch_id > 3:
-            raise ValueError("--byot_active_branches only supports branch ids 1,2,3.")
-        index = branch_id - 1
-        if index not in indices:
-            indices.append(index)
-    return indices
-
-def _reduce_gradient_probe_branch_loss(loss, active_branch_indices, args):
-    if getattr(args, "byot_branch_loss_reduction", "sum") == "mean":
-        return loss / max(1, len(active_branch_indices))
-    return loss
-
-def _gradient_probe_loss_components(model, x, target, args):
-    """Compute the BYOT losses as separately differentiable components.
-
-    The branch CE and branch KD definitions mirror ``train.fedbyot`` for the
-    static, scalar-alpha configuration used by the analysis script. Teacher
-    probabilities are detached, exactly as in training.
-    """
+def _gradient_probe_losses(model, x, target, temperature):
     out = model(x)
-    if not (isinstance(out, tuple) and len(out) == 8):
-        return None
-
-    output, m1, m2, m3, final_fea, f1, f2, f3 = out
-    temperature = float(getattr(args, "temperature", 0.5))
-    active_branch_indices = _gradient_probe_active_branch_indices(args)
-    branch_logits = (m1, m2, m3)
-    branch_features = (f1, f2, f3)
-
-    teacher_ce = F.cross_entropy(output, target)
-    if not active_branch_indices:
-        return {
-            "teacher_ce": teacher_ce,
-            "branch_ce": None,
-            "branch_kd": None,
-            "feature": None,
-        }
-
-    branch_ce_losses = [F.cross_entropy(logits, target) for logits in branch_logits]
-    branch_ce = sum(branch_ce_losses[index] for index in active_branch_indices)
-    branch_ce = _reduce_gradient_probe_branch_loss(branch_ce, active_branch_indices, args)
-
-    with torch.no_grad():
-        teacher_prob = F.softmax(output / temperature, dim=1)
-    branch_kd_losses = [
-        F.kl_div(
-            F.log_softmax(logits / temperature, dim=1),
-            teacher_prob,
-            reduction="batchmean",
+    if isinstance(out, tuple) and len(out) == 8:
+        output, m1, m2, m3, _, _, _, _ = out
+        ce_loss = (
+            F.cross_entropy(output, target)
+            + F.cross_entropy(m1, target)
+            + F.cross_entropy(m2, target)
+            + F.cross_entropy(m3, target)
+        )
+        with torch.no_grad():
+            teacher_prob = F.softmax(output / temperature, dim=1)
+        kd_loss = (
+            F.kl_div(F.log_softmax(m1 / temperature, dim=1), teacher_prob, reduction='batchmean')
+            + F.kl_div(F.log_softmax(m2 / temperature, dim=1), teacher_prob, reduction='batchmean')
+            + F.kl_div(F.log_softmax(m3 / temperature, dim=1), teacher_prob, reduction='batchmean')
         ) * (temperature ** 2)
-        for logits in branch_logits
-    ]
-    branch_kd = sum(branch_kd_losses[index] for index in active_branch_indices)
-    branch_kd = _reduce_gradient_probe_branch_loss(branch_kd, active_branch_indices, args)
+        return ce_loss, kd_loss
 
-    feature_losses = [F.mse_loss(feature, final_fea.detach()) for feature in branch_features]
-    feature = sum(feature_losses[index] for index in active_branch_indices)
-    feature = _reduce_gradient_probe_branch_loss(feature, active_branch_indices, args)
+    if isinstance(out, tuple):
+        output = out[-1]
+    else:
+        output = out
+    return F.cross_entropy(output, target), None
 
-    return {
-        "teacher_ce": teacher_ce,
-        "branch_ce": branch_ce,
-        "branch_kd": branch_kd,
-        "feature": feature,
-    }
-
-def _average_probe_component_gradients(model, dataloader, device, args, max_batches, scopes):
-    """Average each decomposed BYOT gradient over the requested client batches."""
-    scope_parameter_names = {
-        scope: _gradient_probe_scope_parameter_names(model, scope)
-        for scope in scopes
-    }
-    gradients = {
-        component: {scope: [] for scope in scopes}
-        for component in ("teacher_ce", "branch_ce", "branch_kd", "feature")
-    }
-
+def _average_probe_gradient(model, dataloader, device, args, loss_kind, max_batches):
+    grads = []
+    temperature = float(getattr(args, 'temperature', 0.5))
     for batch_idx, (x, target) in enumerate(dataloader):
         if batch_idx >= max_batches:
             break
         x, target = x.to(device), target.to(device).long()
-        components = _gradient_probe_loss_components(model, x, target, args)
-        if components is None:
-            continue
-        active_components = [
-            (name, loss) for name, loss in components.items() if loss is not None
-        ]
-        for component_idx, (name, loss) in enumerate(active_components):
-            model.zero_grad(set_to_none=True)
-            loss.backward(retain_graph=component_idx < len(active_components) - 1)
-            for scope, parameter_names in scope_parameter_names.items():
-                gradients[name][scope].append(
-                    _flatten_current_grads(model, parameter_names)
-                )
         model.zero_grad(set_to_none=True)
-
-    averaged = {}
-    for component, by_scope in gradients.items():
-        averaged[component] = {}
-        for scope, vectors in by_scope.items():
-            if vectors:
-                averaged[component][scope] = torch.stack(vectors, dim=0).mean(dim=0)
-            else:
-                averaged[component][scope] = None
-    return averaged
-
-def _average_kd_info_probe(model, dataloader, device, args, max_batches):
-    metrics = {
-        "teacher_entropy": 0.0,
-        "teacher_entropy_norm": 0.0,
-        "teacher_true_label_prob": 0.0,
-        "teacher_non_target_mass": 0.0,
-        "teacher_top2_margin": 0.0,
-        "teacher_confidence": 0.0,
-    }
-    total_count = 0
-    temperature = float(getattr(args, 'temperature', 0.5))
-
-    with torch.no_grad():
-        for batch_idx, (x, target) in enumerate(dataloader):
-            if batch_idx >= max_batches:
-                break
-            x, target = x.to(device), target.to(device).long()
-            out = model(x)
-            if isinstance(out, tuple) and len(out) == 8:
-                output = out[0]
-            elif isinstance(out, tuple):
-                output = out[-1]
-            else:
-                output = out
-
-            prob = F.softmax(output / temperature, dim=1)
-            batch_size = int(target.numel())
-            num_classes = max(int(prob.size(1)), 2)
-            entropy = -(prob * torch.log(prob + 1e-8)).sum(dim=1)
-            true_label_prob = prob.gather(1, target.view(-1, 1)).squeeze(1).clamp(0.0, 1.0)
-            top2 = prob.topk(k=min(2, num_classes), dim=1).values
-            if top2.size(1) == 1:
-                margin = torch.ones_like(top2[:, 0])
-            else:
-                margin = (top2[:, 0] - top2[:, 1]).clamp(0.0, 1.0)
-            confidence = top2[:, 0]
-
-            metrics["teacher_entropy"] += float(entropy.sum().item())
-            metrics["teacher_entropy_norm"] += float((entropy / math.log(num_classes)).sum().item())
-            metrics["teacher_true_label_prob"] += float(true_label_prob.sum().item())
-            metrics["teacher_non_target_mass"] += float((1.0 - true_label_prob).sum().item())
-            metrics["teacher_top2_margin"] += float(margin.sum().item())
-            metrics["teacher_confidence"] += float(confidence.sum().item())
-            total_count += batch_size
-
-    if total_count == 0:
-        return None
-    return {key: value / total_count for key, value in metrics.items()}
-
-def _should_log_branch_logit_examples(args):
-    if not getattr(args, "log_branch_logit_examples", False):
-        return False
-    current_round = int(getattr(args, "current_round", 0))
-    total_rounds = max(int(getattr(args, "round", 1)), 1)
-    raw = str(getattr(args, "branch_logit_example_rounds", "0,100,250,last") or "")
-    rounds = set()
-    for item in raw.split(","):
-        item = item.strip().lower()
-        if not item:
-            continue
-        if item == "last":
-            rounds.add(total_rounds - 1)
+        ce_loss, kd_loss = _gradient_probe_losses(model, x, target, temperature)
+        if loss_kind == 'ce':
+            loss = ce_loss
+        elif loss_kind == 'kd':
+            if kd_loss is None:
+                continue
+            loss = kd_loss
         else:
-            try:
-                rounds.add(int(item))
-            except ValueError:
-                continue
-    return current_round in rounds
-
-def _branch_logit_example_path(args):
-    log_file_name = getattr(args, "log_file_name", None) or "branch_logit_probe"
-    return os.path.join(args.logdir, f"{log_file_name}_topk.jsonl")
-
-def _topk_payload(prob, topk):
-    k = min(max(int(topk), 1), int(prob.numel()))
-    values, indices = torch.topk(prob, k=k)
-    return [
-        {"class": int(idx.item()), "prob": float(value.item())}
-        for value, idx in zip(values.detach().cpu(), indices.detach().cpu())
-    ]
-
-def _average_branch_logit_probe(
-    model, dataloader, device, args, max_batches, client_id=None, save_examples=False
-):
-    per_branch = [
-        {metric: 0.0 for metric in BRANCH_LOGIT_PROBE_METRICS}
-        for _ in range(3)
-    ]
-    total_count = 0
-    temperature = float(getattr(args, 'temperature', 0.5))
-    example_rows = []
-    max_examples = max(int(getattr(args, "branch_logit_example_samples", 8)), 0)
-    topk = max(int(getattr(args, "branch_logit_example_topk", 5)), 1)
-    saved_examples = 0
-
-    with torch.no_grad():
-        for batch_idx, (x, target) in enumerate(dataloader):
-            if batch_idx >= max_batches:
-                break
-            x, target = x.to(device), target.to(device).long()
-            out = model(x)
-            if not (isinstance(out, tuple) and len(out) == 8):
-                continue
-
-            output, m1, m2, m3 = out[0], out[1], out[2], out[3]
-            teacher_prob = F.softmax(output / temperature, dim=1)
-            branches = [m1, m2, m3]
-            branch_probs = [F.softmax(branch_logits / temperature, dim=1) for branch_logits in branches]
-            batch_size = int(target.numel())
-            num_classes = max(int(teacher_prob.size(1)), 2)
-            log_c = math.log(num_classes)
-            teacher_entropy_norm = (
-                -(teacher_prob * torch.log(teacher_prob + 1e-8)).sum(dim=1) / log_c
-            )
-
-            if save_examples and saved_examples < max_examples:
-                take = min(batch_size, max_examples - saved_examples)
-                for sample_offset in range(take):
-                    sample_index = saved_examples + sample_offset
-                    row_base = {
-                        "round": int(getattr(args, "current_round", 0)),
-                        "client_id": None if client_id is None else int(client_id),
-                        "batch_index": int(batch_idx),
-                        "sample_index": int(sample_index),
-                        "target": int(target[sample_offset].detach().cpu().item()),
-                        "dataset": getattr(args, "dataset", None),
-                        "partition": getattr(args, "partition", None),
-                        "beta": None if not hasattr(args, "beta") else float(getattr(args, "beta")),
-                        "alpha": float(getattr(args, "byot_alpha", 0.0)),
-                    }
-                    heads = [("teacher", teacher_prob)] + [
-                        (f"b{branch_idx}", branch_prob)
-                        for branch_idx, branch_prob in enumerate(branch_probs, start=1)
-                    ]
-                    for head_name, prob_tensor in heads:
-                        prob = prob_tensor[sample_offset]
-                        entropy_norm = float(
-                            (-(prob * torch.log(prob + 1e-8)).sum() / log_c).detach().cpu().item()
-                        )
-                        example_rows.append({
-                            **row_base,
-                            "head": head_name,
-                            "entropy_norm": entropy_norm,
-                            "true_label_prob": float(prob[row_base["target"]].detach().cpu().item()),
-                            "topk": _topk_payload(prob, topk),
-                        })
-                saved_examples += take
-
-            for branch_idx, branch_prob in enumerate(branch_probs):
-                branch_entropy_norm = (
-                    -(branch_prob * torch.log(branch_prob + 1e-8)).sum(dim=1) / log_c
-                )
-                true_label_prob = branch_prob.gather(1, target.view(-1, 1)).squeeze(1).clamp(0.0, 1.0)
-                top2 = branch_prob.topk(k=min(2, num_classes), dim=1).values
-                if top2.size(1) == 1:
-                    margin = torch.ones_like(top2[:, 0])
-                else:
-                    margin = (top2[:, 0] - top2[:, 1]).clamp(0.0, 1.0)
-                confidence, pred = branch_prob.max(dim=1)
-                mix = 0.5 * (teacher_prob + branch_prob)
-                kl_teacher = (
-                    teacher_prob * (torch.log(teacher_prob + 1e-8) - torch.log(mix + 1e-8))
-                ).sum(dim=1)
-                kl_branch = (
-                    branch_prob * (torch.log(branch_prob + 1e-8) - torch.log(mix + 1e-8))
-                ).sum(dim=1)
-                js = 0.5 * (kl_teacher + kl_branch) / log_c
-                teacher_kl = (
-                    teacher_prob * (torch.log(teacher_prob + 1e-8) - torch.log(branch_prob + 1e-8))
-                ).sum(dim=1) / log_c
-                entropy_gap = teacher_entropy_norm - branch_entropy_norm
-
-                stats = per_branch[branch_idx]
-                stats["entropy_norm"] += float(branch_entropy_norm.sum().item())
-                stats["true_label_prob"] += float(true_label_prob.sum().item())
-                stats["non_target_mass"] += float((1.0 - true_label_prob).sum().item())
-                stats["top2_margin"] += float(margin.sum().item())
-                stats["confidence"] += float(confidence.sum().item())
-                stats["acc"] += float((pred == target).float().sum().item())
-                stats["teacher_js"] += float(js.sum().item())
-                stats["teacher_kl"] += float(teacher_kl.sum().item())
-                stats["entropy_gap"] += float(entropy_gap.sum().item())
-
-            total_count += batch_size
-
-    if total_count == 0:
+            raise ValueError(f"Unknown probe loss kind: {loss_kind}")
+        loss.backward()
+        grads.append(_flatten_current_grads(model))
+    model.zero_grad(set_to_none=True)
+    if not grads:
         return None
-
-    if save_examples and example_rows:
-        output_path = _branch_logit_example_path(args)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, "a", encoding="utf-8") as f:
-            for row in example_rows:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    result = {}
-    for branch_idx, stats in enumerate(per_branch, start=1):
-        for metric, value in stats.items():
-            result[f"branch_logit_b{branch_idx}_{metric}"] = value / total_count
-
-    for metric in BRANCH_LOGIT_PROBE_METRICS:
-        result[f"branch_logit_avg_{metric}"] = sum(
-            result[f"branch_logit_b{branch_idx}_{metric}"]
-            for branch_idx in (1, 2, 3)
-        ) / 3.0
-    return result
+    return torch.stack(grads, dim=0).mean(dim=0)
 
 def _weighted_gradient_stats(gradients, weights, eps=1e-12):
     valid = [(grad, float(weight)) for grad, weight in zip(gradients, weights) if grad is not None]
@@ -1090,67 +283,17 @@ def _weighted_centered_cross_stats(left_gradients, right_gradients, weights, eps
         "corr": corr,
     }
 
-def _weighted_gradient_pair_stats(left_gradients, right_gradients, weights, eps=1e-12):
-    """Relationship between two loss gradients on the same sampled clients."""
-    cross_stats = _weighted_centered_cross_stats(left_gradients, right_gradients, weights, eps)
-    valid = [
-        (left, right, float(weight))
-        for left, right, weight in zip(left_gradients, right_gradients, weights)
-        if left is not None and right is not None
-    ]
-    if not valid:
-        return None
-
-    total_weight = sum(weight for _, _, weight in valid)
-    if total_weight <= 0:
-        return None
-
-    cosine = 0.0
-    distance = 0.0
-    right_left_norm_ratio = 0.0
-    for left, right, weight in valid:
-        weight = weight / total_weight
-        left_norm = torch.norm(left)
-        right_norm = torch.norm(right)
-        cosine += weight * float(
-            torch.sum(left * right).item() / (left_norm.item() * right_norm.item() + eps)
-        )
-        distance += weight * float(
-            torch.norm(left - right).item() / (left_norm.item() + right_norm.item() + eps)
-        )
-        right_left_norm_ratio += weight * float(right_norm.item() / (left_norm.item() + eps))
-
-    result = {
-        "cosine": cosine,
-        "distance": distance,
-        "kd_ce_norm_ratio": right_left_norm_ratio,
-    }
-    if cross_stats is not None:
-        result.update(cross_stats)
-    return result
-
 def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_avg_freqs, device, args):
-    """Probe decomposed BYOT gradients at the shared round-start global model.
-
-    In addition to preserving the legacy ``CE=(teacher CE + branch CE)`` vs.
-    ``KD=branch KD`` fields, this records teacher CE, branch CE, branch KD,
-    feature imitation, and the configured training total independently.  The
-    latter is exact for the static-alpha blend/kd_only configurations used by
-    the analysis script.
+    """
+    Probe gradient dissimilarity at the round-start global model.
+    CE and KD gradients are measured separately, then combined as CE + alpha * KD
+    to match the theorem-level FedSD objective decomposition.
     """
     max_batches = max(1, int(getattr(args, 'gradient_probe_batches', 1)))
     alpha = float(getattr(args, 'byot_alpha', 0.0))
-    feature_beta = float(getattr(args, "byot_beta", 0.0))
-    scopes = _parse_gradient_probe_scopes(args)
-    component_gradients = {
-        scope: {component: [] for component in GRADIENT_PROBE_COMPONENTS}
-        for scope in scopes
-    }
-    kd_info_sums = {}
-    branch_logit_sums = {}
+    ce_gradients = []
+    kd_gradients = []
     used_weights = []
-    save_branch_examples_this_round = _should_log_branch_logit_examples(args)
-    max_example_clients = max(int(getattr(args, "branch_logit_example_clients", 2)), 0)
 
     for idx, client_id in enumerate(nets_this_round.keys()):
         dataloader = dataloaders_this_round.get(client_id)
@@ -1159,112 +302,38 @@ def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_av
         model = nets_this_round[client_id]
         was_training = model.training
         model.eval()
-        kd_info = _average_kd_info_probe(model, dataloader, device, args, max_batches)
-        branch_logit_info = _average_branch_logit_probe(
-            model,
-            dataloader,
-            device,
-            args,
-            max_batches,
-            client_id=client_id,
-            save_examples=save_branch_examples_this_round and idx < max_example_clients,
-        )
-        client_component_gradients = _average_probe_component_gradients(
-            model, dataloader, device, args, max_batches, scopes
-        )
+        ce_grad = _average_probe_gradient(model, dataloader, device, args, 'ce', max_batches)
+        kd_grad = _average_probe_gradient(model, dataloader, device, args, 'kd', max_batches)
         if was_training:
             model.train()
-        if client_component_gradients["teacher_ce"][scopes[0]] is None:
+        if ce_grad is None:
             continue
+        if kd_grad is None:
+            kd_grad = torch.zeros_like(ce_grad)
+        ce_gradients.append(ce_grad)
+        kd_gradients.append(kd_grad)
+        used_weights.append(float(fed_avg_freqs[idx]))
 
-        for scope in scopes:
-            teacher_ce = client_component_gradients["teacher_ce"][scope]
-            branch_ce = client_component_gradients["branch_ce"][scope]
-            branch_kd = client_component_gradients["branch_kd"][scope]
-            feature = client_component_gradients["feature"][scope]
-            if branch_ce is None:
-                branch_ce = torch.zeros_like(teacher_ce)
-            if branch_kd is None:
-                branch_kd = torch.zeros_like(teacher_ce)
-            if feature is None:
-                feature = torch.zeros_like(teacher_ce)
+    ce_stats = _weighted_gradient_stats(ce_gradients, used_weights)
+    kd_stats = _weighted_gradient_stats(kd_gradients, used_weights)
+    combined = [ce_grad + alpha * kd_grad for ce_grad, kd_grad in zip(ce_gradients, kd_gradients)]
+    combined_stats = _weighted_gradient_stats(combined, used_weights)
+    cross_stats = _weighted_centered_cross_stats(ce_gradients, kd_gradients, used_weights)
 
-            if getattr(args, "byot_branch_objective", "blend") == "kd_only":
-                configured_total = teacher_ce + alpha * branch_kd + feature_beta * feature
-            else:
-                configured_total = (
-                    teacher_ce
-                    + (1.0 - alpha) * branch_ce
-                    + alpha * branch_kd
-                    + feature_beta * feature
-                )
-            component_gradients[scope]["teacher_ce"].append(teacher_ce)
-            component_gradients[scope]["branch_ce"].append(branch_ce)
-            component_gradients[scope]["branch_kd"].append(branch_kd)
-            component_gradients[scope]["feature"].append(feature)
-            component_gradients[scope]["configured_total"].append(configured_total)
-
-        weight = float(fed_avg_freqs[idx])
-        used_weights.append(weight)
-        if kd_info is not None:
-            for key, value in kd_info.items():
-                kd_info_sums[key] = kd_info_sums.get(key, 0.0) + weight * value
-        if branch_logit_info is not None:
-            for key, value in branch_logit_info.items():
-                branch_logit_sums[key] = branch_logit_sums.get(key, 0.0) + weight * value
-
-    if not used_weights:
+    if ce_stats is None or kd_stats is None or combined_stats is None:
         return {}
 
-    metrics = {"gradient_probe_clients": len(used_weights)}
-    for scope in scopes:
-        for component in GRADIENT_PROBE_COMPONENTS:
-            stats = _weighted_gradient_stats(component_gradients[scope][component], used_weights)
-            if stats is not None:
-                for key, value in stats.items():
-                    metrics[f"gradient_{scope}_{component}_{key}"] = value
-        pair_stats = _weighted_gradient_pair_stats(
-            component_gradients[scope]["branch_ce"],
-            component_gradients[scope]["branch_kd"],
-            used_weights,
-        )
-        if pair_stats is not None:
-            for key, value in pair_stats.items():
-                metrics[f"gradient_{scope}_branch_ce_kd_{key}"] = value
-
-    # Preserve legacy fields so existing analysis notebooks do not break.
-    if "all" in component_gradients:
-        legacy_ce = [
-            teacher_ce + branch_ce
-            for teacher_ce, branch_ce in zip(
-                component_gradients["all"]["teacher_ce"],
-                component_gradients["all"]["branch_ce"],
-            )
-        ]
-        legacy_kd = component_gradients["all"]["branch_kd"]
-        legacy_combined = [
-            ce_grad + alpha * kd_grad
-            for ce_grad, kd_grad in zip(legacy_ce, legacy_kd)
-        ]
-        for prefix, gradients in (
-            ("gradient_ce", legacy_ce),
-            ("gradient_kd", legacy_kd),
-            ("gradient_combined", legacy_combined),
-        ):
-            stats = _weighted_gradient_stats(gradients, used_weights)
-            if stats is not None:
-                for key, value in stats.items():
-                    metrics[f"{prefix}_{key}"] = value
-        legacy_pair_stats = _weighted_gradient_pair_stats(legacy_ce, legacy_kd, used_weights)
-        if legacy_pair_stats is not None:
-            for key, value in legacy_pair_stats.items():
-                metrics[f"gradient_ce_kd_{key}"] = value
-
-    for key, value in kd_info_sums.items():
-        metrics[f"kd_info_{key}"] = value
-    for key, value in branch_logit_sums.items():
-        metrics[key] = value
-
+    metrics = {"gradient_probe_clients": len(ce_gradients)}
+    for prefix, stats in [
+        ("gradient_ce", ce_stats),
+        ("gradient_kd", kd_stats),
+        ("gradient_combined", combined_stats),
+    ]:
+        for key, value in stats.items():
+            metrics[f"{prefix}_{key}"] = value
+    if cross_stats is not None:
+        metrics["gradient_ce_kd_cross"] = cross_stats["cross"]
+        metrics["gradient_ce_kd_corr"] = cross_stats["corr"]
     return metrics
 
 def norm_based_classwise_aggregation(global_model, nets_this_round, clients_this_round, client_data_sizes=None):
@@ -1481,7 +550,6 @@ def get_args():
     # batchnorm -> groupnorm. 켜도되고 안켜도 되는데, groupnorm이 더 좋다는 연구결과가 있는데 꼭 그렇지는 않더라구요
     parser.add_argument('--num_groups', type=int, default=8, help='num of groups in group_norm')
     # group_norm의 groups
-    parser.add_argument('--num_classes', type=int, default=None, help='number of classes; inferred from dataset when omitted')
     parser.add_argument('--in_channels', type=int, default=3)
     # image channels. 1 channel 데이터셋이도 3 channel로 하면 gray scale -> RGB scale 채널이 복사되서 작동합니다
     parser.add_argument('--last_fc', action='store_true', help='For mobilenet, classifier is fc_layer if True, otherwise, 1x1 conv')
@@ -1588,9 +656,14 @@ def get_args():
                         help='How active BYOT branch losses are reduced. '
                              'sum preserves the original behavior; mean divides by the number of active branches.')
     parser.add_argument('--byot_branch_objective', default='blend',
-                        choices=['blend', 'kd_only'],
+                        choices=['blend', 'kd_only', 'feature_only'],
                         help='BYOT branch objective. blend uses (1-alpha)*CE + alpha*KD; '
-                             'kd_only removes branch CE and uses alpha as an unrestricted KD coefficient.')
+                             'kd_only removes branch CE and uses alpha as an unrestricted KD coefficient; '
+                             'feature_only removes both branch CE and KD while retaining feature imitation.')
+    parser.add_argument('--byot_branch_gradient_mode', default='attached',
+                        choices=['attached', 'detach_shared'],
+                        help='Analysis-only intervention for BYOT branches. detach_shared trains branch-private '
+                             'modules but blocks every branch-side loss from updating the shared trunk.')
     parser.add_argument('--byot_branch_gate', default='none',
                         choices=['none', 'entropy_3stage', 'entropy_no_off'],
                         help='Client-label-entropy based BYOT branch gate. '
@@ -1617,79 +690,17 @@ def get_args():
     parser.add_argument('--byot_sample_proxy', default='none',
                         choices=['none', 'teacher_conf', 'teacher_entropy', 'teacher_margin',
                                  'teacher_label_prob', 'teacher_correctness', 'branch_agreement',
-                                 'branch_soft_kl', 'branch_js', 'teacher_label_prob_entropy',
-                                 'teacher_label_prob_branch_js',
-                                 'teacher_label_prob_entropy_branch_js'],
+                                 'branch_soft_kl', 'branch_js'],
                         help='Sample-level reliability proxy used to weight BYOT KD loss.')
     parser.add_argument('--byot_client_proxy', default='none',
                         choices=['none', 'teacher_conf', 'teacher_entropy', 'teacher_margin',
                                  'teacher_label_prob', 'teacher_correctness', 'branch_agreement',
-                                 'branch_soft_kl', 'branch_js', 'teacher_label_prob_entropy',
-                                 'teacher_label_prob_branch_js',
-                                 'teacher_label_prob_entropy_branch_js'],
+                                 'branch_soft_kl', 'branch_js'],
                         help='Client-level reliability proxy used to choose one BYOT KD alpha per client.')
     parser.add_argument('--byot_client_alpha_min', type=float, default=0.01,
                         help='Minimum client-wise BYOT alpha when --byot_client_proxy is enabled.')
     parser.add_argument('--byot_client_alpha_max', type=float, default=0.30,
                         help='Maximum client-wise BYOT alpha when --byot_client_proxy is enabled.')
-    parser.add_argument('--byot_client_alpha_mode', default='map',
-                        choices=['map', 'multiply'],
-                        help='How client reliability is applied. map: alpha_min+(alpha_max-alpha_min)*r. '
-                             'multiply: fallback_alpha*(alpha_min+(alpha_max-alpha_min)*r), useful for round*client schedules.')
-    parser.add_argument('--byot_client_reliability_power', type=float, default=1.0,
-                        help='Power applied to the averaged client reliability before mapping/multiplying BYOT alpha/lambda.')
-    parser.add_argument('--byot_client_skew_proxy', default='none',
-                        choices=['none', 'label_entropy', 'max_concentration', 'prediction_entropy'],
-                        help='Client-local label-skew proxy used to downscale BYOT alpha/lambda. '
-                             'Computed only inside each client and never sent to the server.')
-    parser.add_argument('--byot_client_skew_min_scale', type=float, default=0.0,
-                        help='Minimum skew-penalty scale when client labels are extremely concentrated.')
-    parser.add_argument('--byot_client_skew_power', type=float, default=1.0,
-                        help='Power applied to the client skew reliability before scaling BYOT alpha/lambda.')
-    parser.add_argument('--byot_client_skew_correction_mode', default='multiply',
-                        choices=['multiply', 'normalize', 'residual'],
-                        help='How the client skew score is converted into a lambda scale. '
-                             'multiply keeps the original min+(1-min)*score behavior; '
-                             'normalize divides the powered score by --byot_client_skew_norm_value; '
-                             'residual uses 1 + gamma * (score - center).')
-    parser.add_argument('--byot_client_skew_norm_value', type=float, default=1.0,
-                        help='Denominator for --byot_client_skew_correction_mode normalize.')
-    parser.add_argument('--byot_client_skew_center', type=float, default=1.0,
-                        help='Center value for --byot_client_skew_correction_mode residual.')
-    parser.add_argument('--byot_client_skew_gamma', type=float, default=1.0,
-                        help='Residual strength for --byot_client_skew_correction_mode residual.')
-    parser.add_argument('--byot_client_skew_max_scale', type=float, default=10.0,
-                        help='Maximum client skew scale after correction.')
-    parser.add_argument('--byot_lambda_gate_mode', default='none',
-                        choices=['none', 'hard', 'soft'],
-                        help='Gate between sample-wise and client-wise BYOT lambda control. '
-                             'none keeps the current lambda behavior; hard/soft interpolate from '
-                             'sample-wise lambda to client-wise adaptive lambda when client skew is severe.')
-    parser.add_argument('--byot_lambda_gate_scope', default='client',
-                        choices=['client', 'round'],
-                        help='Whether the lambda granularity gate is computed from each client skew score '
-                             'or from the selected clients round-level mean skew score.')
-    parser.add_argument('--byot_lambda_gate_tau', type=float, default=0.75,
-                        help='Client skew reliability threshold for --byot_lambda_gate_mode. '
-                             'Lower reliability than tau moves toward client-wise adaptive lambda.')
-    parser.add_argument('--byot_lambda_gate_temperature', type=float, default=0.05,
-                        help='Soft gate temperature for --byot_lambda_gate_mode soft.')
-    parser.add_argument('--byot_lambda_gate_warmup', type=int, default=0,
-                        help='Optional round warmup before fully applying the lambda granularity gate.')
-    parser.add_argument('--byot_class_proxy', default='none',
-                        choices=['none', 'label_count', 'teacher_label_prob',
-                                 'teacher_correctness', 'teacher_label_prob_count'],
-                        help='Client-class-level reliability proxy used to choose one BYOT KD alpha per class inside each client.')
-    parser.add_argument('--byot_class_alpha_min', type=float, default=0.0,
-                        help='Minimum class-wise BYOT alpha when --byot_class_proxy is enabled.')
-    parser.add_argument('--byot_class_alpha_max', type=float, default=1.0,
-                        help='Maximum class-wise BYOT alpha when --byot_class_proxy is enabled.')
-    parser.add_argument('--byot_class_alpha_mode', default='map',
-                        choices=['map', 'multiply'],
-                        help='How class reliability is applied. map: alpha_min+(alpha_max-alpha_min)*r. '
-                             'multiply: fallback_alpha*(alpha_min+(alpha_max-alpha_min)*r).')
-    parser.add_argument('--byot_class_count_smoothing', type=float, default=1.0,
-                        help='Smoothing added to per-class counts for count-based class-wise BYOT alpha.')
     parser.add_argument('--byot_round_lambda_schedule', default='none',
                         choices=['none', 'linear', 'cosine'],
                         help='Round-wise schedule for BYOT alpha/lambda. '
@@ -1699,12 +710,6 @@ def get_args():
     parser.add_argument('--byot_round_lambda_warmup', type=int, default=0,
                         help='Number of communication rounds used to ramp BYOT alpha/lambda from min to max. '
                              'If 0, args.round is used.')
-    parser.add_argument('--byot_server_lambda_adaptive', action='store_true',
-                        help='Scale BYOT alpha/lambda by previous-round server-observed client update drift.')
-    parser.add_argument('--byot_server_lambda_tau', type=float, default=1.0,
-                        help='Strength for server drift scaling: scale=1/(1+tau*relative_drift).')
-    parser.add_argument('--byot_server_lambda_min_scale', type=float, default=0.0,
-                        help='Lower bound for server drift scaling.')
     
     parser.add_argument('--warmup_rounds', type=int, default=0, help='Number of rounds for warmup (Teacher only training)')
     parser.add_argument('--amp', action='store_true', help='Use PyTorch AMP (mixed precision)')
@@ -1717,6 +722,8 @@ def get_args():
     parser.add_argument('--use_ema_teacher', action='store_true', help='Maintain EMA of global model and save it')
     parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA decay for server teacher')
     parser.add_argument('--save_best_ckpt', action='store_true', help='Save best checkpoint (global + ema if enabled)')
+    parser.add_argument('--save_final_ckpt', action='store_true',
+                        help='Save the final global-model checkpoint after the last communication round.')
     parser.add_argument('--ckpt_dir', default=None, help='Checkpoint directory (default: logdir)')
     parser.add_argument(
         '--best_by_ema',
@@ -1746,6 +753,9 @@ def get_args():
     parser.add_argument('--use_fedrcl', action='store_true', help='BYOT 학습 시 FedRCL 추가')
     parser.add_argument('--log_client_drift', action='store_true',
                         help='Log client update drift before aggregation.')
+    parser.add_argument('--log_layerwise_client_update_drift', action='store_true',
+                        help='Also log pre-aggregation client update drift separately for trunk blocks, '
+                             'branch-private modules, and the teacher head.')
     parser.add_argument('--drift_log_interval', type=int, default=1,
                         help='Log client drift every N rounds when --log_client_drift is enabled.')
     parser.add_argument('--log_gradient_probe', action='store_true',
@@ -1754,41 +764,6 @@ def get_args():
                         help='Probe gradient dissimilarity every N rounds when --log_gradient_probe is enabled.')
     parser.add_argument('--gradient_probe_batches', type=int, default=1,
                         help='Number of local batches per sampled client used for gradient probing.')
-    parser.add_argument('--gradient_probe_scopes', default='all,shared_backbone',
-                        help='Comma-separated parameter scopes for decomposed BYOT gradients: '
-                             'all, shared_backbone. shared_backbone excludes teacher/branch heads.')
-    parser.add_argument('--log_branch_logit_examples', action='store_true',
-                        help='Save branch/teacher top-k probability examples as JSONL during gradient probes.')
-    parser.add_argument('--branch_logit_example_rounds', default='0,100,250,last',
-                        help='Comma-separated rounds for branch logit example dumps. Use "last" for round-1.')
-    parser.add_argument('--branch_logit_example_clients', type=int, default=2,
-                        help='Number of sampled clients per probe round used for branch logit examples.')
-    parser.add_argument('--branch_logit_example_samples', type=int, default=8,
-                        help='Number of local samples per selected client saved for branch logit examples.')
-    parser.add_argument('--branch_logit_example_topk', type=int, default=5,
-                        help='Top-k probabilities saved for teacher and branch logits.')
-    parser.add_argument('--log_train_branch_frequency_stats', action='store_true',
-                        help='Accumulate branch logit statistics during local training by local target-class frequency.')
-    parser.add_argument('--train_branch_freq_low_ratio', type=float, default=0.5,
-                        help='Local target count ratio below this value is treated as low-frequency.')
-    parser.add_argument('--train_branch_freq_high_ratio', type=float, default=1.5,
-                        help='Local target count ratio above this value is treated as high-frequency.')
-    parser.add_argument('--log_client_branch_frequency_stats', action='store_true',
-                        help='Before local training, summarize branch-frequency logits per selected client.')
-    parser.add_argument('--client_branch_freq_probe_interval', type=int, default=10,
-                        help='Record client-wise pre-training branch-frequency summaries every N rounds.')
-    parser.add_argument('--client_branch_freq_probe_batches', type=int, default=0,
-                        help='Local batches per selected client for the pre-training frequency probe; 0 uses all batches.')
-    parser.add_argument('--log_postlocal_branch_distribution_stats', action='store_true',
-                        help='After local training and before aggregation, measure client-model probability-vector divergence on common reference samples.')
-    parser.add_argument('--postlocal_ref_probe_interval', type=int, default=10,
-                        help='Record post-local common-reference distribution divergence every N rounds.')
-    parser.add_argument('--postlocal_ref_samples_per_class', type=int, default=8,
-                        help='Common test/reference samples per class used in each post-local divergence probe.')
-    parser.add_argument('--save_postlocal_full_logits', action='store_true',
-                        help='Save full float16 logits for every selected client/head/reference sample at post-local probe rounds.')
-    parser.add_argument('--log_client_group_lambda', action='store_true',
-                        help='For noniid_grouping, log selected-client effective BYOT alpha/lambda by partition group.')
     
     
     parser.add_argument('--min_threshold', type=float, default=0.8, help='시작 임계값 (Dynamic Threshold용)')
@@ -1796,6 +771,11 @@ def get_args():
     
     parser.add_argument('--partition_groups', type=int, default=8, help='Number of groups for noniid_grouping')
     parser.add_argument('--imbalance_factor', type=float, default=100.0, help='Imbalance factor for noniid_longtail')
+    parser.add_argument('--cifar100_class_count', type=int, default=0,
+                        help='For the controlled CIFAR-100 class-count study, use a deterministic nested subset '
+                             'of this many classes (0 keeps all 100 classes).')
+    parser.add_argument('--cifar100_subset_seed', type=int, default=0,
+                        help='Seed defining the nested CIFAR-100 class subset used with --cifar100_class_count.')
 
     args = parser.parse_args()
     return args
@@ -1852,20 +832,17 @@ def main():
     # ==========================================================================
     # [통합 수정] 1. 데이터셋별 클래스 수 & 채널 수 자동 설정
     # ==========================================================================
-    if args.num_classes is None:
-        if args.dataset == 'tinyimagenet':
-            args.num_classes = 200
-        elif args.dataset == 'cifar100':
-            args.num_classes = 100
-        elif args.dataset == 'emnist':
-            args.num_classes = 47
-            args.in_channels = 1  # EMNIST는 흑백
-        elif args.dataset == 'cifar10':
-            args.num_classes = 10
-        elif hasattr(global_train_dataset, 'num_classes'):
-            args.num_classes = int(global_train_dataset.num_classes)
-        else:
-            raise ValueError(f"Cannot infer num_classes for dataset={args.dataset}. Pass --num_classes explicitly.")
+    if args.dataset == 'tinyimagenet':
+        args.num_classes = 200
+    elif args.dataset == 'cifar100':
+        requested_class_count = int(getattr(args, 'cifar100_class_count', 0))
+        args.num_classes = requested_class_count if requested_class_count > 0 else 100
+    elif args.dataset == 'emnist':
+        args.num_classes = 47
+        args.in_channels = 1  # EMNIST는 흑백
+    elif args.dataset == 'cifar10':
+        args.num_classes = 10
+    # 다른 데이터셋 추가 시 여기에 작성
     
     print(f"🔥 [Auto Setup] Dataset: {args.dataset} | Classes: {args.num_classes} | Channels: {args.in_channels}")
 
@@ -1973,51 +950,22 @@ def main():
         'gradient_combined_cosine': [],
         'gradient_ce_kd_cross': [],
         'gradient_ce_kd_corr': [],
-        'gradient_ce_kd_cosine': [],
-        'gradient_ce_kd_distance': [],
-        'gradient_kd_ce_norm_ratio': [],
-        'kd_info_teacher_entropy': [],
-        'kd_info_teacher_entropy_norm': [],
-        'kd_info_teacher_true_label_prob': [],
-        'kd_info_teacher_non_target_mass': [],
-        'kd_info_teacher_top2_margin': [],
-        'kd_info_teacher_confidence': [],
         'byot_effective_alpha_mean': [],
         'byot_effective_alpha_min': [],
         'byot_effective_alpha_max': [],
-        'byot_server_lambda_scale': [],
         'max': 0, 'avg_10': 0, 'avg_30': 0, 'avg_50': 0
     }
-    for gradient_key in _decomposed_gradient_probe_keys(args):
-        pkl_dict[gradient_key] = []
-    for branch_logit_key in BRANCH_LOGIT_PROBE_KEYS:
-        pkl_dict[branch_logit_key] = []
-    if getattr(args, "log_train_branch_frequency_stats", False):
-        for train_branch_key in TRAIN_BRANCH_FREQ_KEYS:
-            pkl_dict[train_branch_key] = []
-    if getattr(args, "log_client_branch_frequency_stats", False):
-        for client_branch_key in CLIENT_BRANCH_FREQ_KEYS:
-            pkl_dict[client_branch_key] = []
-        for teacher_freq_key in CLIENT_TEACHER_FREQ_KEYS:
-            pkl_dict[teacher_freq_key] = []
-    if getattr(args, "log_postlocal_branch_distribution_stats", False):
-        for postlocal_key in POSTLOCAL_REF_KEYS:
-            pkl_dict[postlocal_key] = []
-    if getattr(args, "log_client_group_lambda", False):
-        num_group_logs = min(int(getattr(args, "partition_groups", 8)), max(int(getattr(args, "n_clients", 1)), 1))
-        for group_idx in range(num_group_logs):
-            for metric in CLIENT_GROUP_LAMBDA_METRICS:
-                pkl_dict[f"client_group_lambda_g{group_idx}_{metric}"] = []
+    for group in LAYERWISE_UPDATE_GROUPS:
+        for stat_name in ("norm", "norm_sq", "mean_norm", "divergence", "relative_drift", "cosine"):
+            pkl_dict[f"layer_update_{group}_{stat_name}"] = []
     last_10 = []
     lr = args.lr
 
     # --- 4. 메인 학습 루프 ---
     m = max(int(args.sample_fraction * args.n_clients), 1) # 참여 클라이언트 수
-    server_lambda_scale = 1.0
 
     for round in range(args.round):
         args.current_round = round
-        args.byot_server_lambda_scale = server_lambda_scale
         logger.info(f'round:{round}')
         t0 = time.time()
 
@@ -2051,37 +999,6 @@ def main():
         for client_idx, net in nets_this_round.items():
             net.load_state_dict(global_w)
 
-        if (
-            getattr(args, "byot_lambda_gate_mode", "none") != "none"
-            and getattr(args, "byot_lambda_gate_scope", "client") == "round"
-        ):
-            round_skew_scores = []
-            round_skew_weights = []
-            for client_idx, net in nets_this_round.items():
-                dataloader = dataloaders_this_round.get(client_idx)
-                if dataloader is None:
-                    continue
-                score = train_module.estimate_client_skew_reliability(
-                    net, dataloader, device, args
-                )
-                round_skew_scores.append(float(score))
-                round_skew_weights.append(float(len(dataloader.dataset)))
-            if round_skew_scores:
-                weights = np.asarray(round_skew_weights, dtype=np.float64)
-                scores = np.asarray(round_skew_scores, dtype=np.float64)
-                if weights.sum() > 0.0:
-                    args.byot_lambda_gate_global_reliability = float(
-                        np.average(scores, weights=weights)
-                    )
-                else:
-                    args.byot_lambda_gate_global_reliability = float(scores.mean())
-            else:
-                args.byot_lambda_gate_global_reliability = 1.0
-            logger.info(
-                "Round lambda granularity gate reliability: "
-                f"{args.byot_lambda_gate_global_reliability:.6f}"
-            )
-
         # Gradient dissimilarity probe at the shared round-start model.
         total_batches = sum([len(dataloaders_this_round[j]) for j in dataloaders_this_round if dataloaders_this_round[j] is not None])
         fed_avg_freqs = [len(dataloaders_this_round[j]) / total_batches if dataloaders_this_round[j] is not None else 0.0 for j in dataloaders_this_round]
@@ -2098,27 +1015,11 @@ def main():
             if gradient_probe_metrics:
                 logger.info(
                     "Gradient probe: "
-                    f"branchCE(all)={gradient_probe_metrics.get('gradient_all_branch_ce_divergence', float('nan')):.6f}, "
-                    f"branchKD(all)={gradient_probe_metrics.get('gradient_all_branch_kd_divergence', float('nan')):.6f}, "
-                    f"total(all)={gradient_probe_metrics.get('gradient_all_configured_total_divergence', float('nan')):.6f}, "
-                    f"CE-KD cosine(shared)={gradient_probe_metrics.get('gradient_shared_backbone_branch_ce_kd_cosine', float('nan')):.6f}"
+                    f"CE={gradient_probe_metrics['gradient_ce_divergence']:.6f}, "
+                    f"KD={gradient_probe_metrics['gradient_kd_divergence']:.6f}, "
+                    f"Combined={gradient_probe_metrics['gradient_combined_divergence']:.6f}, "
+                    f"RelCombined={gradient_probe_metrics['gradient_combined_relative']:.6f}"
                 )
-
-        client_branch_frequency_stats = {}
-        should_probe_client_branch_frequency = (
-            getattr(args, 'log_client_branch_frequency_stats', False)
-            and getattr(args, 'client_branch_freq_probe_interval', 1) > 0
-            and round % getattr(args, 'client_branch_freq_probe_interval', 1) == 0
-        )
-        if should_probe_client_branch_frequency:
-            client_branch_frequency_stats = compute_client_pretrain_branch_frequency_stats(
-                nets_this_round, dataloaders_this_round, device, args, train_module
-            )
-            logger.info(
-                "Client branch-frequency probe: "
-                f"low/B1 clients="
-                f"{client_branch_frequency_stats.get('client_pretrain_branch_freq_low_b1_entropy_norm_count', 0)}"
-            )
 
         old_w = copy.deepcopy(global_model.state_dict())
         
@@ -2154,30 +1055,6 @@ def main():
             avg_byot_alpha_min = avg_byot_alpha_mean
             avg_byot_alpha_max = avg_byot_alpha_mean
 
-        postlocal_reference_stats = {}
-        postlocal_full_logit_path = None
-        should_probe_postlocal_reference = (
-            getattr(args, 'log_postlocal_branch_distribution_stats', False)
-            and getattr(args, 'postlocal_ref_probe_interval', 1) > 0
-            and round % getattr(args, 'postlocal_ref_probe_interval', 1) == 0
-        )
-        if should_probe_postlocal_reference:
-            postlocal_reference_stats, postlocal_raw_logits = compute_postlocal_reference_distribution_stats(
-                nets_this_round, dataloaders_this_round, global_test_dataloader,
-                device, args, train_module,
-                capture_full_logits=getattr(args, 'save_postlocal_full_logits', False),
-            )
-            if getattr(args, 'save_postlocal_full_logits', False):
-                postlocal_full_logit_path = save_postlocal_full_logits(
-                    postlocal_raw_logits, args, round
-                )
-            logger.info(
-                "Post-local reference distribution probe: "
-                f"low/B3 JS={postlocal_reference_stats.get('postlocal_ref_low_b3_js_to_mean')}"
-            )
-            if postlocal_full_logit_path:
-                logger.info(f"Saved full post-local logits: {postlocal_full_logit_path}")
-
         # 로그 저장
         pkl_dict['avg_train_loss'].append(avg_loss)
         pkl_dict['efficiency'].append(avg_ratio)
@@ -2188,33 +1065,6 @@ def main():
         pkl_dict['byot_effective_alpha_mean'].append(avg_byot_alpha_mean)
         pkl_dict['byot_effective_alpha_min'].append(avg_byot_alpha_min)
         pkl_dict['byot_effective_alpha_max'].append(avg_byot_alpha_max)
-        pkl_dict['byot_server_lambda_scale'].append(server_lambda_scale)
-        client_group_lambda_stats = {}
-        if getattr(args, "log_client_group_lambda", False):
-            client_group_lambda_stats = compute_client_group_lambda_stats(args)
-            num_group_logs = min(int(getattr(args, "partition_groups", 8)), max(int(getattr(args, "n_clients", 1)), 1))
-            for group_idx in range(num_group_logs):
-                for metric in CLIENT_GROUP_LAMBDA_METRICS:
-                    key = f"client_group_lambda_g{group_idx}_{metric}"
-                    pkl_dict.setdefault(key, []).append(client_group_lambda_stats.get(key))
-        if getattr(args, "log_train_branch_frequency_stats", False):
-            train_branch_stats = getattr(args, "_last_train_branch_frequency_stats", {}) or {}
-            for train_branch_key in TRAIN_BRANCH_FREQ_KEYS:
-                pkl_dict.setdefault(train_branch_key, []).append(train_branch_stats.get(train_branch_key))
-        if getattr(args, "log_client_branch_frequency_stats", False):
-            for client_branch_key in CLIENT_BRANCH_FREQ_KEYS:
-                pkl_dict.setdefault(client_branch_key, []).append(
-                    client_branch_frequency_stats.get(client_branch_key)
-                )
-            for teacher_freq_key in CLIENT_TEACHER_FREQ_KEYS:
-                pkl_dict.setdefault(teacher_freq_key, []).append(
-                    client_branch_frequency_stats.get(teacher_freq_key)
-                )
-        if getattr(args, "log_postlocal_branch_distribution_stats", False):
-            for postlocal_key in POSTLOCAL_REF_KEYS:
-                pkl_dict.setdefault(postlocal_key, []).append(
-                    postlocal_reference_stats.get(postlocal_key)
-                )
         for gradient_key in [
             'gradient_probe_clients',
             'gradient_ce_divergence',
@@ -2237,29 +1087,26 @@ def main():
             'gradient_combined_cosine',
             'gradient_ce_kd_cross',
             'gradient_ce_kd_corr',
-            'gradient_ce_kd_cosine',
-            'gradient_ce_kd_distance',
-            'gradient_kd_ce_norm_ratio',
-            'kd_info_teacher_entropy',
-            'kd_info_teacher_entropy_norm',
-            'kd_info_teacher_true_label_prob',
-            'kd_info_teacher_non_target_mass',
-            'kd_info_teacher_top2_margin',
-            'kd_info_teacher_confidence',
-            *BRANCH_LOGIT_PROBE_KEYS,
-            *_decomposed_gradient_probe_keys(args),
         ]:
             pkl_dict[gradient_key].append(gradient_probe_metrics.get(gradient_key))
 
         # 모델 집계 (Aggregation)
         drift_metrics = {}
         should_log_drift = (
-            (getattr(args, 'log_client_drift', False) or getattr(args, 'byot_server_lambda_adaptive', False))
+            (
+                getattr(args, 'log_client_drift', False)
+                or getattr(args, 'log_layerwise_client_update_drift', False)
+            )
             and getattr(args, 'drift_log_interval', 1) > 0
             and round % getattr(args, 'drift_log_interval', 1) == 0
         )
         if should_log_drift:
-            drift_metrics = compute_client_update_drift(old_w, nets_this_round, fed_avg_freqs)
+            drift_metrics = compute_client_update_drift(
+                old_w,
+                nets_this_round,
+                fed_avg_freqs,
+                layerwise=getattr(args, 'log_layerwise_client_update_drift', False),
+            )
 
         for drift_key in [
             'client_update_norm',
@@ -2270,6 +1117,10 @@ def main():
             'client_update_cosine',
         ]:
             pkl_dict[drift_key].append(drift_metrics.get(drift_key))
+        for group in LAYERWISE_UPDATE_GROUPS:
+            for stat_name in ("norm", "norm_sq", "mean_norm", "divergence", "relative_drift", "cosine"):
+                drift_key = f"layer_update_{group}_{stat_name}"
+                pkl_dict[drift_key].append(drift_metrics.get(drift_key))
 
         if drift_metrics:
             logger.info(
@@ -2279,15 +1130,6 @@ def main():
                 f"norm={drift_metrics['client_update_norm']:.6f}, "
                 f"cos={drift_metrics['client_update_cosine']:.6f}"
             )
-            if getattr(args, 'byot_server_lambda_adaptive', False):
-                tau = max(float(getattr(args, 'byot_server_lambda_tau', 1.0)), 0.0)
-                min_scale = max(0.0, min(1.0, float(getattr(args, 'byot_server_lambda_min_scale', 0.0))))
-                rel_drift = max(float(drift_metrics.get('client_relative_drift', 0.0) or 0.0), 0.0)
-                server_lambda_scale = max(min_scale, 1.0 / (1.0 + tau * rel_drift))
-                logger.info(
-                    "Server adaptive lambda scale for next round: "
-                    f"scale={server_lambda_scale:.6f}, tau={tau:.4f}, rel_drift={rel_drift:.6f}"
-                )
 
         if getattr(args, 'use_norm_agg', False):
             global_w = norm_based_classwise_aggregation(global_model, nets_this_round, fed_avg_freqs)
@@ -2356,19 +1198,6 @@ def main():
                 metrics[f"drift/{drift_key}"] = drift_value
             for gradient_key, gradient_value in gradient_probe_metrics.items():
                 metrics[f"gradient_probe/{gradient_key}"] = gradient_value
-            for group_key, group_value in client_group_lambda_stats.items():
-                if group_value is not None:
-                    metrics[f"client_group_lambda/{group_key}"] = group_value
-            if getattr(args, "log_train_branch_frequency_stats", False):
-                for train_branch_key in TRAIN_BRANCH_FREQ_KEYS:
-                    train_branch_values = pkl_dict.get(train_branch_key)
-                    if train_branch_values:
-                        train_branch_value = train_branch_values[-1]
-                        if train_branch_value is not None:
-                            metrics[
-                                "train_branch_freq/"
-                                + train_branch_key.removeprefix("train_branch_freq_")
-                            ] = train_branch_value
 
             wandb.log(metrics, step=round)
 
@@ -2387,6 +1216,19 @@ def main():
         torch.cuda.empty_cache() # 찌꺼기 메모리 완전 삭제
 
     # --- 5. 최종 결과 저장 ---
+    if getattr(args, "save_final_ckpt", False):
+        ckpt_dir = args.ckpt_dir if args.ckpt_dir is not None else args.logdir
+        final_ckpt_path = os.path.join(ckpt_dir, f"{log_file_name}_final.pt")
+        os.makedirs(os.path.dirname(final_ckpt_path), exist_ok=True)
+        final_ckpt = {
+            "round": max(int(args.round) - 1, 0),
+            "final_accuracy": float(test_acc_global) if args.round > 0 else None,
+            "args": vars(args),
+            "global_model": global_model.state_dict(),
+        }
+        torch.save(final_ckpt, final_ckpt_path)
+        logger.info(f"Saved final checkpoint: {final_ckpt_path}")
+
     # (기존 코드 유지)
     with open(os.path.join(args.logdir, log_file_name + '.pkl'), 'wb') as f:
         pickle.dump(pkl_dict, f)

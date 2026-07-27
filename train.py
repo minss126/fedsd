@@ -393,6 +393,12 @@ def get_byot_branch_alphas(args, device):
 
 def get_byot_active_branch_indices(args):
     raw = str(getattr(args, "byot_active_branches", "1,2,3") or "1,2,3").strip()
+    if raw.lower() in {"none", "off", "0"}:
+        # Keep the BYOT architecture but remove every branch-side objective.
+        # This is useful for diagnostics such as a frozen intermediate-feature
+        # probe: the teacher is trained exactly as the final classifier, while
+        # no branch CE/KD/feature-imitation gradient reaches the trunk.
+        return []
     values = [v.strip() for v in raw.split(",") if v.strip()]
     if not values:
         raise ValueError("--byot_active_branches must contain at least one branch id from 1,2,3.")
@@ -1301,6 +1307,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
     lambda_gate_enabled = getattr(args, "byot_lambda_gate_mode", "none") != "none"
     class_alpha = estimate_class_byot_alpha(net, train_dataloader, device, args, alpha)
     branch_objective = getattr(args, "byot_branch_objective", "blend")
+    branch_gradient_mode = getattr(args, "byot_branch_gradient_mode", "attached")
     branch_alphas = get_byot_branch_alphas(args, device)
     if branch_objective == "kd_only" and branch_alphas is not None:
         raise ValueError("--byot_branch_alphas is not supported with --byot_branch_objective kd_only.")
@@ -1330,7 +1337,19 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
             x, target = x.to(device), target.to(device).long()
             optimizer.zero_grad()
 
-            out = net(x) 
+            if branch_gradient_mode == "detach_shared":
+                # Analysis-only causal control: branch CE/KD/feature losses
+                # still train the branch-private modules, but cannot alter the
+                # trunk before the corresponding branch exit.
+                try:
+                    out = net(x, detach_branch_inputs=True)
+                except TypeError as error:
+                    raise ValueError(
+                        "--byot_branch_gradient_mode detach_shared currently "
+                        "requires a BYOT model that supports detach_branch_inputs."
+                    ) from error
+            else:
+                out = net(x)
             final_features = None
             
             if isinstance(out, tuple) and len(out) == 8:
@@ -1402,6 +1421,13 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                     alpha_min = 0.0
                     alpha_max = 0.0
                     loss = loss_main
+                elif branch_objective == "feature_only":
+                    # Keep the same branch architecture and feature imitation
+                    # term while removing both branch CE and branch KD.
+                    alpha_mean = 0.0
+                    alpha_min = 0.0
+                    alpha_max = 0.0
+                    loss = loss_main + beta * loss_feat_students
                 elif sample_alpha is None:
                     kd_branch_losses = [
                         criterion_kl(F.log_softmax(m1 / temperature, dim=1), teacher_prob) * (temperature ** 2),

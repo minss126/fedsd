@@ -165,28 +165,40 @@ class Multi_ResNet(nn.Module):
         
         return nn.Sequential(*layer)
     
-    def forward(self, x):
+    def forward(self, x, detach_branch_inputs=False):
+        """Return teacher and branch outputs.
+
+        ``detach_branch_inputs`` is an analysis-only intervention.  It keeps
+        every branch bottleneck/head trainable, but prevents branch-side losses
+        from sending gradients into the trunk preceding that branch.  The final
+        teacher path is deliberately left attached.  This lets an ablation
+        distinguish a branch-head effect from an effect mediated by shared
+        shallow representations.
+        """
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
         # x = self.maxpool(x)
 
         x = self.layer1(x)
-        middle_output1 = self.bottleneck1_1(x)
+        branch_input1 = x.detach() if detach_branch_inputs else x
+        middle_output1 = self.bottleneck1_1(branch_input1)
         middle_output1 = self.avgpool1(middle_output1)
         middle1_fea = middle_output1
         middle_output1 = torch.flatten(middle_output1, 1)
         middle_output1 = self.middle_fc1(middle_output1)
 
         x = self.layer2(x)
-        middle_output2 = self.bottleneck2_1(x)
+        branch_input2 = x.detach() if detach_branch_inputs else x
+        middle_output2 = self.bottleneck2_1(branch_input2)
         middle_output2 = self.avgpool2(middle_output2)
         middle2_fea = middle_output2
         middle_output2 = torch.flatten(middle_output2, 1)
         middle_output2 = self.middle_fc2(middle_output2)
 
         x = self.layer3(x)
-        middle_output3 = self.bottleneck3_1(x)
+        branch_input3 = x.detach() if detach_branch_inputs else x
+        middle_output3 = self.bottleneck3_1(branch_input3)
         middle_output3 = self.avgpool3(middle_output3)
         middle3_fea = middle_output3
         middle_output3 = torch.flatten(middle_output3, 1)

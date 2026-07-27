@@ -21,6 +21,35 @@ from medmnist import PathMNIST, OCTMNIST, OrganAMNIST, OrganCMNIST, OrganSMNIST,
 
 dataset_dict = {'Pathmnist': PathMNIST, 'OCTmnist': OCTMNIST, 'OrganAmnist': OrganAMNIST, 'OrganCmnist': OrganCMNIST, 'OrganSmnist': OrganSMNIST, 'Bloodmnist': BloodMNIST}
 
+
+def _restrict_cifar100_classes(train_ds, test_ds, class_count, subset_seed):
+    """Create a deterministic nested CIFAR-100 class subset with remapped labels.
+
+    This is used only by the controlled class-cardinality study.  A prefix of
+    one seeded permutation is used, so the 10/20/50-class conditions are
+    nested inside the 100-class condition.  Both train and test labels are
+    remapped to ``0..class_count-1`` before FL partitioning.
+    """
+    class_count = int(class_count)
+    if class_count <= 0 or class_count == 100:
+        return
+    if class_count < 2 or class_count > 100:
+        raise ValueError("--cifar100_class_count must be 0 or an integer in [2, 100].")
+
+    rng = np.random.default_rng(int(subset_seed))
+    original_classes = rng.permutation(100)[:class_count]
+    remap = np.full(100, -1, dtype=np.int64)
+    remap[original_classes] = np.arange(class_count, dtype=np.int64)
+
+    for dataset in (train_ds, test_ds):
+        targets = np.asarray(dataset.target, dtype=np.int64)
+        keep = remap[targets] >= 0
+        dataset.data = dataset.data[keep]
+        dataset.target = remap[targets[keep]]
+        # Useful provenance for logs / post-hoc checks; CIFAR100_truncated
+        # exposes num_classes dynamically from the remapped target array.
+        dataset.original_class_ids = original_classes.tolist()
+
 def get_global_dataset(args):
     if args.dataset == 'mnist':
         normalize = transforms.Normalize(mean=[0.1307], std=[0.3081])
@@ -221,6 +250,12 @@ def get_global_dataset(args):
         train_ds = CIFAR100_truncated(args.datadir, train=True, transform=transform_train, download=True)
         val_ds = None
         test_ds = CIFAR100_truncated(args.datadir, train=False, transform=transform_test, download=True)
+        _restrict_cifar100_classes(
+            train_ds,
+            test_ds,
+            getattr(args, 'cifar100_class_count', 0),
+            getattr(args, 'cifar100_subset_seed', 0),
+        )
     
     elif args.dataset == 'tinyimagenet':
         transform_train = transforms.Compose([
