@@ -1365,6 +1365,39 @@ def fedacg(net, global_model, prev_global_model, train_dataloader, optimizer, de
     net.zero_grad()
     return total_loss / max(1, len(train_dataloader)) / args.epochs
 
+def _branch_kd_keep_mask(teacher_prob, target, args):
+    """Return the analysis-only sample mask used to form a branch KD target.
+
+    The target remains detached in every mode.  Filtering changes *which local
+    teacher targets* are trusted, while the selected KD losses are still
+    averaged over selected samples so their scale does not collapse merely
+    because fewer examples pass the filter.
+    """
+    mode = getattr(args, "byot_branch_kd_filter", "none")
+    if mode == "none":
+        return torch.ones(target.size(0), dtype=torch.bool, device=target.device)
+
+    confidence, prediction = teacher_prob.max(dim=1)
+    keep_mask = prediction.eq(target)
+    if mode == "teacher_correct_confident":
+        threshold = float(getattr(args, "byot_branch_kd_conf_threshold", 0.8))
+        keep_mask = keep_mask & confidence.ge(threshold)
+    return keep_mask
+
+
+def _filtered_branch_kd_loss(student_logits, teacher_prob, keep_mask, temperature):
+    """KL(student || detached teacher), averaged over the kept samples only."""
+    if not keep_mask.any():
+        # Keep a valid zero connected to the student graph, so backward works
+        # even for an early local batch where no teacher target is trusted.
+        return student_logits.sum() * 0.0
+    return F.kl_div(
+        F.log_softmax(student_logits[keep_mask] / temperature, dim=1),
+        teacher_prob[keep_mask],
+        reduction='batchmean',
+    ) * (temperature ** 2)
+
+
 def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, args):
     temperature = args.temperature
     base_alpha = get_effective_byot_alpha(train_dataloader, args)
@@ -1383,6 +1416,13 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
     beta = args.byot_beta
     
     criterion_ce = nn.CrossEntropyLoss().to(device)
+    branch_label_smoothing = float(getattr(args, "byot_branch_ce_label_smoothing", 0.0))
+    if not 0.0 <= branch_label_smoothing < 1.0:
+        raise ValueError("--byot_branch_ce_label_smoothing must be in [0, 1).")
+    branch_ce_weight = float(getattr(args, "byot_branch_ce_weight", 1.0))
+    if branch_ce_weight < 0.0:
+        raise ValueError("--byot_branch_ce_weight must be non-negative.")
+    criterion_branch_ce = nn.CrossEntropyLoss(label_smoothing=branch_label_smoothing).to(device)
     criterion_kl = nn.KLDivLoss(reduction='batchmean').to(device)
     criterion_mse = nn.MSELoss().to(device)
     
@@ -1394,6 +1434,8 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
     total_alpha_batches = 0
     min_effective_alpha = None
     max_effective_alpha = None
+    total_kd_kept = 0
+    total_kd_candidates = 0
     branch_freq_stats = init_train_branch_freq_stats() if getattr(args, "log_train_branch_frequency_stats", False) else None
     class_counts, _, expected_class_count = get_local_class_counts(
         train_dataloader, args, device
@@ -1429,9 +1471,9 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                 
                 # 2. Student CE Loss
                 ce_branch_losses = [
-                    criterion_ce(m1, target),
-                    criterion_ce(m2, target),
-                    criterion_ce(m3, target),
+                    branch_ce_weight * criterion_branch_ce(m1, target),
+                    branch_ce_weight * criterion_branch_ce(m2, target),
+                    branch_ce_weight * criterion_branch_ce(m3, target),
                 ]
                 loss_ce_students = sum(ce_branch_losses[i] for i in active_branch_indices)
                 loss_ce_students = reduce_active_branch_loss(
@@ -1450,6 +1492,9 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                     if correct_mask.any():
                         total_correct_conf += teacher_conf[correct_mask].mean().item()
                         valid_conf_batches += 1
+                    kd_keep_mask = _branch_kd_keep_mask(teacher_prob, target, args)
+                    total_kd_kept += int(kd_keep_mask.sum().item())
+                    total_kd_candidates += int(kd_keep_mask.numel())
 
                 if branch_freq_stats is not None:
                     update_train_branch_freq_stats(
@@ -1498,9 +1543,9 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                     loss = loss_main + beta * loss_feat_students
                 elif sample_alpha is None:
                     kd_branch_losses = [
-                        criterion_kl(F.log_softmax(m1 / temperature, dim=1), teacher_prob) * (temperature ** 2),
-                        criterion_kl(F.log_softmax(m2 / temperature, dim=1), teacher_prob) * (temperature ** 2),
-                        criterion_kl(F.log_softmax(m3 / temperature, dim=1), teacher_prob) * (temperature ** 2),
+                        _filtered_branch_kd_loss(m1, teacher_prob, kd_keep_mask, temperature),
+                        _filtered_branch_kd_loss(m2, teacher_prob, kd_keep_mask, temperature),
+                        _filtered_branch_kd_loss(m3, teacher_prob, kd_keep_mask, temperature),
                     ]
                     loss_kd_students = sum(kd_branch_losses[i] for i in active_branch_indices)
                     loss_kd_students = reduce_active_branch_loss(
@@ -1533,6 +1578,11 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                         alpha_max = alpha_mean
                         loss = loss_main + (1 - batch_alpha) * loss_ce_students + batch_alpha * loss_kd_students + beta * loss_feat_students
                 else:
+                    if getattr(args, "byot_branch_kd_filter", "none") != "none":
+                        raise ValueError(
+                            "--byot_branch_kd_filter is an unweighted target ablation and cannot be combined "
+                            "with sample-wise BYOT alpha proxies."
+                        )
                     branch_logits = [m1, m2, m3]
                     loss_kd_students = sum(
                         weighted_byot_kd_loss(branch_logits[i], teacher_prob, sample_alpha, temperature)
@@ -1574,8 +1624,13 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
         min_effective_alpha = alpha
     if max_effective_alpha is None:
         max_effective_alpha = alpha
+    kd_keep_ratio = total_kd_kept / max(1, total_kd_candidates)
+    # `ratio` is surfaced in the existing training log as KD%.  For this
+    # target-quality ablation it records the fraction of local samples that
+    # supplied a KD target; non-KD configurations preserve the legacy 100%.
+    reported_ratio = kd_keep_ratio if getattr(args, "byot_branch_kd_filter", "none") != "none" else 1.0
     result = (
-        total_loss / denom, 1.0, 0.0, 1.0, avg_correct_conf, 0, 0.0, avg_entropy,
+        total_loss / denom, reported_ratio, 0.0, 1.0, avg_correct_conf, 0, 0.0, avg_entropy,
         avg_effective_alpha, min_effective_alpha, max_effective_alpha,
     )
     if branch_freq_stats is not None:

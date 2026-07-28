@@ -147,7 +147,7 @@ job_count=0
 for case_spec in "${CASES[@]}"; do
     IFS='|' read -r dataset num_classes env_name env_flags <<< "$case_spec"
     for alpha in "${ALPHAS[@]}"; do
-        for seed in "${SEEDS[@]}"; do
+        for seed in "${SEEDS[@]}"; doss
             gpu_idx=$((job_count % NUM_GPUS))
             QUEUES[$gpu_idx]+="${dataset}|${num_classes}|${env_name}|${env_flags}|${alpha}|${seed}"$'\n'
             job_count=$((job_count + 1))

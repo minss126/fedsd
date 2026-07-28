@@ -352,6 +352,129 @@ def compute_gradient_drift_probe(nets_this_round, dataloaders_this_round, fed_av
         metrics["gradient_ce_kd_corr"] = cross_stats["corr"]
     return metrics
 
+
+def _gradient_vector_for_prefixes(model, loss, prefixes):
+    """Flatten a loss gradient over a selected shared-prefix parameter set."""
+    params = [
+        parameter for name, parameter in model.named_parameters()
+        if parameter.requires_grad and name.startswith(prefixes)
+    ]
+    if not params:
+        return None
+    grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+    flat = [
+        (torch.zeros_like(parameter) if grad is None else grad).detach().flatten()
+        for parameter, grad in zip(params, grads)
+    ]
+    return torch.cat(flat)
+
+
+def _branch_teacher_gradient_alignment_for_model(model, dataloader, device, max_batches):
+    """Compare branch CE/KD and teacher CE gradients on the same client batches."""
+    prefixes = {
+        "b1": ("conv1.", "bn1.", "layer1."),
+        "b2": ("conv1.", "bn1.", "layer1.", "layer2."),
+        "b3": ("conv1.", "bn1.", "layer1.", "layer2.", "layer3."),
+    }
+    sums = {
+        name: {
+            "ce_cosine": 0.0, "ce_norm_ratio": 0.0,
+            "kd_cosine": 0.0, "kd_norm_ratio": 0.0,
+            "count": 0,
+        }
+        for name in prefixes
+    }
+    temperature = float(getattr(model, "_gradient_probe_temperature", 0.5))
+    for batch_idx, (x, target) in enumerate(dataloader):
+        if batch_idx >= max_batches:
+            break
+        x, target = x.to(device), target.to(device).long()
+        out = model(x)
+        if not (isinstance(out, tuple) and len(out) == 8):
+            continue
+        teacher_logits, m1, m2, m3, _, _, _, _ = out
+        teacher_loss = F.cross_entropy(teacher_logits, target)
+        with torch.no_grad():
+            teacher_prob = F.softmax(teacher_logits / temperature, dim=1)
+        for name, branch_logits in zip(("b1", "b2", "b3"), (m1, m2, m3)):
+            teacher_grad = _gradient_vector_for_prefixes(model, teacher_loss, prefixes[name])
+            branch_ce_grad = _gradient_vector_for_prefixes(
+                model, F.cross_entropy(branch_logits, target), prefixes[name]
+            )
+            branch_kd_loss = F.kl_div(
+                F.log_softmax(branch_logits / temperature, dim=1),
+                teacher_prob,
+                reduction='batchmean',
+            ) * (temperature ** 2)
+            branch_kd_grad = _gradient_vector_for_prefixes(model, branch_kd_loss, prefixes[name])
+            if teacher_grad is None or branch_ce_grad is None or branch_kd_grad is None:
+                continue
+            teacher_norm = float(torch.linalg.vector_norm(teacher_grad).item())
+            branch_ce_norm = float(torch.linalg.vector_norm(branch_ce_grad).item())
+            branch_kd_norm = float(torch.linalg.vector_norm(branch_kd_grad).item())
+            ce_cosine = 0.0
+            kd_cosine = 0.0
+            if teacher_norm > 0.0 and branch_ce_norm > 0.0:
+                ce_cosine = float(torch.dot(teacher_grad, branch_ce_grad).item() / (teacher_norm * branch_ce_norm))
+            if teacher_norm > 0.0 and branch_kd_norm > 0.0:
+                kd_cosine = float(torch.dot(teacher_grad, branch_kd_grad).item() / (teacher_norm * branch_kd_norm))
+            sums[name]["ce_cosine"] += ce_cosine
+            sums[name]["ce_norm_ratio"] += branch_ce_norm / max(teacher_norm, 1e-12)
+            sums[name]["kd_cosine"] += kd_cosine
+            sums[name]["kd_norm_ratio"] += branch_kd_norm / max(teacher_norm, 1e-12)
+            sums[name]["count"] += 1
+    return {
+        name: {
+            "ce_cosine": values["ce_cosine"] / values["count"],
+            "ce_norm_ratio": values["ce_norm_ratio"] / values["count"],
+            "kd_cosine": values["kd_cosine"] / values["count"],
+            "kd_norm_ratio": values["kd_norm_ratio"] / values["count"],
+        }
+        for name, values in sums.items() if values["count"] > 0
+    }
+
+
+def compute_branch_teacher_gradient_alignment_probe(nets_this_round, dataloaders_this_round, fed_avg_freqs, device, args):
+    """Client-weighted branch CE/KD versus teacher CE alignment at round start."""
+    max_batches = max(1, int(getattr(args, "branch_gradient_probe_batches", 1)))
+    weighted = {
+        name: {
+            "ce_cosine": 0.0, "ce_norm_ratio": 0.0,
+            "kd_cosine": 0.0, "kd_norm_ratio": 0.0,
+            "weight": 0.0,
+        }
+        for name in ("b1", "b2", "b3")
+    }
+    used_clients = 0
+    for idx, client_id in enumerate(nets_this_round.keys()):
+        dataloader = dataloaders_this_round.get(client_id)
+        if dataloader is None:
+            continue
+        model = nets_this_round[client_id]
+        was_training = model.training
+        model._gradient_probe_temperature = float(getattr(args, "temperature", 0.5))
+        model.eval()
+        stats = _branch_teacher_gradient_alignment_for_model(model, dataloader, device, max_batches)
+        if was_training:
+            model.train()
+        if not stats:
+            continue
+        used_clients += 1
+        weight = float(fed_avg_freqs[idx])
+        for name, values in stats.items():
+            for metric in ("ce_cosine", "ce_norm_ratio", "kd_cosine", "kd_norm_ratio"):
+                weighted[name][metric] += weight * values[metric]
+            weighted[name]["weight"] += weight
+
+    metrics = {"branch_gradient_probe_clients": used_clients}
+    for name, values in weighted.items():
+        if values["weight"] > 0:
+            metrics[f"branch_gradient_{name}_teacher_ce_cosine"] = values["ce_cosine"] / values["weight"]
+            metrics[f"branch_gradient_{name}_teacher_ce_norm_ratio"] = values["ce_norm_ratio"] / values["weight"]
+            metrics[f"branch_gradient_{name}_teacher_kd_cosine"] = values["kd_cosine"] / values["weight"]
+            metrics[f"branch_gradient_{name}_teacher_kd_norm_ratio"] = values["kd_norm_ratio"] / values["weight"]
+    return metrics
+
 def norm_based_classwise_aggregation(global_model, nets_this_round, clients_this_round, client_data_sizes=None):
     """
     특징 추출기(Body)는 데이터 장수 비례 FedAvg로 합치고,
@@ -680,6 +803,18 @@ def get_args():
                         help='BYOT branch objective. blend uses (1-alpha)*CE + alpha*KD; '
                              'kd_only removes branch CE and uses alpha as an unrestricted KD coefficient; '
                              'feature_only removes both branch CE and KD while retaining feature imitation.')
+    parser.add_argument('--byot_branch_ce_label_smoothing', type=float, default=0.0,
+                        help='Label-smoothing epsilon applied only to branch CE; the final teacher CE remains hard-label CE.')
+    parser.add_argument('--byot_branch_ce_weight', type=float, default=1.0,
+                        help='Multiplicative coefficient applied only to branch CE; teacher CE is unchanged.')
+    parser.add_argument('--byot_branch_kd_filter', default='none',
+                        choices=['none', 'teacher_correct', 'teacher_correct_confident'],
+                        help='Optional target-quality ablation for branch KD. teacher_correct keeps only samples '
+                             'whose detached teacher prediction matches the label; teacher_correct_confident also '
+                             'requires teacher confidence >= --byot_branch_kd_conf_threshold.')
+    parser.add_argument('--byot_branch_kd_conf_threshold', type=float, default=0.8,
+                        help='Confidence threshold for --byot_branch_kd_filter teacher_correct_confident. '
+                             'Confidence is computed from the same temperature-scaled teacher distribution used by KD.')
     parser.add_argument('--byot_branch_gradient_mode', default='attached',
                         choices=['attached', 'detach_shared'],
                         help='Analysis-only intervention for BYOT branches. detach_shared trains branch-private '
@@ -825,6 +960,12 @@ def get_args():
                         help='Probe gradient dissimilarity every N rounds when --log_gradient_probe is enabled.')
     parser.add_argument('--gradient_probe_batches', type=int, default=1,
                         help='Number of local batches per sampled client used for gradient probing.')
+    parser.add_argument('--log_branch_gradient_alignment', action='store_true',
+                        help='Probe cosine/norm-ratio between branch CE and teacher CE gradients on shared prefixes.')
+    parser.add_argument('--branch_gradient_probe_interval', type=int, default=50,
+                        help='Probe branch-to-teacher CE gradient alignment every N rounds when enabled.')
+    parser.add_argument('--branch_gradient_probe_batches', type=int, default=1,
+                        help='Number of local batches per client used for branch-to-teacher gradient probing.')
     
     
     parser.add_argument('--min_threshold', type=float, default=0.8, help='시작 임계값 (Dynamic Threshold용)')
@@ -1023,6 +1164,19 @@ def main():
         'gradient_combined_cosine': [],
         'gradient_ce_kd_cross': [],
         'gradient_ce_kd_corr': [],
+        'branch_gradient_probe_clients': [],
+        'branch_gradient_b1_teacher_ce_cosine': [],
+        'branch_gradient_b1_teacher_ce_norm_ratio': [],
+        'branch_gradient_b1_teacher_kd_cosine': [],
+        'branch_gradient_b1_teacher_kd_norm_ratio': [],
+        'branch_gradient_b2_teacher_ce_cosine': [],
+        'branch_gradient_b2_teacher_ce_norm_ratio': [],
+        'branch_gradient_b2_teacher_kd_cosine': [],
+        'branch_gradient_b2_teacher_kd_norm_ratio': [],
+        'branch_gradient_b3_teacher_ce_cosine': [],
+        'branch_gradient_b3_teacher_ce_norm_ratio': [],
+        'branch_gradient_b3_teacher_kd_cosine': [],
+        'branch_gradient_b3_teacher_kd_norm_ratio': [],
         'byot_effective_alpha_mean': [],
         'byot_effective_alpha_min': [],
         'byot_effective_alpha_max': [],
@@ -1094,6 +1248,27 @@ def main():
                     f"RelCombined={gradient_probe_metrics['gradient_combined_relative']:.6f}"
                 )
 
+        branch_gradient_alignment_metrics = {}
+        should_probe_branch_gradient = (
+            getattr(args, 'log_branch_gradient_alignment', False)
+            and getattr(args, 'branch_gradient_probe_interval', 1) > 0
+            and round % getattr(args, 'branch_gradient_probe_interval', 1) == 0
+        )
+        if should_probe_branch_gradient:
+            branch_gradient_alignment_metrics = compute_branch_teacher_gradient_alignment_probe(
+                nets_this_round, dataloaders_this_round, fed_avg_freqs, device, args
+            )
+            if branch_gradient_alignment_metrics:
+                logger.info(
+                    "Branch gradient alignment: "
+                    f"B1(CE/KD)={branch_gradient_alignment_metrics.get('branch_gradient_b1_teacher_ce_cosine', float('nan')):.4f}/"
+                    f"{branch_gradient_alignment_metrics.get('branch_gradient_b1_teacher_kd_cosine', float('nan')):.4f}, "
+                    f"B2(CE/KD)={branch_gradient_alignment_metrics.get('branch_gradient_b2_teacher_ce_cosine', float('nan')):.4f}/"
+                    f"{branch_gradient_alignment_metrics.get('branch_gradient_b2_teacher_kd_cosine', float('nan')):.4f}, "
+                    f"B3(CE/KD)={branch_gradient_alignment_metrics.get('branch_gradient_b3_teacher_ce_cosine', float('nan')):.4f}/"
+                    f"{branch_gradient_alignment_metrics.get('branch_gradient_b3_teacher_kd_cosine', float('nan')):.4f}"
+                )
+
         old_w = copy.deepcopy(global_model.state_dict())
         
         args.current_round = round + 1
@@ -1160,8 +1335,23 @@ def main():
             'gradient_combined_cosine',
             'gradient_ce_kd_cross',
             'gradient_ce_kd_corr',
+            'branch_gradient_probe_clients',
+            'branch_gradient_b1_teacher_ce_cosine',
+            'branch_gradient_b1_teacher_ce_norm_ratio',
+            'branch_gradient_b1_teacher_kd_cosine',
+            'branch_gradient_b1_teacher_kd_norm_ratio',
+            'branch_gradient_b2_teacher_ce_cosine',
+            'branch_gradient_b2_teacher_ce_norm_ratio',
+            'branch_gradient_b2_teacher_kd_cosine',
+            'branch_gradient_b2_teacher_kd_norm_ratio',
+            'branch_gradient_b3_teacher_ce_cosine',
+            'branch_gradient_b3_teacher_ce_norm_ratio',
+            'branch_gradient_b3_teacher_kd_cosine',
+            'branch_gradient_b3_teacher_kd_norm_ratio',
         ]:
-            pkl_dict[gradient_key].append(gradient_probe_metrics.get(gradient_key))
+            pkl_dict[gradient_key].append(
+                gradient_probe_metrics.get(gradient_key, branch_gradient_alignment_metrics.get(gradient_key))
+            )
 
         # 모델 집계 (Aggregation)
         drift_metrics = {}
