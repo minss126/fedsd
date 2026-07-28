@@ -119,6 +119,7 @@ run_queue() {
     shift
     local job dataset partition variant branch_mode objective alpha beta seed
     for job in "$@"; do
+        [ -z "$job" ] && continue
         IFS='|' read -r dataset partition variant branch_mode objective alpha beta seed <<< "$job"
         run_job "$gpu_id" "$dataset" "$partition" "$variant" "$branch_mode" "$objective" "$alpha" "$beta" "$seed"
     done

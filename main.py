@@ -39,6 +39,22 @@ LAYERWISE_UPDATE_GROUPS = (
 )
 
 
+def _extract_dataset_targets(dataset):
+    """Return labels for a dataset or a torch Subset-style wrapper."""
+    if hasattr(dataset, 'indices') and hasattr(dataset, 'dataset'):
+        parent_targets = _extract_dataset_targets(dataset.dataset)
+        if parent_targets is not None:
+            return parent_targets[np.asarray(dataset.indices, dtype=np.int64)]
+
+    for attr in ('targets', 'target', 'labels'):
+        if hasattr(dataset, attr):
+            values = getattr(dataset, attr)
+            if isinstance(values, torch.Tensor):
+                return values.detach().cpu().numpy()
+            return np.asarray(values)
+    return None
+
+
 def _layerwise_update_group(key):
     if key.startswith(("conv1.", "bn1.")):
         return "stem"
@@ -689,18 +705,59 @@ def get_args():
                         help='Batch-level proxy used to scale BYOT KD alpha.')
     parser.add_argument('--byot_sample_proxy', default='none',
                         choices=['none', 'teacher_conf', 'teacher_entropy', 'teacher_margin',
-                                 'teacher_label_prob', 'teacher_correctness', 'branch_agreement',
-                                 'branch_soft_kl', 'branch_js'],
+                                 'teacher_label_prob', 'teacher_label_prob_entropy',
+                                 'teacher_label_prob_branch_js', 'teacher_label_prob_entropy_branch_js',
+                                 'teacher_correctness', 'branch_agreement', 'branch_soft_kl', 'branch_js'],
                         help='Sample-level reliability proxy used to weight BYOT KD loss.')
     parser.add_argument('--byot_client_proxy', default='none',
                         choices=['none', 'teacher_conf', 'teacher_entropy', 'teacher_margin',
-                                 'teacher_label_prob', 'teacher_correctness', 'branch_agreement',
-                                 'branch_soft_kl', 'branch_js'],
+                                 'teacher_label_prob', 'teacher_label_prob_entropy',
+                                 'teacher_label_prob_branch_js', 'teacher_label_prob_entropy_branch_js',
+                                 'teacher_correctness', 'branch_agreement', 'branch_soft_kl', 'branch_js'],
                         help='Client-level reliability proxy used to choose one BYOT KD alpha per client.')
     parser.add_argument('--byot_client_alpha_min', type=float, default=0.01,
                         help='Minimum client-wise BYOT alpha when --byot_client_proxy is enabled.')
     parser.add_argument('--byot_client_alpha_max', type=float, default=0.30,
                         help='Maximum client-wise BYOT alpha when --byot_client_proxy is enabled.')
+    parser.add_argument('--byot_client_alpha_mode', default='map', choices=['map', 'multiply'],
+                        help='map: use the client alpha directly; multiply: scale the round-wise lambda by it.')
+    parser.add_argument('--byot_client_reliability_power', type=float, default=1.0,
+                        help='Power applied to the client reliability proxy before mapping it to lambda.')
+    parser.add_argument('--byot_client_skew_proxy', default='none',
+                        choices=['none', 'prediction_entropy', 'prediction_js_global',
+                                 'label_entropy', 'label_js_global', 'max_concentration'],
+                        help='Client-distribution signal used to scale BYOT lambda.')
+    parser.add_argument('--byot_client_skew_power', type=float, default=1.0,
+                        help='Power p applied to the client skew reliability b before lambda scaling.')
+    parser.add_argument('--byot_client_skew_min_scale', type=float, default=0.0,
+                        help='Lower bound for the client skew lambda scale.')
+    parser.add_argument('--byot_client_skew_max_scale', type=float, default=10.0,
+                        help='Upper bound for the client skew lambda scale.')
+    parser.add_argument('--byot_client_skew_correction_mode', default='multiply',
+                        choices=['multiply', 'normalize', 'residual', 'soft_relax'],
+                        help='How client skew reliability is converted to a lambda scale.')
+    parser.add_argument('--byot_client_skew_norm_value', type=float, default=1.0,
+                        help='Normalization constant for --byot_client_skew_correction_mode normalize.')
+    parser.add_argument('--byot_client_skew_center', type=float, default=1.0,
+                        help='Center value for --byot_client_skew_correction_mode residual.')
+    parser.add_argument('--byot_client_skew_gamma', type=float, default=1.0,
+                        help='Residual strength for --byot_client_skew_correction_mode residual.')
+    parser.add_argument('--byot_client_skew_soft_tau', type=float, default=0.80,
+                        help='Reliability threshold where soft_relax starts removing the skew penalty.')
+    parser.add_argument('--byot_client_skew_soft_temperature', type=float, default=0.05,
+                        help='Transition temperature for --byot_client_skew_correction_mode soft_relax.')
+    parser.add_argument('--byot_client_skew_label_smoothing', type=float, default=0.0,
+                        help='Additive class-count smoothing for label-based client skew proxies.')
+    parser.add_argument('--byot_lambda_gate_mode', default='none', choices=['none', 'hard', 'soft'],
+                        help='Optional gate between sample-wise and client-wise BYOT lambda.')
+    parser.add_argument('--byot_lambda_gate_scope', default='client', choices=['client', 'round'],
+                        help='Use an individual-client or round-level skew signal for the lambda gate.')
+    parser.add_argument('--byot_lambda_gate_tau', type=float, default=0.75,
+                        help='Skew-reliability threshold for the lambda gate.')
+    parser.add_argument('--byot_lambda_gate_temperature', type=float, default=0.05,
+                        help='Transition temperature for a soft lambda gate.')
+    parser.add_argument('--byot_lambda_gate_warmup', type=int, default=0,
+                        help='Optional rounds over which to ramp the lambda gate from zero.')
     parser.add_argument('--byot_round_lambda_schedule', default='none',
                         choices=['none', 'linear', 'cosine'],
                         help='Round-wise schedule for BYOT alpha/lambda. '
@@ -845,6 +902,18 @@ def main():
     # 다른 데이터셋 추가 시 여기에 작성
     
     print(f"🔥 [Auto Setup] Dataset: {args.dataset} | Classes: {args.num_classes} | Channels: {args.in_channels}")
+
+    # Label-JS client-skew proxies compare each local label distribution with
+    # this global training-distribution reference.  It is a server-side prior;
+    # clients only need the resulting public vector to compute a local scalar.
+    global_targets = _extract_dataset_targets(global_train_dataset)
+    if global_targets is not None:
+        if isinstance(global_targets, torch.Tensor):
+            global_targets = global_targets.detach().cpu().numpy()
+        global_targets = np.asarray(global_targets, dtype=np.int64).reshape(-1)
+        global_counts = np.bincount(global_targets, minlength=args.num_classes).astype(np.float64)
+        if float(global_counts.sum()) > 0.0:
+            args.byot_client_skew_global_label_probs = (global_counts / global_counts.sum()).tolist()
 
     # ==========================================================================
     # [통합 수정] 2. 모델 선택 로직 (Base vs Ours)

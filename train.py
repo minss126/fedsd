@@ -190,6 +190,53 @@ def _extract_dataset_targets(dataset):
 def _clamp_unit(value):
     return min(max(float(value), 0.0), 1.0)
 
+
+def _normalized_js_divergence(first, second):
+    """Return Jensen-Shannon divergence normalized to [0, 1]."""
+    first = np.asarray(first, dtype=np.float64)
+    second = np.asarray(second, dtype=np.float64)
+    if first.size == 0 or second.size == 0 or first.shape != second.shape:
+        return 0.0
+
+    first = np.clip(first, 0.0, None)
+    second = np.clip(second, 0.0, None)
+    first_total = float(first.sum())
+    second_total = float(second.sum())
+    if first_total <= 0.0 or second_total <= 0.0:
+        return 0.0
+
+    first /= first_total
+    second /= second_total
+    mixture = 0.5 * (first + second)
+    kl_first = np.sum(first * np.log((first + 1e-12) / (mixture + 1e-12)))
+    kl_second = np.sum(second * np.log((second + 1e-12) / (mixture + 1e-12)))
+    return _clamp_unit(0.5 * (kl_first + kl_second) / math.log(2.0))
+
+
+def _get_client_label_distribution(train_dataloader, args, num_classes):
+    targets = _extract_dataset_targets(train_dataloader.dataset)
+    if targets is None or len(targets) == 0:
+        return None
+
+    targets = np.asarray(targets, dtype=np.int64).reshape(-1)
+    counts = np.bincount(targets, minlength=num_classes).astype(np.float64)
+    smoothing = max(float(getattr(args, "byot_client_skew_label_smoothing", 0.0)), 0.0)
+    if smoothing > 0.0:
+        counts += smoothing
+    total = float(counts.sum())
+    return None if total <= 0.0 else counts / total
+
+
+def _get_global_label_distribution(args, num_classes):
+    values = getattr(args, "byot_client_skew_global_label_probs", None)
+    if values is None:
+        return None
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if values.size != num_classes:
+        return None
+    total = float(values.sum())
+    return None if total <= 0.0 else values / total
+
 def _infer_num_classes_from_targets(targets, args):
     configured = getattr(args, "num_classes", None)
     if configured is not None:
@@ -272,7 +319,7 @@ def estimate_client_skew_reliability(net, train_dataloader, device, args):
     if proxy == "none":
         return 1.0
 
-    if proxy == "prediction_entropy":
+    if proxy in {"prediction_entropy", "prediction_js_global"}:
         temperature = float(getattr(args, "temperature", 0.5))
         was_training = net.training
         net.eval()
@@ -298,10 +345,16 @@ def estimate_client_skew_reliability(net, train_dataloader, device, args):
             return 1.0
 
         mean_prob = (prob_sum / float(total)).detach().cpu().numpy().astype(np.float64)
-        mean_prob = mean_prob[mean_prob > 0]
         num_classes = max(int(prob_sum.numel()), 2)
-        entropy = -np.sum(mean_prob * np.log(mean_prob + 1e-12))
-        reliability = entropy / np.log(num_classes)
+        if proxy == "prediction_entropy":
+            nonzero_prob = mean_prob[mean_prob > 0]
+            entropy = -np.sum(nonzero_prob * np.log(nonzero_prob + 1e-12))
+            reliability = entropy / np.log(num_classes)
+        else:
+            global_prob = _get_global_label_distribution(args, int(prob_sum.numel()))
+            if global_prob is None:
+                return 1.0
+            reliability = 1.0 - _normalized_js_divergence(mean_prob, global_prob)
     else:
         targets = _extract_dataset_targets(train_dataloader.dataset)
         if targets is None or len(targets) == 0:
@@ -321,6 +374,12 @@ def estimate_client_skew_reliability(net, train_dataloader, device, args):
             else:
                 entropy = -np.sum(probs * np.log(probs + 1e-12))
                 reliability = entropy / np.log(num_classes)
+        elif proxy == "label_js_global":
+            local_prob = _get_client_label_distribution(train_dataloader, args, num_classes)
+            global_prob = _get_global_label_distribution(args, num_classes)
+            if local_prob is None or global_prob is None:
+                return 1.0
+            reliability = 1.0 - _normalized_js_divergence(local_prob, global_prob)
         elif proxy == "max_concentration":
             reliability = 1.0 - float(counts.max() / total)
             if num_classes > 1:
@@ -345,6 +404,15 @@ def get_client_skew_scale_from_reliability(reliability, args):
         center = float(getattr(args, "byot_client_skew_center", 1.0))
         gamma = float(getattr(args, "byot_client_skew_gamma", 1.0))
         scale = 1.0 + gamma * (powered - center)
+    elif correction_mode == "soft_relax":
+        # Preserve the original b^p penalty for low-reliability (strongly
+        # skewed) clients, but smoothly relax it toward 1 for high-reliability
+        # clients.  This keeps p=2 unchanged in the severe-skew regime.
+        tau = _clamp_unit(getattr(args, "byot_client_skew_soft_tau", 0.80))
+        temperature = max(float(getattr(args, "byot_client_skew_soft_temperature", 0.05)), 1e-8)
+        logit = max(min((reliability - tau) / temperature, 60.0), -60.0)
+        gate = 1.0 / (1.0 + math.exp(-logit))
+        scale = (1.0 - gate) * powered + gate
     else:
         scale = min_scale + (1.0 - min_scale) * powered
 

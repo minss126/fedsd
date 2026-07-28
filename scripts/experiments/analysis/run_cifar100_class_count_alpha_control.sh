@@ -88,6 +88,10 @@ run_queue() {
     shift
     local job class_count alpha seed
     for job in "$@"; do
+        # ``mapfile`` may preserve the final empty line used to delimit a
+        # queue.  Ignore it so no malformed blank-argument main.py call is
+        # issued after an otherwise successful queue.
+        [ -z "$job" ] && continue
         IFS='|' read -r class_count alpha seed <<< "$job"
         run_job "$gpu_id" "$class_count" "$alpha" "$seed"
     done

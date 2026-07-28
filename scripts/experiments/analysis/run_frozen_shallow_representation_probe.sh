@@ -92,6 +92,7 @@ run_queue() {
     shift
     local job
     for job in "$@"; do
+        [ -z "$job" ] && continue
         IFS='|' read -r dataset num_classes env_name env_flags seed <<< "$job"
         run_job "$gpu_id" "$dataset" "$num_classes" "$env_name" "$env_flags" "$seed"
     done
