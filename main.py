@@ -554,6 +554,8 @@ def get_args():
     # 데이터를 다운로드하거나, 이미 있는 경로 (서버마다 공유 데이터 경로가 있음)  v100: /mnt/data3/ 8000: /mnt/data1/ or /mnt/data3/ , 4000: /data/  ,  2080: /mnt/data3/
     parser.add_argument('--logdir', default="./logs/", help='Log directory path')
     parser.add_argument('--log_file_name', default=None, help='log file name')
+    parser.add_argument('--log_client_group_lambda', action='store_true',
+                        help='Compatibility flag for lambda experiment scripts.')
     parser.add_argument('--device', default='cuda:0', help='The device to run the program')
     # gpu 번호 설정
     parser.add_argument('--num_workers', default=0, type=int, help='the number of workers for each dataloader')
@@ -568,6 +570,8 @@ def get_args():
     # group_norm의 groups
     parser.add_argument('--in_channels', type=int, default=3)
     # image channels. 1 channel 데이터셋이도 3 channel로 하면 gray scale -> RGB scale 채널이 복사되서 작동합니다
+    parser.add_argument('--num_classes', type=int, default=100,
+                        help='Classifier output dimension; dataset setup may override this value.')
     parser.add_argument('--last_fc', action='store_true', help='For mobilenet, classifier is fc_layer if True, otherwise, 1x1 conv')
     # mobilenet에서만 작동. 기본값은 마지막 classifier가 1x1 conv
     

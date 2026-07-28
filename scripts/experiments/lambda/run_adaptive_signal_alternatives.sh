@@ -61,7 +61,7 @@ LAMBDA_MAX="${LAMBDA_MAX:-2.00}"
 WARMUP_ROUNDS="${WARMUP_ROUNDS:-250}"
 LOG_ROOT="${LOG_ROOT:-logs/lambda/adaptive/logs_adaptive_signal_alternatives}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
-EXTRA_FLAGS="${EXTRA_FLAGS:---log_client_group_lambda}"
+EXTRA_FLAGS="${EXTRA_FLAGS:-}"
 
 # beta=0.5 tests the mild-skew regime targeted by soft_relax; beta=0.1 tests
 # whether a candidate retains the original adaptive method's severe-skew gain.
@@ -155,7 +155,7 @@ run_job() {
     echo "[GPU ${gpu_id}] start: ${env_name} | ${method_name}"
 
     "$PYTHON_BIN" main.py \
-        --dataset cifar100 --datadir ./data --num_classes 100 \
+        --dataset cifar100 --datadir ./data \
         --n_clients 100 --sample_fraction 0.1 \
         --epochs "$LOCAL_EPOCHS" --lr "$LR" --batch_size "$BATCH_SIZE" \
         --num_workers "$NUM_WORKERS" --round "$ROUNDS" --seed "$SEED" \
