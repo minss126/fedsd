@@ -41,7 +41,7 @@ LOG_ROOT="${LOG_ROOT:-logs/analysis/logs_branch_target_ablation_r500}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 run_job() {
-    local gpu_id=$1 dataset=$2 variant=$3 objective=$4 alpha=$5 smoothing=$6 kd_filter=$7 seed=$8
+    local gpu_id=$1 dataset=$2 variant=$3 objective=$4 alpha=$5 smoothing=$6 kd_filter=$7 target_mode=$8 seed=$9
     local setting="${dataset}_resnet18/beta_0.5/fedavg/seed${seed}"
     local log_dir="${LOG_ROOT}/${setting}"
     local result="${log_dir}/${variant}.pkl"
@@ -66,6 +66,7 @@ run_job() {
         --byot_beta "$FEATURE_BETA" \
         --byot_branch_ce_label_smoothing "$smoothing" \
         --byot_branch_kd_filter "$kd_filter" \
+        --byot_branch_kd_target_mode "$target_mode" \
         --byot_branch_kd_conf_threshold "$KD_CONF_THRESHOLD" \
         > "${log_dir}/${variant}_terminal.log" 2>&1
     echo "[GPU ${gpu_id}] complete: ${setting} | ${variant}"
@@ -73,9 +74,9 @@ run_job() {
 
 declare -a JOBS=()
 add_variant() {
-    local dataset=$1 variant=$2 objective=$3 alpha=$4 smoothing=$5 kd_filter=$6
+    local dataset=$1 variant=$2 objective=$3 alpha=$4 smoothing=$5 kd_filter=$6 target_mode=${7:-full_teacher}
     for seed in "${SEEDS[@]}"; do
-        JOBS+=("${dataset}|${variant}|${objective}|${alpha}|${smoothing}|${kd_filter}|${seed}")
+        JOBS+=("${dataset}|${variant}|${objective}|${alpha}|${smoothing}|${kd_filter}|${target_mode}|${seed}")
     done
 }
 
@@ -89,6 +90,9 @@ add_dataset_suite() {
     add_variant "$dataset" "lsce$(printf '%.2f' "$LABEL_SMOOTHING" | tr '.' 'p')_feature" blend 0.00 "$LABEL_SMOOTHING" none
     # Tests teacher relations with all targets versus only reliable targets.
     add_variant "$dataset" kd_feature blend 1.00 0.00 none
+    # Preserves q_T(y|x) per sample but deletes the teacher's non-target
+    # class allocation.  This isolates the contribution of class relations.
+    add_variant "$dataset" kd_teacher_mass_uniform_feature blend 1.00 0.00 none teacher_mass_uniform
     add_variant "$dataset" kd_teacher_correct_feature blend 1.00 0.00 teacher_correct
     add_variant "$dataset" "kd_teacher_correct_conf$(printf '%.2f' "$KD_CONF_THRESHOLD" | tr '.' 'p')_feature" blend 1.00 0.00 teacher_correct_confident
 }
@@ -102,17 +106,17 @@ echo "========== Branch Target Ablation =========="
 echo "gpus=${GPUS[*]}, rounds=${ROUNDS}, local_epochs=${LOCAL_EPOCHS}, seeds=${SEEDS[*]}"
 echo "datasets=cifar100,cifar10 | partition=beta_0.5 | feature_beta=${FEATURE_BETA}"
 echo "label_smoothing=${LABEL_SMOOTHING}, kd_conf_threshold=${KD_CONF_THRESHOLD}"
-echo "conditions=feature_only,ce,lsce,kd_all,kd_correct,kd_correct_confident"
+echo "conditions=feature_only,ce,lsce,kd_all,kd_teacher_mass_uniform,kd_correct,kd_correct_confident"
 echo "log_root=${LOG_ROOT}, jobs=${#JOBS[@]}, skip_existing=${SKIP_EXISTING}"
 
 run_queue() {
     local gpu_id=$1
     shift
-    local job dataset variant objective alpha smoothing kd_filter seed
+    local job dataset variant objective alpha smoothing kd_filter target_mode seed
     for job in "$@"; do
         [ -z "$job" ] && continue
-        IFS='|' read -r dataset variant objective alpha smoothing kd_filter seed <<< "$job"
-        run_job "$gpu_id" "$dataset" "$variant" "$objective" "$alpha" "$smoothing" "$kd_filter" "$seed"
+        IFS='|' read -r dataset variant objective alpha smoothing kd_filter target_mode seed <<< "$job"
+        run_job "$gpu_id" "$dataset" "$variant" "$objective" "$alpha" "$smoothing" "$kd_filter" "$target_mode" "$seed"
     done
 }
 

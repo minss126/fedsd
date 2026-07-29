@@ -812,6 +812,11 @@ def get_args():
                         help='Optional target-quality ablation for branch KD. teacher_correct keeps only samples '
                              'whose detached teacher prediction matches the label; teacher_correct_confident also '
                              'requires teacher confidence >= --byot_branch_kd_conf_threshold.')
+    parser.add_argument('--byot_branch_kd_target_mode', default='full_teacher',
+                        choices=['full_teacher', 'teacher_mass_uniform'],
+                        help='Branch-KD target construction. full_teacher uses the complete teacher distribution; '
+                             'teacher_mass_uniform preserves the teacher probability of the true label but spreads '
+                             'all remaining probability uniformly over non-target classes.')
     parser.add_argument('--byot_branch_kd_conf_threshold', type=float, default=0.8,
                         help='Confidence threshold for --byot_branch_kd_filter teacher_correct_confident. '
                              'Confidence is computed from the same temperature-scaled teacher distribution used by KD.')

@@ -1385,6 +1385,26 @@ def _branch_kd_keep_mask(teacher_prob, target, args):
     return keep_mask
 
 
+def _branch_kd_target_distribution(teacher_prob, target, args):
+    """Construct the detached branch-KD target for target-information ablations."""
+    mode = getattr(args, "byot_branch_kd_target_mode", "full_teacher")
+    if mode == "full_teacher":
+        return teacher_prob
+    if mode != "teacher_mass_uniform":
+        raise ValueError(f"Unknown --byot_branch_kd_target_mode: {mode}")
+
+    # Preserve q_T(y|x), thereby preserving each sample's teacher-adaptive
+    # softness.  Only the allocation among non-target classes is erased.
+    num_classes = teacher_prob.size(1)
+    if num_classes <= 1:
+        return teacher_prob
+    target_prob = teacher_prob.gather(1, target.unsqueeze(1))
+    uniform_non_target = (1.0 - target_prob) / float(num_classes - 1)
+    kd_target = uniform_non_target.expand_as(teacher_prob).clone()
+    kd_target.scatter_(1, target.unsqueeze(1), target_prob)
+    return kd_target
+
+
 def _filtered_branch_kd_loss(student_logits, teacher_prob, keep_mask, temperature):
     """KL(student || detached teacher), averaged over the kept samples only."""
     if not keep_mask.any():
@@ -1483,6 +1503,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                 # 3. KL Divergence
                 with torch.no_grad():
                     teacher_prob = F.softmax(output / temperature, dim=1)
+                    kd_target_prob = _branch_kd_target_distribution(teacher_prob, target, args)
                     
                     entropy = -(teacher_prob * torch.log(teacher_prob + 1e-8)).sum(dim=1).mean().item()
                     total_entropy += entropy
@@ -1543,9 +1564,9 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                     loss = loss_main + beta * loss_feat_students
                 elif sample_alpha is None:
                     kd_branch_losses = [
-                        _filtered_branch_kd_loss(m1, teacher_prob, kd_keep_mask, temperature),
-                        _filtered_branch_kd_loss(m2, teacher_prob, kd_keep_mask, temperature),
-                        _filtered_branch_kd_loss(m3, teacher_prob, kd_keep_mask, temperature),
+                        _filtered_branch_kd_loss(m1, kd_target_prob, kd_keep_mask, temperature),
+                        _filtered_branch_kd_loss(m2, kd_target_prob, kd_keep_mask, temperature),
+                        _filtered_branch_kd_loss(m3, kd_target_prob, kd_keep_mask, temperature),
                     ]
                     loss_kd_students = sum(kd_branch_losses[i] for i in active_branch_indices)
                     loss_kd_students = reduce_active_branch_loss(
@@ -1585,7 +1606,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                         )
                     branch_logits = [m1, m2, m3]
                     loss_kd_students = sum(
-                        weighted_byot_kd_loss(branch_logits[i], teacher_prob, sample_alpha, temperature)
+                        weighted_byot_kd_loss(branch_logits[i], kd_target_prob, sample_alpha, temperature)
                         for i in active_branch_indices
                     ) * (temperature ** 2)
                     loss_kd_students = reduce_active_branch_loss(
