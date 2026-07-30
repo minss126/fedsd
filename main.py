@@ -475,6 +475,241 @@ def compute_branch_teacher_gradient_alignment_probe(nets_this_round, dataloaders
             metrics[f"branch_gradient_{name}_teacher_kd_norm_ratio"] = values["kd_norm_ratio"] / values["weight"]
     return metrics
 
+
+def _active_branch_indices_for_probe(args):
+    """Parse active BYOT exits without importing the training module."""
+    raw = str(getattr(args, "byot_active_branches", "1,2,3") or "1,2,3").strip().lower()
+    if raw in {"", "none", "off", "0"}:
+        return []
+    indices = []
+    for token in raw.split(","):
+        branch_id = int(token.strip())
+        if branch_id not in (1, 2, 3):
+            raise ValueError("--byot_active_branches only supports 1,2,3 for this probe.")
+        if branch_id - 1 not in indices:
+            indices.append(branch_id - 1)
+    return indices
+
+
+def _branch_shared_trunk_parameters(model):
+    """Parameters that branch exits can update and that the final teacher reuses."""
+    prefixes = ("conv1.", "bn1.", "layer1.", "layer2.", "layer3.")
+    return [
+        parameter for name, parameter in model.named_parameters()
+        if parameter.requires_grad and name.startswith(prefixes)
+    ]
+
+
+def _branch_kd_probe_target(teacher_prob, target, args):
+    """Mirror the supported KD-target ablation when probing gradient geometry."""
+    mode = getattr(args, "byot_branch_kd_target_mode", "full_teacher")
+    if mode == "full_teacher":
+        return teacher_prob
+    if mode != "teacher_mass_uniform":
+        raise ValueError(f"Unknown --byot_branch_kd_target_mode: {mode}")
+    num_classes = teacher_prob.size(1)
+    if num_classes <= 1:
+        return teacher_prob
+    target_prob = teacher_prob.gather(1, target.unsqueeze(1))
+    uniform_non_target = (1.0 - target_prob) / float(num_classes - 1)
+    target_distribution = uniform_non_target.expand_as(teacher_prob).clone()
+    target_distribution.scatter_(1, target.unsqueeze(1), target_prob)
+    return target_distribution
+
+
+def _branch_shared_probe_loss(output, branch_logits, target, args, loss_kind):
+    """Return one branch-only CE or KD loss over the configured active exits."""
+    active_indices = _active_branch_indices_for_probe(args)
+    if not active_indices:
+        return None
+    temperature = float(getattr(args, "temperature", 0.5))
+    if loss_kind == "ce":
+        smoothing = float(getattr(args, "byot_branch_ce_label_smoothing", 0.0))
+        weight = float(getattr(args, "byot_branch_ce_weight", 1.0))
+        losses = [
+            weight * F.cross_entropy(branch_logits[idx], target, label_smoothing=smoothing)
+            for idx in active_indices
+        ]
+    elif loss_kind == "kd":
+        with torch.no_grad():
+            teacher_prob = F.softmax(output / temperature, dim=1)
+            kd_target = _branch_kd_probe_target(teacher_prob, target, args)
+        losses = [
+            F.kl_div(
+                F.log_softmax(branch_logits[idx] / temperature, dim=1),
+                kd_target,
+                reduction="batchmean",
+            ) * (temperature ** 2)
+            for idx in active_indices
+        ]
+    else:
+        raise ValueError(f"Unknown branch shared-gradient loss kind: {loss_kind}")
+    total = sum(losses)
+    if getattr(args, "byot_branch_loss_reduction", "sum") == "mean":
+        total = total / len(active_indices)
+    return total
+
+
+def _average_branch_shared_gradient(model, dataloader, device, args, loss_kind, max_batches):
+    """Client gradient of one branch loss with respect to shared trunk only."""
+    params = _branch_shared_trunk_parameters(model)
+    if not params:
+        return None
+    gradients = []
+    for batch_idx, (x, target) in enumerate(dataloader):
+        if batch_idx >= max_batches:
+            break
+        x, target = x.to(device), target.to(device).long()
+        if getattr(args, "byot_branch_gradient_mode", "attached") == "detach_shared":
+            # This control blocks exactly the branch-loss path into the
+            # shared trunk, so record the gradient that is actually applied.
+            out = model(x, detach_branch_inputs=True)
+        else:
+            out = model(x)
+        if not (isinstance(out, tuple) and len(out) == 8):
+            continue
+        output, m1, m2, m3 = out[:4]
+        loss = _branch_shared_probe_loss(output, (m1, m2, m3), target, args, loss_kind)
+        if loss is None:
+            continue
+        grads = torch.autograd.grad(loss, params, allow_unused=True)
+        flat = [
+            (torch.zeros_like(parameter) if grad is None else grad).detach().cpu().flatten()
+            for parameter, grad in zip(params, grads)
+        ]
+        gradients.append(torch.cat(flat))
+    if not gradients:
+        return None
+    return torch.stack(gradients, dim=0).mean(dim=0)
+
+
+def compute_branch_shared_gradient_dispersion_probe(
+    nets_this_round, dataloaders_this_round, fed_avg_freqs, device, args
+):
+    """Measure CE/KD branch-gradient disagreement before local training.
+
+    Each vector is \nabla_{theta_shared} L_branch for one selected client at
+    the identical round-start global checkpoint.  The weighted mean is the
+    first-order FedAvg branch update; divergence measures how much client
+    gradients cancel around that aggregated direction.
+    """
+    max_batches = max(1, int(getattr(args, "branch_shared_gradient_probe_batches", 1)))
+    ce_gradients, kd_gradients, used_weights = [], [], []
+    for idx, client_id in enumerate(nets_this_round.keys()):
+        dataloader = dataloaders_this_round.get(client_id)
+        if dataloader is None:
+            continue
+        model = nets_this_round[client_id]
+        was_training = model.training
+        model.eval()
+        ce_grad = _average_branch_shared_gradient(model, dataloader, device, args, "ce", max_batches)
+        kd_grad = _average_branch_shared_gradient(model, dataloader, device, args, "kd", max_batches)
+        if was_training:
+            model.train()
+        if ce_grad is None and kd_grad is None:
+            continue
+        if ce_grad is not None:
+            ce_gradients.append(ce_grad)
+        else:
+            ce_gradients.append(torch.zeros_like(kd_grad))
+        if kd_grad is not None:
+            kd_gradients.append(kd_grad)
+        else:
+            kd_gradients.append(torch.zeros_like(ce_grad))
+        used_weights.append(float(fed_avg_freqs[idx]))
+
+    ce_stats = _weighted_gradient_stats(ce_gradients, used_weights)
+    kd_stats = _weighted_gradient_stats(kd_gradients, used_weights)
+    if ce_stats is None or kd_stats is None:
+        return {}
+    metrics = {"branch_shared_gradient_probe_clients": len(used_weights)}
+    for name, stats in (("ce", ce_stats), ("kd", kd_stats)):
+        for key, value in stats.items():
+            metrics[f"branch_shared_gradient_{name}_{key}"] = value
+    return metrics
+
+
+def _collect_reference_representations(model, dataloader, device, max_batches):
+    """Collect fixed common-reference features without storing per-sample logits."""
+    features = {name: [] for name in ("b1", "b2", "b3", "teacher")}
+    targets = []
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, (x, target) in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+            x = x.to(device)
+            out = model(x)
+            if not (isinstance(out, tuple) and len(out) == 8):
+                continue
+            _, _, _, _, final_fea, f1, f2, f3 = out
+            for name, feature in zip(("b1", "b2", "b3", "teacher"), (f1, f2, f3, final_fea)):
+                features[name].append(feature.detach().flatten(1).cpu())
+            targets.append(target.detach().cpu().long())
+    if was_training:
+        model.train()
+    if not targets:
+        return None
+    return {
+        "targets": torch.cat(targets, dim=0),
+        "features": {name: torch.cat(values, dim=0) for name, values in features.items() if values},
+    }
+
+
+def _fisher_feature_ratio(features, targets, eps=1e-12):
+    """Trace(S_between)/Trace(S_within) on a common reference set."""
+    classes = torch.unique(targets)
+    if features.size(0) < 2 or classes.numel() < 2:
+        return None
+    overall_mean = features.mean(dim=0)
+    between = features.new_zeros(())
+    within = features.new_zeros(())
+    for class_id in classes:
+        selected = features[targets == class_id]
+        if selected.numel() == 0:
+            continue
+        class_mean = selected.mean(dim=0)
+        between += selected.size(0) * torch.sum((class_mean - overall_mean) ** 2)
+        within += torch.sum((selected - class_mean) ** 2)
+    return float((between / (within + eps)).item())
+
+
+def _linear_cka(left, right, eps=1e-12):
+    left = left - left.mean(dim=0, keepdim=True)
+    right = right - right.mean(dim=0, keepdim=True)
+    cross_sq = torch.sum((left.T @ right) ** 2)
+    left_sq = torch.sum((left.T @ left) ** 2)
+    right_sq = torch.sum((right.T @ right) ** 2)
+    return float((cross_sq / (torch.sqrt(left_sq * right_sq) + eps)).item())
+
+
+def compute_post_aggregation_representation_change(pre, post, eps=1e-12):
+    """Quantify how one FedAvg aggregation changes common-reference geometry."""
+    if pre is None or post is None:
+        return {}
+    metrics = {}
+    targets = pre["targets"]
+    if not torch.equal(targets, post["targets"]):
+        raise ValueError("Representation probe reference samples changed within a round.")
+    for name in ("b1", "b2", "b3", "teacher"):
+        before, after = pre["features"].get(name), post["features"].get(name)
+        if before is None or after is None or before.shape != after.shape:
+            continue
+        cosine = F.cosine_similarity(before, after, dim=1).mean()
+        relative_delta = torch.linalg.vector_norm(after - before) / (torch.linalg.vector_norm(before) + eps)
+        pre_fisher = _fisher_feature_ratio(before, targets, eps)
+        post_fisher = _fisher_feature_ratio(after, targets, eps)
+        metrics[f"representation_{name}_cosine_pre_post"] = float(cosine.item())
+        metrics[f"representation_{name}_relative_delta"] = float(relative_delta.item())
+        metrics[f"representation_{name}_linear_cka"] = _linear_cka(before, after, eps)
+        metrics[f"representation_{name}_pre_fisher"] = pre_fisher
+        metrics[f"representation_{name}_post_fisher"] = post_fisher
+        metrics[f"representation_{name}_fisher_delta"] = (
+            None if pre_fisher is None or post_fisher is None else post_fisher - pre_fisher
+        )
+    return metrics
+
 def norm_based_classwise_aggregation(global_model, nets_this_round, clients_this_round, client_data_sizes=None):
     """
     특징 추출기(Body)는 데이터 장수 비례 FedAvg로 합치고,
@@ -971,6 +1206,18 @@ def get_args():
                         help='Probe branch-to-teacher CE gradient alignment every N rounds when enabled.')
     parser.add_argument('--branch_gradient_probe_batches', type=int, default=1,
                         help='Number of local batches per client used for branch-to-teacher gradient probing.')
+    parser.add_argument('--log_branch_shared_gradient_dispersion', action='store_true',
+                        help='Log client dispersion of branch CE/KD gradients restricted to the shared trunk.')
+    parser.add_argument('--branch_shared_gradient_probe_interval', type=int, default=50,
+                        help='Round interval for --log_branch_shared_gradient_dispersion.')
+    parser.add_argument('--branch_shared_gradient_probe_batches', type=int, default=1,
+                        help='Local batches per selected client for shared-trunk branch-gradient dispersion.')
+    parser.add_argument('--log_post_aggregation_representation', action='store_true',
+                        help='Log common-reference representation change caused by each sampled FedAvg aggregation.')
+    parser.add_argument('--representation_probe_interval', type=int, default=50,
+                        help='Round interval for --log_post_aggregation_representation.')
+    parser.add_argument('--representation_probe_batches', type=int, default=8,
+                        help='Fixed test batches used before and after aggregation for representation geometry.')
     
     
     parser.add_argument('--min_threshold', type=float, default=0.8, help='시작 임계값 (Dynamic Threshold용)')
@@ -1190,6 +1437,16 @@ def main():
     for group in LAYERWISE_UPDATE_GROUPS:
         for stat_name in ("norm", "norm_sq", "mean_norm", "divergence", "relative_drift", "cosine"):
             pkl_dict[f"layer_update_{group}_{stat_name}"] = []
+    for loss_name in ("ce", "kd"):
+        for stat_name in ("divergence", "relative", "norm", "norm_sq", "mean_norm", "cosine"):
+            pkl_dict[f"branch_shared_gradient_{loss_name}_{stat_name}"] = []
+    pkl_dict["branch_shared_gradient_probe_clients"] = []
+    for feature_name in ("b1", "b2", "b3", "teacher"):
+        for stat_name in (
+            "cosine_pre_post", "relative_delta", "linear_cka",
+            "pre_fisher", "post_fisher", "fisher_delta",
+        ):
+            pkl_dict[f"representation_{feature_name}_{stat_name}"] = []
     last_10 = []
     lr = args.lr
 
@@ -1274,6 +1531,41 @@ def main():
                     f"{branch_gradient_alignment_metrics.get('branch_gradient_b3_teacher_kd_cosine', float('nan')):.4f}"
                 )
 
+        branch_shared_gradient_metrics = {}
+        should_probe_branch_shared_gradient = (
+            getattr(args, 'log_branch_shared_gradient_dispersion', False)
+            and getattr(args, 'branch_shared_gradient_probe_interval', 1) > 0
+            and round % getattr(args, 'branch_shared_gradient_probe_interval', 1) == 0
+        )
+        if should_probe_branch_shared_gradient:
+            branch_shared_gradient_metrics = compute_branch_shared_gradient_dispersion_probe(
+                nets_this_round, dataloaders_this_round, fed_avg_freqs, device, args
+            )
+            if branch_shared_gradient_metrics:
+                logger.info(
+                    "Branch shared-gradient dispersion: "
+                    f"CE(div/rel/cos)={branch_shared_gradient_metrics['branch_shared_gradient_ce_divergence']:.6f}/"
+                    f"{branch_shared_gradient_metrics['branch_shared_gradient_ce_relative']:.6f}/"
+                    f"{branch_shared_gradient_metrics['branch_shared_gradient_ce_cosine']:.4f}, "
+                    f"KD(div/rel/cos)={branch_shared_gradient_metrics['branch_shared_gradient_kd_divergence']:.6f}/"
+                    f"{branch_shared_gradient_metrics['branch_shared_gradient_kd_relative']:.6f}/"
+                    f"{branch_shared_gradient_metrics['branch_shared_gradient_kd_cosine']:.4f}"
+                )
+
+        representation_pre = None
+        should_probe_representation = (
+            getattr(args, 'log_post_aggregation_representation', False)
+            and getattr(args, 'representation_probe_interval', 1) > 0
+            and round % getattr(args, 'representation_probe_interval', 1) == 0
+        )
+        if should_probe_representation:
+            representation_pre = _collect_reference_representations(
+                global_model,
+                global_test_dataloader,
+                device,
+                max(1, int(getattr(args, 'representation_probe_batches', 8))),
+            )
+
         old_w = copy.deepcopy(global_model.state_dict())
         
         args.current_round = round + 1
@@ -1357,6 +1649,22 @@ def main():
             pkl_dict[gradient_key].append(
                 gradient_probe_metrics.get(gradient_key, branch_gradient_alignment_metrics.get(gradient_key))
             )
+        for gradient_key in [
+            'branch_shared_gradient_probe_clients',
+            'branch_shared_gradient_ce_divergence',
+            'branch_shared_gradient_ce_relative',
+            'branch_shared_gradient_ce_norm',
+            'branch_shared_gradient_ce_norm_sq',
+            'branch_shared_gradient_ce_mean_norm',
+            'branch_shared_gradient_ce_cosine',
+            'branch_shared_gradient_kd_divergence',
+            'branch_shared_gradient_kd_relative',
+            'branch_shared_gradient_kd_norm',
+            'branch_shared_gradient_kd_norm_sq',
+            'branch_shared_gradient_kd_mean_norm',
+            'branch_shared_gradient_kd_cosine',
+        ]:
+            pkl_dict[gradient_key].append(branch_shared_gradient_metrics.get(gradient_key))
 
         # 모델 집계 (Aggregation)
         drift_metrics = {}
@@ -1416,6 +1724,33 @@ def main():
 
         # 글로벌 모델 업데이트 및 평가
         global_model.load_state_dict(global_w)
+
+        representation_metrics = {}
+        if should_probe_representation:
+            representation_post = _collect_reference_representations(
+                global_model,
+                global_test_dataloader,
+                device,
+                max(1, int(getattr(args, 'representation_probe_batches', 8))),
+            )
+            representation_metrics = compute_post_aggregation_representation_change(
+                representation_pre, representation_post
+            )
+            if representation_metrics:
+                logger.info(
+                    "Post-aggregation representation: "
+                    f"teacher(cos/delta/fisher)="
+                    f"{representation_metrics.get('representation_teacher_cosine_pre_post', float('nan')):.6f}/"
+                    f"{representation_metrics.get('representation_teacher_relative_delta', float('nan')):.6f}/"
+                    f"{representation_metrics.get('representation_teacher_fisher_delta', float('nan')):.6f}"
+                )
+        for feature_name in ("b1", "b2", "b3", "teacher"):
+            for stat_name in (
+                "cosine_pre_post", "relative_delta", "linear_cka",
+                "pre_fisher", "post_fisher", "fisher_delta",
+            ):
+                key = f"representation_{feature_name}_{stat_name}"
+                pkl_dict[key].append(representation_metrics.get(key))
 
         if ema_model is not None:
             update_ema_model(ema_model, global_model, decay=float(args.ema_decay))
