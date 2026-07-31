@@ -505,12 +505,14 @@ def _branch_kd_probe_target(teacher_prob, target, args):
     mode = getattr(args, "byot_branch_kd_target_mode", "full_teacher")
     if mode == "full_teacher":
         return teacher_prob
-    if mode != "teacher_mass_uniform":
+    if mode not in ("teacher_mass_uniform", "teacher_mass_uniform_batchmean"):
         raise ValueError(f"Unknown --byot_branch_kd_target_mode: {mode}")
     num_classes = teacher_prob.size(1)
     if num_classes <= 1:
         return teacher_prob
     target_prob = teacher_prob.gather(1, target.unsqueeze(1))
+    if mode == "teacher_mass_uniform_batchmean":
+        target_prob = target_prob.mean(dim=0, keepdim=True).expand_as(target_prob)
     uniform_non_target = (1.0 - target_prob) / float(num_classes - 1)
     target_distribution = uniform_non_target.expand_as(teacher_prob).clone()
     target_distribution.scatter_(1, target.unsqueeze(1), target_prob)
@@ -522,7 +524,11 @@ def _branch_shared_probe_loss(output, branch_logits, target, args, loss_kind):
     active_indices = _active_branch_indices_for_probe(args)
     if not active_indices:
         return None
-    temperature = float(getattr(args, "temperature", 0.5))
+    default_temperature = float(getattr(args, "temperature", 0.5))
+    teacher_temperature = float(getattr(args, "byot_branch_kd_teacher_temperature", 0.0))
+    student_temperature = float(getattr(args, "byot_branch_kd_student_temperature", 0.0))
+    teacher_temperature = teacher_temperature if teacher_temperature > 0.0 else default_temperature
+    student_temperature = student_temperature if student_temperature > 0.0 else default_temperature
     if loss_kind == "ce":
         smoothing = float(getattr(args, "byot_branch_ce_label_smoothing", 0.0))
         weight = float(getattr(args, "byot_branch_ce_weight", 1.0))
@@ -532,14 +538,21 @@ def _branch_shared_probe_loss(output, branch_logits, target, args, loss_kind):
         ]
     elif loss_kind == "kd":
         with torch.no_grad():
-            teacher_prob = F.softmax(output / temperature, dim=1)
+            teacher_prob = F.softmax(output / teacher_temperature, dim=1)
             kd_target = _branch_kd_probe_target(teacher_prob, target, args)
+        scale_mode = getattr(args, "byot_branch_kd_loss_scale_mode", "native_t2")
+        if scale_mode == "native_t2":
+            loss_scale = student_temperature ** 2
+        elif scale_mode == "gradient_prefactor_one":
+            loss_scale = student_temperature
+        else:
+            raise ValueError(f"Unknown --byot_branch_kd_loss_scale_mode: {scale_mode}")
         losses = [
             F.kl_div(
-                F.log_softmax(branch_logits[idx] / temperature, dim=1),
+                F.log_softmax(branch_logits[idx] / student_temperature, dim=1),
                 kd_target,
                 reduction="batchmean",
-            ) * (temperature ** 2)
+            ) * loss_scale
             for idx in active_indices
         ]
     else:
@@ -1048,10 +1061,20 @@ def get_args():
                              'whose detached teacher prediction matches the label; teacher_correct_confident also '
                              'requires teacher confidence >= --byot_branch_kd_conf_threshold.')
     parser.add_argument('--byot_branch_kd_target_mode', default='full_teacher',
-                        choices=['full_teacher', 'teacher_mass_uniform'],
+                        choices=['full_teacher', 'teacher_mass_uniform', 'teacher_mass_uniform_batchmean'],
                         help='Branch-KD target construction. full_teacher uses the complete teacher distribution; '
                              'teacher_mass_uniform preserves the teacher probability of the true label but spreads '
-                             'all remaining probability uniformly over non-target classes.')
+                             'all remaining probability uniformly over non-target classes; '
+                             'teacher_mass_uniform_batchmean additionally replaces per-sample true-label mass '
+                             'with its batch mean.')
+    parser.add_argument('--byot_branch_kd_teacher_temperature', type=float, default=0.0,
+                        help='Optional teacher temperature for branch KD. A non-positive value uses --temperature.')
+    parser.add_argument('--byot_branch_kd_student_temperature', type=float, default=0.0,
+                        help='Optional student temperature for branch KD. A non-positive value uses --temperature.')
+    parser.add_argument('--byot_branch_kd_loss_scale_mode', default='native_t2',
+                        choices=['native_t2', 'gradient_prefactor_one'],
+                        help='Branch-KD KL multiplier: native_t2 uses T_student^2; '
+                             'gradient_prefactor_one uses T_student to normalize the leading logit-gradient factor.')
     parser.add_argument('--byot_branch_kd_conf_threshold', type=float, default=0.8,
                         help='Confidence threshold for --byot_branch_kd_filter teacher_correct_confident. '
                              'Confidence is computed from the same temperature-scaled teacher distribution used by KD.')
@@ -1102,10 +1125,16 @@ def get_args():
                         help='map: use the client alpha directly; multiply: scale the round-wise lambda by it.')
     parser.add_argument('--byot_client_reliability_power', type=float, default=1.0,
                         help='Power applied to the client reliability proxy before mapping it to lambda.')
+    parser.add_argument('--byot_proxy_temperature', type=float, default=1.0,
+                        help='Temperature used only to measure BYOT reliability/skew proxies. '
+                             'It is independent of branch-KD and MOON temperatures; 1.0 uses native logits.')
     parser.add_argument('--byot_client_skew_proxy', default='none',
-                        choices=['none', 'prediction_entropy', 'prediction_js_global',
+                        choices=['none', 'prediction_entropy', 'prediction_mutual_info', 'prediction_js_global',
                                  'label_entropy', 'label_js_global', 'max_concentration'],
                         help='Client-distribution signal used to scale BYOT lambda.')
+    parser.add_argument('--byot_log_prediction_entropy_components', action='store_true',
+                        help='For prediction-entropy skew proxies, log marginal entropy b, mean sample entropy u, '
+                             'and their difference d=b-u for every selected client.')
     parser.add_argument('--byot_client_skew_power', type=float, default=1.0,
                         help='Power p applied to the client skew reliability b before lambda scaling.')
     parser.add_argument('--byot_client_skew_min_scale', type=float, default=0.0,
@@ -1432,6 +1461,13 @@ def main():
         'byot_effective_alpha_mean': [],
         'byot_effective_alpha_min': [],
         'byot_effective_alpha_max': [],
+        # Optional prediction-entropy decomposition diagnostics.  Each item
+        # stores the selected clients' raw b/u/d values for one round.
+        'byot_prediction_entropy_client_stats': [],
+        'byot_prediction_entropy_mean': [],
+        'byot_sample_entropy_mean': [],
+        'byot_prediction_mutual_info_mean': [],
+        'byot_prediction_entropy_mutual_info_corr': [],
         'max': 0, 'avg_10': 0, 'avg_30': 0, 'avg_50': 0
     }
     for group in LAYERWISE_UPDATE_GROUPS:
@@ -1610,6 +1646,41 @@ def main():
         pkl_dict['byot_effective_alpha_mean'].append(avg_byot_alpha_mean)
         pkl_dict['byot_effective_alpha_min'].append(avg_byot_alpha_min)
         pkl_dict['byot_effective_alpha_max'].append(avg_byot_alpha_max)
+        client_proxy_stats = getattr(args, "_last_client_skew_proxy_stats", {})
+        pkl_dict['byot_prediction_entropy_client_stats'].append(client_proxy_stats)
+        if client_proxy_stats:
+            b_values = np.asarray([
+                stats['prediction_entropy'] for stats in client_proxy_stats.values()
+                if 'prediction_entropy' in stats
+            ], dtype=np.float64)
+            u_values = np.asarray([
+                stats['sample_entropy'] for stats in client_proxy_stats.values()
+                if 'sample_entropy' in stats
+            ], dtype=np.float64)
+            d_values = np.asarray([
+                stats['prediction_mutual_info'] for stats in client_proxy_stats.values()
+                if 'prediction_mutual_info' in stats
+            ], dtype=np.float64)
+            pkl_dict['byot_prediction_entropy_mean'].append(
+                float(b_values.mean()) if b_values.size else None
+            )
+            pkl_dict['byot_sample_entropy_mean'].append(
+                float(u_values.mean()) if u_values.size else None
+            )
+            pkl_dict['byot_prediction_mutual_info_mean'].append(
+                float(d_values.mean()) if d_values.size else None
+            )
+            if b_values.size >= 2 and b_values.size == d_values.size:
+                pkl_dict['byot_prediction_entropy_mutual_info_corr'].append(
+                    float(np.corrcoef(b_values, d_values)[0, 1])
+                )
+            else:
+                pkl_dict['byot_prediction_entropy_mutual_info_corr'].append(None)
+        else:
+            pkl_dict['byot_prediction_entropy_mean'].append(None)
+            pkl_dict['byot_sample_entropy_mean'].append(None)
+            pkl_dict['byot_prediction_mutual_info_mean'].append(None)
+            pkl_dict['byot_prediction_entropy_mutual_info_corr'].append(None)
         for gradient_key in [
             'gradient_probe_clients',
             'gradient_ce_divergence',
