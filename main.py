@@ -39,6 +39,22 @@ LAYERWISE_UPDATE_GROUPS = (
 )
 
 
+def _args_snapshot(args):
+    """Return a stable, serialization-safe snapshot of CLI arguments.
+
+    Training attaches private runtime diagnostics to ``args``.  Keeping a
+    live ``vars(args)`` reference in result dictionaries lets those mutable
+    diagnostics leak into the final pickle and can create arbitrarily deep
+    structures across rounds.  Private runtime fields are not experiment
+    configuration, so exclude them from checkpoints and result metadata.
+    """
+    return {
+        key: value
+        for key, value in vars(args).items()
+        if not key.startswith("_")
+    }
+
+
 def _extract_dataset_targets(dataset):
     """Return labels for a dataset or a torch Subset-style wrapper."""
     if hasattr(dataset, 'indices') and hasattr(dataset, 'dataset'):
@@ -1408,7 +1424,7 @@ def main():
 
     # [수정] 효율성(efficiency) 저장을 위한 리스트 추가
     pkl_dict = {
-        'args': vars(args),
+        'args': _args_snapshot(args),
         'avg_train_loss': [],
         'test_loss': [],
         'efficiency': [],
@@ -1646,7 +1662,7 @@ def main():
         pkl_dict['byot_effective_alpha_mean'].append(avg_byot_alpha_mean)
         pkl_dict['byot_effective_alpha_min'].append(avg_byot_alpha_min)
         pkl_dict['byot_effective_alpha_max'].append(avg_byot_alpha_max)
-        client_proxy_stats = getattr(args, "_last_client_skew_proxy_stats", {})
+        client_proxy_stats = getattr(args, "_last_round_client_skew_proxy_stats", {})
         pkl_dict['byot_prediction_entropy_client_stats'].append(client_proxy_stats)
         if client_proxy_stats:
             b_values = np.asarray([
@@ -1843,7 +1859,7 @@ def main():
                 ckpt = {
                     "round": round,
                     "best_accuracy": best_accuracy,
-                    "args": vars(args),
+                    "args": _args_snapshot(args),
                     "global_model": global_model.state_dict(),
                 }
                 torch.save(ckpt, os.path.join(ckpt_dir, f"{log_file_name}_best.pt"))
@@ -1897,15 +1913,23 @@ def main():
         final_ckpt = {
             "round": max(int(args.round) - 1, 0),
             "final_accuracy": float(test_acc_global) if args.round > 0 else None,
-            "args": vars(args),
+            "args": _args_snapshot(args),
             "global_model": global_model.state_dict(),
         }
         torch.save(final_ckpt, final_ckpt_path)
         logger.info(f"Saved final checkpoint: {final_ckpt_path}")
 
-    # (기존 코드 유지)
-    with open(os.path.join(args.logdir, log_file_name + '.pkl'), 'wb') as f:
-        pickle.dump(pkl_dict, f)
+    # Serialize to a temporary file first.  A failed pickle must not leave a
+    # zero-byte file that a resumable launcher mistakes for a completed run.
+    result_path = os.path.join(args.logdir, log_file_name + '.pkl')
+    temp_result_path = f"{result_path}.tmp.{os.getpid()}"
+    try:
+        with open(temp_result_path, 'wb') as f:
+            pickle.dump(pkl_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temp_result_path, result_path)
+    finally:
+        if os.path.exists(temp_result_path):
+            os.remove(temp_result_path)
         
     if wandb_run is not None:
         wandb_run.finish()

@@ -43,16 +43,53 @@ TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-0.5}"
 LOG_ROOT="${LOG_ROOT:-logs/analysis/logs_cifar100_kd_factorial_r500}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
+# Refuse to mix Python source versions in one factorial comparison.  Running
+# Python processes keep the source loaded at launch, so editing either file
+# mid-run would otherwise reproduce an old-code/new-code mixture.
+CODE_FILES=(main.py train.py data_utils.py fl_utils.py utils.py models/resnet_byot.py)
+INITIAL_CODE_FINGERPRINT="$(sha256sum "${CODE_FILES[@]}" | sha256sum | awk '{print $1}')"
+
+assert_code_unchanged() {
+    local current_fingerprint
+    current_fingerprint="$(sha256sum "${CODE_FILES[@]}" | sha256sum | awk '{print $1}')"
+    if [ "$current_fingerprint" != "$INITIAL_CODE_FINGERPRINT" ]; then
+        echo "Source changed during the factorial run; refusing to mix code versions." >&2
+        echo "initial=${INITIAL_CODE_FINGERPRINT}, current=${current_fingerprint}" >&2
+        return 1
+    fi
+}
+
+has_completed_result() {
+    local result=$1
+    [ -s "$result" ] || return 1
+    "$PYTHON_BIN" -c '
+import pickle
+import sys
+
+path, expected_rounds = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path, "rb") as handle:
+        payload = pickle.load(handle)
+    accuracies = payload.get("acc_global", [])
+    ok = isinstance(accuracies, (list, tuple)) and len(accuracies) >= expected_rounds
+except Exception:
+    ok = False
+raise SystemExit(0 if ok else 1)
+' "$result" "$ROUNDS"
+}
+
 run_job() {
     local gpu_id=$1 variant=$2 target_mode=$3 student_temperature=$4 scale_mode=$5 seed=$6
     local setting="cifar100_resnet18/beta_0.5/fedavg/seed${seed}"
     local log_dir="${LOG_ROOT}/${setting}"
     local result="${log_dir}/${variant}.pkl"
     mkdir -p "$log_dir"
-    if [ "$SKIP_EXISTING" = "1" ] && [ -f "$result" ]; then
+    if [ "$SKIP_EXISTING" = "1" ] && has_completed_result "$result"; then
         echo "[GPU ${gpu_id}] skip: ${setting} | ${variant}"
         return
     fi
+
+    assert_code_unchanged
 
     echo "[GPU ${gpu_id}] start: ${setting} | ${variant}"
     "$PYTHON_BIN" main.py \
@@ -74,6 +111,11 @@ run_job() {
         --byot_branch_kd_loss_scale_mode "$scale_mode" \
         --byot_branch_kd_target_mode "$target_mode" \
         > "${log_dir}/${variant}_terminal.log" 2>&1
+
+    if ! has_completed_result "$result"; then
+        echo "[GPU ${gpu_id}] invalid or incomplete result: ${result}" >&2
+        return 1
+    fi
     echo "[GPU ${gpu_id}] complete: ${setting} | ${variant}"
 }
 
@@ -110,16 +152,41 @@ echo "gpus=${GPUS[*]}, rounds=${ROUNDS}, local_epochs=${LOCAL_EPOCHS}, seeds=${S
 echo "partition=beta_0.5, feature_beta=${FEATURE_BETA}, teacher_temperature=${TEACHER_TEMPERATURE}"
 echo "factors=target(adaptive,batchmean) x student_temperature(0.5,1.0) x scale(native,gradnorm)"
 echo "log_root=${LOG_ROOT}, jobs=${#JOBS[@]}, skip_existing=${SKIP_EXISTING}"
+echo "code_fingerprint=${INITIAL_CODE_FINGERPRINT}"
+
+mkdir -p "$LOG_ROOT"
+MANIFEST_PATH="${LOG_ROOT}/run_manifest.txt"
+if [ -f "$MANIFEST_PATH" ]; then
+    recorded_fingerprint="$(awk -F= '$1 == "code_fingerprint" {print $2}' "$MANIFEST_PATH")"
+    if [ -z "$recorded_fingerprint" ] || [ "$recorded_fingerprint" != "$INITIAL_CODE_FINGERPRINT" ]; then
+        echo "Existing log root was created by a different source version: ${LOG_ROOT}" >&2
+        echo "Use a new LOG_ROOT instead of mixing results." >&2
+        exit 1
+    fi
+else
+    {
+        echo "code_fingerprint=${INITIAL_CODE_FINGERPRINT}"
+        echo "git_revision=$(git rev-parse HEAD 2>/dev/null || echo unavailable)"
+        echo "rounds=${ROUNDS}"
+        echo "local_epochs=${LOCAL_EPOCHS}"
+        echo "seeds=${SEEDS[*]}"
+    } > "$MANIFEST_PATH"
+fi
 
 run_queue() {
     local gpu_id=$1
     shift
     local job variant target_mode student_temperature scale_mode seed
+    local queue_failed=0
     for job in "$@"; do
         [ -z "$job" ] && continue
         IFS='|' read -r variant target_mode student_temperature scale_mode seed <<< "$job"
-        run_job "$gpu_id" "$variant" "$target_mode" "$student_temperature" "$scale_mode" "$seed"
+        if ! run_job "$gpu_id" "$variant" "$target_mode" "$student_temperature" "$scale_mode" "$seed"; then
+            echo "[GPU ${gpu_id}] failed: ${variant} | seed=${seed}" >&2
+            queue_failed=1
+        fi
     done
+    return "$queue_failed"
 }
 
 declare -a QUEUES
@@ -136,5 +203,14 @@ for ((i = 0; i < NUM_GPUS; i++)); do
         pids+=("$!")
     fi
 done
-wait "${pids[@]}"
+queue_failed=0
+for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+        queue_failed=1
+    fi
+done
+if [ "$queue_failed" -ne 0 ]; then
+    echo "One or more factorial jobs failed; inspect *_terminal.log files." >&2
+    exit 1
+fi
 echo "C100 branch-KD factorial ablation complete (${#JOBS[@]} jobs)"

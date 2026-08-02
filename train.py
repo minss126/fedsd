@@ -4323,11 +4323,15 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     total_time = 0.0
     total_efficiency = 0.0
 
+    # Keep the per-client scratch record separate from the completed round
+    # aggregate.  Reusing one attribute for both made the previous round's
+    # dictionary get copied into every client in the next round.
+    args._last_round_client_skew_proxy_stats = {}
     for net_id, net in nets.items():
-        # `args` is shared while clients train sequentially. Clear the
-        # previous client's diagnostic record before this local update.
-        if getattr(args, "byot_log_prediction_entropy_components", False):
-            args._last_client_skew_proxy_stats = None
+        # `args` is shared while clients train sequentially.  Always clear the
+        # scratch value, even when diagnostics are disabled, so stale runtime
+        # state can never become a recursively nested round statistic.
+        args._last_client_skew_proxy_stats = None
         start_time = time.time() # [NEW] 로컬 클라이언트 학습 시작 시간 기록
         net.train()
         
@@ -4531,7 +4535,8 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     avg_byot_alpha_max = total_byot_alpha_max / num_clients
     avg_entropy = total_entropy / num_clients
     args._last_client_byot_alpha_stats = client_byot_alpha_stats
-    args._last_client_skew_proxy_stats = client_skew_proxy_stats
+    args._last_round_client_skew_proxy_stats = client_skew_proxy_stats
+    args._last_client_skew_proxy_stats = None
     args._last_train_branch_frequency_stats = finalize_train_branch_freq_stats(total_branch_freq_stats)
     
     # [NEW] 시간 및 연산 효율 평균
