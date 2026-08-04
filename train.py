@@ -985,9 +985,15 @@ def fedavg(net, train_dataloader, optimizer, device, args):
             optimizer.zero_grad()
             target = target.long()
             
-            # [수정] 모델 출력 언패킹 (기존: features, out = net(x))
-            raw_out = net(x)
-            features, out = unpack_model_output(raw_out)
+            # A BYOT-shaped model with SD disabled is a teacher-only control.
+            # Skip private branch paths entirely so their BatchNorm buffers do
+            # not change and cannot contaminate client-update diagnostics.
+            if hasattr(net, "forward_teacher") and not getattr(args, 'use_sd', False):
+                features, out = net.forward_teacher(x)
+                raw_out = (features, out)
+            else:
+                raw_out = net(x)
+                features, out = unpack_model_output(raw_out)
 
             loss = criterion(out, target)
             
@@ -4328,6 +4334,11 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     # dictionary get copied into every client in the next round.
     args._last_round_client_skew_proxy_stats = {}
     for net_id, net in nets.items():
+        sequential_client_execution = bool(
+            getattr(args, "sequential_client_execution", False)
+        )
+        if sequential_client_execution:
+            net.to(device)
         # `args` is shared while clients train sequentially.  Always clear the
         # scratch value, even when diagnostics are disabled, so stale runtime
         # state can never become a recursively nested round statistic.
@@ -4521,6 +4532,12 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
         # [NEW] 시간 및 연산 효율 누적
         total_time += wall_clock_time
         total_efficiency += compute_efficiency
+
+        if sequential_client_execution:
+            # The optimizer is local to this loop iteration, so moving the
+            # completed model back to CPU is safe and bounds GPU memory by one
+            # client model even under 100-client full participation.
+            net.to('cpu')
 
     num_clients = len(nets)
     avg_loss = total_loss / num_clients

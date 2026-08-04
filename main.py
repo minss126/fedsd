@@ -4,8 +4,9 @@ import copy
 import time
 import pickle
 import random
-import os 
-import numpy as np 
+import os
+import json
+import numpy as np
 
 import sys
 sys.path.append('./models')
@@ -999,6 +1000,16 @@ def get_args():
     # 클라이언트의 FL참여를 조절. stationary가 일반적, non-stationary는 클라이언트들이 라운드마다 불규칙하게 참여
     parser.add_argument('--sample_fraction', type=float, default=0.1, help='how many clients are sampled in each round')
     # round 당 클라이언트 참여비율
+    parser.add_argument(
+        '--sequential_client_execution', action='store_true',
+        help='Keep selected client models on CPU and move them to the training device one at a time. '
+             'This is required for memory-safe full participation with many clients.',
+    )
+    parser.add_argument(
+        '--client_keep_last_batch', action='store_true',
+        help='Use incomplete final client batches instead of dropping them. '
+             'Useful for exact full-data client-count controls.',
+    )
     parser.add_argument('--time', type=int, default=0)
     parser.add_argument('--no_init', action='store_true', help='Kaiming init is not performed')
     # 기본은 kaiming init. no_init은 별도의 initialization 없이 torch 기본 설정으로 초기화가 이루어집니다. 써도되고 안써도되요
@@ -1205,6 +1216,14 @@ def get_args():
     parser.add_argument('--save_best_ckpt', action='store_true', help='Save best checkpoint (global + ema if enabled)')
     parser.add_argument('--save_final_ckpt', action='store_true',
                         help='Save the final global-model checkpoint after the last communication round.')
+    parser.add_argument(
+        '--save_final_client_ckpts', action='store_true',
+        help='Save a deterministic subset of post-local client models from the final round for offline probes.',
+    )
+    parser.add_argument(
+        '--final_client_ckpt_count', type=int, default=10,
+        help='Maximum number of final post-local client checkpoints to save.',
+    )
     parser.add_argument('--ckpt_dir', default=None, help='Checkpoint directory (default: logdir)')
     parser.add_argument(
         '--best_by_ema',
@@ -1514,7 +1533,13 @@ def main():
         clients_this_round = np.random.choice(range(args.n_clients), m, replace=False)
         
         # 2. 선택된 클라이언트의 모델과 데이터로더 가져오기
-        nets_this_round = {i: client_nets[i].to(device) for i in clients_this_round}
+        if getattr(args, 'sequential_client_execution', False):
+            # Full participation with 100 ResNet clients cannot safely place
+            # every local model on one GPU at once.  train_local_net moves one
+            # model at a time and returns it to CPU after its local update.
+            nets_this_round = {i: client_nets[i] for i in clients_this_round}
+        else:
+            nets_this_round = {i: client_nets[i].to(device) for i in clients_this_round}
         # [수정] get_client_dataloaders 함수가 아니라, 위에서 만든 변수(client_dataloaders)를 써야 함
         dataloaders_this_round = {i: client_dataloaders[i] for i in clients_this_round}
 
@@ -1761,7 +1786,10 @@ def main():
                 or getattr(args, 'log_layerwise_client_update_drift', False)
             )
             and getattr(args, 'drift_log_interval', 1) > 0
-            and round % getattr(args, 'drift_log_interval', 1) == 0
+            and (
+                round % getattr(args, 'drift_log_interval', 1) == 0
+                or round == int(args.round) - 1
+            )
         )
         if should_log_drift:
             drift_metrics = compute_client_update_drift(
@@ -1918,6 +1946,42 @@ def main():
         }
         torch.save(final_ckpt, final_ckpt_path)
         logger.info(f"Saved final checkpoint: {final_ckpt_path}")
+
+    if getattr(args, "save_final_client_ckpts", False):
+        ckpt_dir = args.ckpt_dir if args.ckpt_dir is not None else args.logdir
+        client_ckpt_dir = os.path.join(ckpt_dir, f"{log_file_name}_final_clients")
+        os.makedirs(client_ckpt_dir, exist_ok=True)
+        requested_count = max(1, int(getattr(args, "final_client_ckpt_count", 10)))
+        saved_count = min(requested_count, int(args.n_clients))
+        # Evenly spaced deterministic ids make runs reproducible and avoid
+        # selecting a special contiguous block when client ids have structure.
+        selected_ids = np.linspace(
+            0, max(int(args.n_clients) - 1, 0), num=saved_count, dtype=np.int64
+        ).tolist()
+        selected_ids = list(dict.fromkeys(int(client_id) for client_id in selected_ids))
+        saved_files = []
+        for client_id in selected_ids:
+            client_path = os.path.join(client_ckpt_dir, f"client_{client_id:05d}.pt")
+            client_ckpt = {
+                "round": max(int(args.round) - 1, 0),
+                "client_id": client_id,
+                "args": _args_snapshot(args),
+                "client_model": client_nets[client_id].state_dict(),
+            }
+            torch.save(client_ckpt, client_path)
+            saved_files.append(os.path.basename(client_path))
+        manifest = {
+            "round": max(int(args.round) - 1, 0),
+            "n_clients": int(args.n_clients),
+            "saved_client_ids": selected_ids,
+            "files": saved_files,
+            "checkpoint_role": "post_local_pre_aggregation_final_round",
+        }
+        with open(os.path.join(client_ckpt_dir, "manifest.json"), "w", encoding="utf-8") as file:
+            json.dump(manifest, file, indent=2)
+        logger.info(
+            f"Saved {len(selected_ids)} final post-local client checkpoints: {client_ckpt_dir}"
+        )
 
     # Serialize to a temporary file first.  A failed pickle must not leave a
     # zero-byte file that a resumable launcher mistakes for a completed run.

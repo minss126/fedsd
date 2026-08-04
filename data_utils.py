@@ -770,7 +770,14 @@ def get_client_dataloaders(client_datasets, args):
     for i in range(args.n_clients):
         # 클라이언트의 데이터셋이 비어있지 않은 경우에만 DataLoader 생성
         if len(client_datasets[i]) > 0:
-            client_train_dataloader = data.DataLoader(dataset=client_datasets[i], batch_size=args.batch_size, drop_last=True, shuffle=True, pin_memory=True,num_workers=args.num_workers)
+            client_train_dataloader = data.DataLoader(
+                dataset=client_datasets[i],
+                batch_size=args.batch_size,
+                drop_last=not getattr(args, 'client_keep_last_batch', False),
+                shuffle=True,
+                pin_memory=True,
+                num_workers=args.num_workers,
+            )
             dataloaders[i] = client_train_dataloader
         else:
             # 데이터가 없는 클라이언트 (파티셔닝 실패 시)

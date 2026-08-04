@@ -164,6 +164,25 @@ class Multi_ResNet(nn.Module):
             layer.append(block(self.inplanes, planes))
         
         return nn.Sequential(*layer)
+
+    def forward_teacher(self, x):
+        """Run only the final ResNet path, bypassing every private branch.
+
+        This is used by branch-off diagnostics so inactive branch bottlenecks
+        neither add compute nor update BatchNorm buffers during local training.
+        The returned feature/logit pair follows the plain-model training
+        contract used by FedAvg.
+        """
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        final_fea = self.avgpool(x)
+        output = self.fc(torch.flatten(final_fea, 1))
+        return final_fea, output
     
     def forward(self, x, detach_branch_inputs=False):
         """Return teacher and branch outputs.
