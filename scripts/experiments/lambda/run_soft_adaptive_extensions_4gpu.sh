@@ -13,6 +13,8 @@ cd "$REPO_ROOT"
 # Every extension compares fixed lambda=1 and adaptive lambda under the same
 # selected configuration on beta={0.5,0.1}.  Fixed lambda=1 is constant from
 # round 0; only the adaptive method receives the selected lambda warm-up.
+# The optional `plain` method is the matching non-BYOT baseline: no branches,
+# no KD, and the underlying FL algorithm (FedAvg/FedProx/MOON) is used directly.
 # This is a single-seed screening matrix; do not retune adaptive parameters
 # per extension.
 #
@@ -27,13 +29,14 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     echo "Default extensions: tinyimagenet imagenet100_64 mobilenet fedprox moon"
     echo "Exclude ImageNet100-64: EXTENSIONS_OVERRIDE=\"tinyimagenet mobilenet fedprox moon\" bash $0"
     echo "Default matrix: fixed lambda=1 vs. selected adaptive, beta={0.5,0.1}, seed=0."
+    echo "Optional methods: METHODS_OVERRIDE=\"plain fixed_lambda1 soft_b_adaptive\""
     exit 0
 fi
 
 GPUS=(${GPUS_OVERRIDE:-0 1 2 3})
 NUM_GPUS=${#GPUS[@]}
-if [ "$NUM_GPUS" -ne 4 ]; then
-    echo "This launcher requires exactly four GPU ids; received: ${GPUS[*]}" >&2
+if [ "$NUM_GPUS" -eq 0 ]; then
+    echo "Set GPUS_OVERRIDE to one or more GPU ids." >&2
     exit 1
 fi
 
@@ -48,6 +51,7 @@ fi
 SEED="${SEED:-0}"
 ROUNDS="${ROUNDS:-500}"
 TINYIMAGENET_ROUNDS="${TINYIMAGENET_ROUNDS:-100}"
+IMAGENET100_ROUNDS="${IMAGENET100_ROUNDS:-$ROUNDS}"
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-5}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
@@ -85,7 +89,9 @@ value_tag() {
 
 env_args() {
     case "$1" in
+        iid) printf '%s\n' --partition iid ;;
         beta_0.5) printf '%s\n' --partition noniid --beta 0.5 ;;
+        beta_0.3) printf '%s\n' --partition noniid --beta 0.3 ;;
         beta_0.1) printf '%s\n' --partition noniid --beta 0.1 ;;
         *) echo "Unknown environment: $1" >&2; exit 1 ;;
     esac
@@ -116,6 +122,7 @@ configure_extension() {
             DATA_DIR="$IMAGENET100_DATADIR"
             LR="0.01"
             NUM_WORKERS="2"
+            EXT_ROUNDS="$IMAGENET100_ROUNDS"
             ;;
         mobilenet)
             MODEL="mobilenet_byot"
@@ -138,6 +145,9 @@ configure_extension() {
 
 method_name() {
     case "$1" in
+        plain)
+            echo "plain"
+            ;;
         fixed_lambda1)
             echo "fixed_lambda1_tkd$(value_tag "$KD_TEMPERATURE")"
             ;;
@@ -160,6 +170,8 @@ has_completed_log() {
 append_method_args() {
     local method=$1
     case "$method" in
+        plain)
+            ;;
         fixed_lambda1)
             CMD+=(--byot_alpha 1.00)
             ;;
@@ -182,6 +194,31 @@ append_method_args() {
         *)
             echo "Unknown method: $method" >&2
             exit 1
+            ;;
+    esac
+}
+
+plain_model() {
+    case "$MODEL" in
+        resnet18_byot) echo "resnet18" ;;
+        mobilenet_byot) echo "mobilenet" ;;
+        *)
+            echo "No plain-model mapping for ${MODEL}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+append_plain_algorithm_args() {
+    case "$EXT_LABEL" in
+        fedprox)
+            CMD+=(--alg fedprox --mu "$FEDPROX_MU")
+            ;;
+        moon)
+            CMD+=(--alg moon --mu "$MOON_MU" --temperature "$MOON_TEMPERATURE")
+            ;;
+        *)
+            CMD+=(--alg fedavg)
             ;;
     esac
 }
@@ -212,17 +249,25 @@ run_job() {
         --num_workers "$NUM_WORKERS" --round "$EXT_ROUNDS" --seed "$SEED"
         --device "cuda:${gpu_id}" --logdir "$LOG_ROOT"
         --log_file_name "${EXT_LABEL}/${env_name}/fedavg/${name}"
-        --model "$MODEL" --alg fedbyot
-        --byot_active_branches "1,2,3" --byot_branch_loss_reduction sum
-        --byot_branch_objective kd_only --byot_beta "$FEATURE_BETA"
-        --temperature "$LOSS_TEMPERATURE"
-        --byot_branch_kd_teacher_temperature "$KD_TEMPERATURE"
-        --byot_branch_kd_student_temperature "$KD_TEMPERATURE"
-        --byot_proxy_temperature "$PROXY_TEMPERATURE"
     )
     CMD+=("${PARTITION_ARGS[@]}")
-    CMD+=("${FL_ARGS[@]}")
-    append_method_args "$method"
+
+    if [ "$method" = "plain" ]; then
+        CMD+=(--model "$(plain_model)")
+        append_plain_algorithm_args
+    else
+        CMD+=(
+            --model "$MODEL" --alg fedbyot
+            --byot_active_branches "1,2,3" --byot_branch_loss_reduction sum
+            --byot_branch_objective kd_only --byot_beta "$FEATURE_BETA"
+            --temperature "$LOSS_TEMPERATURE"
+            --byot_branch_kd_teacher_temperature "$KD_TEMPERATURE"
+            --byot_branch_kd_student_temperature "$KD_TEMPERATURE"
+            --byot_proxy_temperature "$PROXY_TEMPERATURE"
+        )
+        CMD+=("${FL_ARGS[@]}")
+        append_method_args "$method"
+    fi
     CMD+=("${WANDB_FLAGS[@]}")
 
     echo "[GPU ${gpu_id}] start: ${extension} | ${env_name} | ${method} | rounds=${EXT_ROUNDS}"
@@ -268,7 +313,7 @@ for extension in "${EXTENSIONS[@]}"; do
 done
 
 echo "========== Soft-b Extension Screen =========="
-echo "gpus=${GPUS[*]}, jobs=${job_count}, default_rounds=${ROUNDS}, tinyimagenet_rounds=${TINYIMAGENET_ROUNDS}, local_epochs=${LOCAL_EPOCHS}, seed=${SEED}"
+echo "gpus=${GPUS[*]}, jobs=${job_count}, default_rounds=${ROUNDS}, tinyimagenet_rounds=${TINYIMAGENET_ROUNDS}, imagenet100_rounds=${IMAGENET100_ROUNDS}, local_epochs=${LOCAL_EPOCHS}, seed=${SEED}"
 echo "extensions=${EXTENSIONS[*]}"
 echo "envs=${ENVS[*]}, methods=${METHODS[*]}"
 echo "selected adaptive: T_KD=${KD_TEMPERATURE}, T_proxy=${PROXY_TEMPERATURE}, lambda_max=${LAMBDA_MAX}, tau=${SOFT_TAU}, warmup=${LAMBDA_WARMUP}"
