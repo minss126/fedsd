@@ -148,6 +148,12 @@ method_name() {
         plain)
             echo "plain"
             ;;
+        fixed_lambda0p10)
+            echo "fixed_lambda0p10_tkd$(value_tag "$KD_TEMPERATURE")"
+            ;;
+        fixed_lambda0p30)
+            echo "fixed_lambda0p30_tkd$(value_tag "$KD_TEMPERATURE")"
+            ;;
         fixed_lambda1)
             echo "fixed_lambda1_tkd$(value_tag "$KD_TEMPERATURE")"
             ;;
@@ -171,6 +177,12 @@ append_method_args() {
     local method=$1
     case "$method" in
         plain)
+            ;;
+        fixed_lambda0p10)
+            CMD+=(--byot_alpha 0.10)
+            ;;
+        fixed_lambda0p30)
+            CMD+=(--byot_alpha 0.30)
             ;;
         fixed_lambda1)
             CMD+=(--byot_alpha 1.00)
