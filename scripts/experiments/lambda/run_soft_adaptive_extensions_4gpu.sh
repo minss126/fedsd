@@ -58,7 +58,11 @@ FEATURE_BETA="${FEATURE_BETA:-0.01}"
 KD_TEMPERATURE="${KD_TEMPERATURE:-1.00}"
 PROXY_TEMPERATURE="${PROXY_TEMPERATURE:-1.0}"
 LAMBDA_MAX="${LAMBDA_MAX:-1.00}"
-LAMBDA_WARMUP="${LAMBDA_WARMUP:-250}"
+# Adaptive warm-up is expressed as a fraction of each setting's communication
+# horizon.  An explicit LAMBDA_WARMUP remains available only as a legacy
+# override for reproducing earlier runs.
+LAMBDA_WARMUP_RATIO="${LAMBDA_WARMUP_RATIO:-0.5}"
+LAMBDA_WARMUP_OVERRIDE="${LAMBDA_WARMUP:-}"
 SKEW_POWER="${SKEW_POWER:-2.0}"
 SOFT_TAU="${SOFT_TAU:-0.85}"
 SOFT_TEMPERATURE="${SOFT_TEMPERATURE:-0.05}"
@@ -141,6 +145,12 @@ configure_extension() {
             exit 1
             ;;
     esac
+
+    if [ -n "$LAMBDA_WARMUP_OVERRIDE" ]; then
+        EXT_LAMBDA_WARMUP="$LAMBDA_WARMUP_OVERRIDE"
+    else
+        EXT_LAMBDA_WARMUP=$(awk -v rounds="$EXT_ROUNDS" -v ratio="$LAMBDA_WARMUP_RATIO" 'BEGIN { printf "%d", int(rounds * ratio + 0.5) }')
+    fi
 }
 
 method_name() {
@@ -158,7 +168,7 @@ method_name() {
             echo "fixed_lambda1_tkd$(value_tag "$KD_TEMPERATURE")"
             ;;
         soft_b_adaptive)
-            echo "soft_b_tkd$(value_tag "$KD_TEMPERATURE")_lmax$(value_tag "$LAMBDA_MAX")_warm${LAMBDA_WARMUP}_tau$(value_tag "$SOFT_TAU")"
+            echo "soft_b_tkd$(value_tag "$KD_TEMPERATURE")_lmax$(value_tag "$LAMBDA_MAX")_warm${EXT_LAMBDA_WARMUP}_tau$(value_tag "$SOFT_TAU")"
             ;;
         *)
             echo "Unknown method: $1" >&2
@@ -191,7 +201,7 @@ append_method_args() {
             CMD+=(
                 --byot_alpha "$LAMBDA_MAX"
                 --byot_round_lambda_schedule linear --byot_round_lambda_min 0.00
-                --byot_round_lambda_warmup "$LAMBDA_WARMUP"
+                --byot_round_lambda_warmup "$EXT_LAMBDA_WARMUP"
                 --alpha_min_scale 0.0
                 --byot_client_proxy teacher_label_prob
                 --byot_client_alpha_min 0.00 --byot_client_alpha_max 1.00
@@ -328,7 +338,7 @@ echo "========== Soft-b Extension Screen =========="
 echo "gpus=${GPUS[*]}, jobs=${job_count}, default_rounds=${ROUNDS}, tinyimagenet_rounds=${TINYIMAGENET_ROUNDS}, imagenet100_rounds=${IMAGENET100_ROUNDS}, local_epochs=${LOCAL_EPOCHS}, seed=${SEED}"
 echo "extensions=${EXTENSIONS[*]}"
 echo "envs=${ENVS[*]}, methods=${METHODS[*]}"
-echo "selected adaptive: T_KD=${KD_TEMPERATURE}, T_proxy=${PROXY_TEMPERATURE}, lambda_max=${LAMBDA_MAX}, tau=${SOFT_TAU}, warmup=${LAMBDA_WARMUP}"
+echo "selected adaptive: T_KD=${KD_TEMPERATURE}, T_proxy=${PROXY_TEMPERATURE}, lambda_max=${LAMBDA_MAX}, tau=${SOFT_TAU}, warmup_ratio=${LAMBDA_WARMUP_RATIO}, warmup_override=${LAMBDA_WARMUP_OVERRIDE:-none}"
 echo "FedProx mu=${FEDPROX_MU}; MOON mu=${MOON_MU}, contrastive temperature=${MOON_TEMPERATURE}"
 echo "log_root=${LOG_ROOT}, skip_existing=${SKIP_EXISTING}, wandb=${USE_WANDB:-1}"
 

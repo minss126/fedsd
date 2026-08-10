@@ -27,13 +27,14 @@ export METHODS_OVERRIDE="soft_b_adaptive"
 export ROUNDS="${ROUNDS:-500}"
 export TINYIMAGENET_ROUNDS="${TINYIMAGENET_ROUNDS:-100}"
 export IMAGENET100_ROUNDS="${IMAGENET100_ROUNDS:-100}"
-export LAMBDA_WARMUP="${LAMBDA_WARMUP:-50}"
+unset LAMBDA_WARMUP
+export LAMBDA_WARMUP_RATIO="${LAMBDA_WARMUP_RATIO:-0.5}"
 export LOG_ROOT="${LOG_ROOT:-logs/lambda/adaptive/logs_extension_short_horizon_warmup50}"
 export SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 echo "========== Short-Horizon Adaptive Re-validation =========="
 echo "extensions=${EXTENSIONS_OVERRIDE}; gpus=${GPUS_OVERRIDE}"
-echo "rounds: TinyImageNet=${TINYIMAGENET_ROUNDS}, ImageNet100-64=${IMAGENET100_ROUNDS}; warmup=${LAMBDA_WARMUP}"
+echo "rounds: TinyImageNet=${TINYIMAGENET_ROUNDS}, ImageNet100-64=${IMAGENET100_ROUNDS}; warmup_ratio=${LAMBDA_WARMUP_RATIO}"
 echo "methods=${METHODS_OVERRIDE}; envs=${ENVS_OVERRIDE}; log_root=${LOG_ROOT}"
 
 bash scripts/experiments/lambda/run_soft_adaptive_extensions_4gpu.sh
