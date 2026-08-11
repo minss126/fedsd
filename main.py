@@ -705,6 +705,425 @@ def _fisher_feature_ratio(features, targets, eps=1e-12):
     return float((between / (within + eps)).item())
 
 
+POSTLOCAL_GEOMETRY_DEPTHS = ("b1", "b2", "b3", "final")
+POSTLOCAL_GEOMETRY_SCALARS = (
+    "within_class_variance",
+    "between_class_variance",
+    "total_variance",
+    "between_within_ratio",
+    "raw_feature_norm_mean",
+    "raw_feature_norm_std",
+)
+
+
+def _raw_trunk_features(model, x):
+    """Return raw ResNet trunk features without executing private branches."""
+    required = ("conv1", "bn1", "relu", "layer1", "layer2", "layer3", "layer4")
+    missing = [name for name in required if not hasattr(model, name)]
+    if missing:
+        raise ValueError(
+            "--log_postlocal_feature_geometry currently requires a ResNet-style "
+            f"trunk; missing modules: {missing}"
+        )
+    x = model.relu(model.bn1(model.conv1(x)))
+    x = model.layer1(x)
+    b1 = F.adaptive_avg_pool2d(x, 1).flatten(1)
+    x = model.layer2(x)
+    b2 = F.adaptive_avg_pool2d(x, 1).flatten(1)
+    x = model.layer3(x)
+    b3 = F.adaptive_avg_pool2d(x, 1).flatten(1)
+    x = model.layer4(x)
+    final = F.adaptive_avg_pool2d(x, 1).flatten(1)
+    return {"b1": b1, "b2": b2, "b3": b3, "final": final}
+
+
+def _balanced_feature_geometry(features, targets, eps=1e-12):
+    """Compute class-macro W/B traces on sample-wise unit-normalized features."""
+    result = {}
+    classes = torch.unique(targets, sorted=True)
+    if classes.numel() < 2:
+        raise ValueError("Feature geometry requires at least two reference classes.")
+    for depth in POSTLOCAL_GEOMETRY_DEPTHS:
+        raw = features[depth].float()
+        normalized = F.normalize(raw, dim=1, eps=eps)
+        class_means, within_per_class, class_counts = [], [], []
+        for class_id in classes:
+            class_features = normalized[targets == class_id]
+            class_mean = class_features.mean(dim=0)
+            class_means.append(class_mean)
+            within_per_class.append(
+                ((class_features - class_mean) ** 2).sum(dim=1).mean()
+            )
+            class_counts.append(int(class_features.size(0)))
+        class_means = torch.stack(class_means, dim=0)
+        global_mean = class_means.mean(dim=0)
+        within = torch.stack(within_per_class).mean()
+        between = ((class_means - global_mean) ** 2).sum(dim=1).mean()
+        total = ((normalized - global_mean) ** 2).sum(dim=1).mean()
+        raw_norm = torch.linalg.vector_norm(raw, dim=1)
+        result[depth] = {
+            "feature_dim": int(raw.size(1)),
+            "samples": int(raw.size(0)),
+            "classes": int(classes.numel()),
+            "samples_per_class_min": int(min(class_counts)),
+            "samples_per_class_max": int(max(class_counts)),
+            "within_class_variance": float(within.item()),
+            "between_class_variance": float(between.item()),
+            "total_variance": float(total.item()),
+            "between_within_ratio": float((between / within.clamp_min(eps)).item()),
+            "raw_feature_norm_mean": float(raw_norm.mean().item()),
+            "raw_feature_norm_std": float(raw_norm.std(unbiased=False).item()),
+        }
+    return result
+
+
+def compute_reference_feature_geometry(model, dataloader, device, max_batches=0):
+    """Evaluate one model on the common reference set and restore its state/device."""
+    features, targets = collect_reference_raw_features(
+        model, dataloader, device, max_batches=max_batches
+    )
+    return _balanced_feature_geometry(features, targets)
+
+
+def collect_reference_raw_features(model, dataloader, device, max_batches=0):
+    """Extract raw trunk features while restoring the model's mode and device."""
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_state = None
+    if device.type == "cuda":
+        cuda_rng_state = torch.cuda.get_rng_state(device)
+    try:
+        original_device = next(model.parameters()).device
+    except StopIteration:
+        original_device = torch.device("cpu")
+    was_training = model.training
+    model.to(device)
+    model.eval()
+    collected = {depth: [] for depth in POSTLOCAL_GEOMETRY_DEPTHS}
+    targets = []
+    with torch.no_grad():
+        for batch_index, (x, target) in enumerate(dataloader):
+            if max_batches > 0 and batch_index >= max_batches:
+                break
+            x = x.to(device, non_blocking=True)
+            batch_features = _raw_trunk_features(model, x)
+            for depth in POSTLOCAL_GEOMETRY_DEPTHS:
+                collected[depth].append(batch_features[depth].detach().cpu())
+            targets.append(target.detach().long().cpu())
+    if was_training:
+        model.train()
+    if original_device != device:
+        model.to(original_device)
+    torch.set_rng_state(cpu_rng_state)
+    if cuda_rng_state is not None:
+        torch.cuda.set_rng_state(cuda_rng_state, device)
+    if not targets:
+        raise ValueError("The post-local feature-geometry reference loader was empty.")
+    features = {
+        depth: torch.cat(chunks, dim=0) for depth, chunks in collected.items()
+    }
+    return features, torch.cat(targets, dim=0)
+
+
+def _class_balanced_subset(dataset, samples_per_class, num_classes, seed):
+    """Return a deterministic class-balanced subset; non-positive means full."""
+    if int(samples_per_class) <= 0:
+        return dataset
+    targets = _extract_dataset_targets(dataset)
+    if targets is None:
+        raise ValueError("The logit-probe dataset does not expose class targets.")
+    targets = np.asarray(targets, dtype=np.int64).reshape(-1)
+    rng = np.random.default_rng(int(seed))
+    selected = []
+    for class_id in range(int(num_classes)):
+        indices = np.flatnonzero(targets == class_id)
+        if len(indices) < int(samples_per_class):
+            raise ValueError(
+                f"Probe class {class_id} has {len(indices)} samples, fewer than "
+                f"requested {samples_per_class}."
+            )
+        indices = indices.copy()
+        rng.shuffle(indices)
+        selected.extend(indices[:int(samples_per_class)].tolist())
+    rng.shuffle(selected)
+    return torch.utils.data.Subset(dataset, selected)
+
+
+def build_postlocal_logit_probe_loader(
+    global_train_dataset, global_test_dataset, args, device
+):
+    """Build a deterministic, augmentation-free train split for analysis probes."""
+    probe_base = copy.copy(global_train_dataset)
+    if not hasattr(probe_base, "transform") or not hasattr(global_test_dataset, "transform"):
+        raise ValueError("Round-wise logit probes require datasets with a transform attribute.")
+    probe_base.transform = global_test_dataset.transform
+    probe_dataset = _class_balanced_subset(
+        probe_base,
+        int(getattr(args, "postlocal_logit_probe_samples_per_class", 0)),
+        int(args.num_classes),
+        int(args.seed) + 7001,
+    )
+    loader = torch.utils.data.DataLoader(
+        probe_dataset,
+        batch_size=max(1, int(getattr(args, "postlocal_logit_probe_batch_size", 512))),
+        shuffle=False,
+        num_workers=int(args.num_workers),
+        pin_memory=device.type == "cuda",
+    )
+    return loader, len(probe_dataset)
+
+
+def fit_round_start_logit_probes(model, dataloader, device, args, round_index):
+    """Fit depth-specific decoders without perturbing the FL training RNG/state."""
+    features, targets = collect_reference_raw_features(model, dataloader, device)
+    dimensions = {depth: int(features[depth].size(1)) for depth in POSTLOCAL_GEOMETRY_DEPTHS}
+    probe_seed = int(args.seed) * 1_000_003 + int(round_index) * 97_409 + 31
+    fork_devices = []
+    if device.type == "cuda":
+        fork_devices = [device.index if device.index is not None else torch.cuda.current_device()]
+    with torch.random.fork_rng(devices=fork_devices):
+        torch.manual_seed(probe_seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed(probe_seed)
+        heads = torch.nn.ModuleDict({
+            depth: torch.nn.Linear(dimensions[depth], int(args.num_classes))
+            for depth in POSTLOCAL_GEOMETRY_DEPTHS
+        }).to(device)
+        feature_dataset = torch.utils.data.TensorDataset(
+            *(features[depth] for depth in POSTLOCAL_GEOMETRY_DEPTHS), targets
+        )
+        generator = torch.Generator()
+        generator.manual_seed(probe_seed + 1)
+        feature_loader = torch.utils.data.DataLoader(
+            feature_dataset,
+            batch_size=max(1, int(getattr(args, "postlocal_logit_probe_batch_size", 512))),
+            shuffle=True,
+            num_workers=0,
+            pin_memory=device.type == "cuda",
+            generator=generator,
+        )
+        optimizer = torch.optim.SGD(
+            heads.parameters(),
+            lr=float(getattr(args, "postlocal_logit_probe_lr", 0.1)),
+            momentum=0.9,
+            weight_decay=float(getattr(args, "postlocal_logit_probe_weight_decay", 5e-4)),
+        )
+        epochs = max(1, int(getattr(args, "postlocal_logit_probe_epochs", 30)))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        final_loss, seen = 0.0, 0
+        for _ in range(epochs):
+            heads.train()
+            loss_sum, seen = 0.0, 0
+            for batch in feature_loader:
+                batch_features = {
+                    depth: batch[index].to(device, non_blocking=True)
+                    for index, depth in enumerate(POSTLOCAL_GEOMETRY_DEPTHS)
+                }
+                target = batch[-1].to(device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                loss = sum(
+                    F.cross_entropy(heads[depth](batch_features[depth]), target)
+                    for depth in POSTLOCAL_GEOMETRY_DEPTHS
+                ) / float(len(POSTLOCAL_GEOMETRY_DEPTHS))
+                loss.backward()
+                optimizer.step()
+                loss_sum += float(loss.item()) * int(target.numel())
+                seen += int(target.numel())
+            scheduler.step()
+            final_loss = loss_sum / max(seen, 1)
+        heads.eval()
+        for parameter in heads.parameters():
+            parameter.requires_grad = False
+    del features, targets
+    return heads, {
+        "definition": "per-round depth-specific linear probes fitted on frozen round-start global raw trunk features",
+        "seed": int(probe_seed),
+        "train_samples": int(len(dataloader.dataset)),
+        "epochs": int(epochs),
+        "final_train_loss": float(final_loss),
+        "feature_dimensions": dimensions,
+    }
+
+
+def _softmax_js_divergence(left, right, eps=1e-12):
+    left = left.clamp_min(eps)
+    right = right.clamp_min(eps)
+    midpoint = 0.5 * (left + right)
+    return 0.5 * (
+        (left * (left.log() - midpoint.log())).sum(dim=-1)
+        + (right * (right.log() - midpoint.log())).sum(dim=-1)
+    )
+
+
+def compute_depth_logit_metrics(features, targets, heads, device, num_classes):
+    """Measure semantic direction disagreement decoded by frozen shared probes."""
+    logits = {}
+    with torch.no_grad():
+        for depth in POSTLOCAL_GEOMETRY_DEPTHS:
+            chunks = [
+                heads[depth](chunk.to(device, non_blocking=True)).cpu()
+                for chunk in features[depth].split(2048)
+            ]
+            logits[depth] = torch.cat(chunks, dim=0).float()
+    probabilities = {depth: F.softmax(logits[depth], dim=1) for depth in logits}
+    centered = {
+        depth: logits[depth] - logits[depth].mean(dim=1, keepdim=True)
+        for depth in logits
+    }
+    directions = {
+        depth: F.normalize(centered[depth], dim=1, eps=1e-12) for depth in logits
+    }
+    sanity = {}
+    for depth in POSTLOCAL_GEOMETRY_DEPTHS:
+        probs = probabilities[depth]
+        entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=1) / np.log(num_classes)
+        centered_norm = torch.linalg.vector_norm(centered[depth], dim=1)
+        sanity[depth] = {
+            "accuracy_pct": float(
+                100.0 * logits[depth].argmax(dim=1).eq(targets).float().mean().item()
+            ),
+            "nll": float(F.cross_entropy(logits[depth], targets).item()),
+            "entropy_normalized_mean": float(entropy.mean().item()),
+            "max_probability_mean": float(probs.max(dim=1).values.mean().item()),
+            "centered_logit_norm_mean": float(centered_norm.mean().item()),
+            "near_zero_centered_logit_fraction": float(
+                centered_norm.lt(1e-8).float().mean().item()
+            ),
+        }
+    pairwise, pair_cosines, pair_js = {}, [], []
+    depths = POSTLOCAL_GEOMETRY_DEPTHS
+    for left_index in range(len(depths)):
+        for right_index in range(left_index + 1, len(depths)):
+            left, right = depths[left_index], depths[right_index]
+            cosine = (directions[left] * directions[right]).sum(dim=1).clamp(-1.0, 1.0)
+            js = _softmax_js_divergence(probabilities[left], probabilities[right])
+            pairwise[f"{left}-{right}"] = {
+                "centered_logit_cosine_mean": float(cosine.mean().item()),
+                "centered_logit_cosine_std": float(cosine.std(unbiased=False).item()),
+                "softmax_js_divergence_mean": float(js.mean().item()),
+                "softmax_js_divergence_std": float(js.std(unbiased=False).item()),
+            }
+            pair_cosines.append(cosine)
+            pair_js.append(js)
+    stacked = torch.stack([directions[depth] for depth in depths], dim=1)
+    mean_direction = stacked.mean(dim=1, keepdim=True)
+    directional_variance = ((stacked - mean_direction) ** 2).sum(dim=2).mean(dim=1)
+    per_sample_cosine = torch.stack(pair_cosines, dim=1).mean(dim=1)
+    per_sample_js = torch.stack(pair_js, dim=1).mean(dim=1)
+    return {
+        "sanity": sanity,
+        "pairwise": pairwise,
+        "depth_summary": {
+            "directional_variance_mean": float(directional_variance.mean().item()),
+            "directional_variance_std": float(directional_variance.std(unbiased=False).item()),
+            "off_diagonal_centered_cosine_mean": float(per_sample_cosine.mean().item()),
+            "depth_semantic_inconsistency_mean": float((1.0 - per_sample_cosine).mean().item()),
+            "off_diagonal_softmax_js_mean": float(per_sample_js.mean().item()),
+        },
+    }
+
+
+def _macro_postlocal_geometry(client_geometries, global_geometry):
+    """Macro-average client-internal scalars, preserving raw client values."""
+    postlocal_macro, delta_macro = {}, {}
+    for depth in POSTLOCAL_GEOMETRY_DEPTHS:
+        postlocal_macro[depth], delta_macro[depth] = {}, {}
+        for metric in POSTLOCAL_GEOMETRY_SCALARS:
+            values = np.asarray([
+                item["geometry"][depth][metric] for item in client_geometries
+            ], dtype=np.float64)
+            deltas = values - float(global_geometry[depth][metric])
+            for destination, array in ((postlocal_macro[depth], values), (delta_macro[depth], deltas)):
+                destination[f"{metric}_mean"] = float(array.mean())
+                destination[f"{metric}_std"] = float(array.std(ddof=0))
+                destination[f"{metric}_min"] = float(array.min())
+                destination[f"{metric}_max"] = float(array.max())
+    return postlocal_macro, delta_macro
+
+
+def _nested_numeric_client_macro(client_values, baseline):
+    """Recursively summarize client scalars and their paired baseline deltas."""
+    if isinstance(baseline, dict):
+        macro, delta = {}, {}
+        for key, baseline_value in baseline.items():
+            values = [item[key] for item in client_values if key in item]
+            if not values:
+                continue
+            child_macro, child_delta = _nested_numeric_client_macro(values, baseline_value)
+            if child_macro is not None:
+                macro[key], delta[key] = child_macro, child_delta
+        return macro, delta
+    if isinstance(baseline, (int, float)) and not isinstance(baseline, bool):
+        array = np.asarray(client_values, dtype=np.float64)
+        deltas = array - float(baseline)
+
+        def stats(values):
+            return {
+                "mean": float(values.mean()),
+                "std": float(values.std(ddof=0)),
+                "min": float(values.min()),
+                "max": float(values.max()),
+            }
+
+        return stats(array), stats(deltas)
+    return None, None
+
+
+def compute_postlocal_feature_geometry_record(
+    round_index, global_geometry, nets_this_round, reference_loader, device,
+    client_count, max_batches=0, probe_heads=None, global_logits=None,
+    probe_metadata=None, num_classes=None,
+):
+    """Measure post-local/pre-aggregation feature and optional logit geometry."""
+    available_ids = sorted(int(client_id) for client_id in nets_this_round)
+    requested_count = int(client_count)
+    count = (
+        len(available_ids)
+        if requested_count <= 0
+        else min(requested_count, len(available_ids))
+    )
+    positions = np.linspace(0, len(available_ids) - 1, num=count, dtype=np.int64)
+    selected_ids = list(dict.fromkeys(available_ids[int(position)] for position in positions))
+    client_geometries = []
+    for client_id in selected_ids:
+        features, targets = collect_reference_raw_features(
+            nets_this_round[client_id], reference_loader, device, max_batches=max_batches
+        )
+        client_result = {
+            "client_id": client_id,
+            "geometry": _balanced_feature_geometry(features, targets),
+        }
+        if probe_heads is not None:
+            client_result["logits"] = compute_depth_logit_metrics(
+                features, targets, probe_heads, device, int(num_classes)
+            )
+        client_geometries.append(client_result)
+        del features, targets
+    postlocal_macro, delta_macro = _macro_postlocal_geometry(
+        client_geometries, global_geometry
+    )
+    record = {
+        "round": int(round_index),
+        "measurement_point": "post_local_pre_aggregation",
+        "selected_client_ids": selected_ids,
+        "measured_client_count": len(selected_ids),
+        "round_start_global": global_geometry,
+        "clients": client_geometries,
+        "postlocal_client_macro": postlocal_macro,
+        "delta_from_round_start_global_macro": delta_macro,
+    }
+    if probe_heads is not None:
+        logit_macro, logit_delta = _nested_numeric_client_macro(
+            [item["logits"] for item in client_geometries], global_logits
+        )
+        record.update({
+            "logit_probe": probe_metadata,
+            "round_start_global_logits": global_logits,
+            "postlocal_logit_client_macro": logit_macro,
+            "delta_from_round_start_global_logit_macro": logit_delta,
+        })
+    return record
+
+
 def _linear_cka(left, right, eps=1e-12):
     left = left - left.mean(dim=0, keepdim=True)
     right = right - right.mean(dim=0, keepdim=True)
@@ -1282,6 +1701,26 @@ def get_args():
                         help='Round interval for --log_post_aggregation_representation.')
     parser.add_argument('--representation_probe_batches', type=int, default=8,
                         help='Fixed test batches used before and after aggregation for representation geometry.')
+    parser.add_argument('--log_postlocal_feature_geometry', action='store_true',
+                        help='Measure client-internal raw-trunk W/B geometry after local training and before aggregation.')
+    parser.add_argument('--postlocal_geometry_interval', type=int, default=5,
+                        help='Measure post-local feature geometry every N rounds (the final round is always included).')
+    parser.add_argument('--postlocal_geometry_client_count', type=int, default=0,
+                        help='Maximum participating clients measured at each geometry round; 0 measures all.')
+    parser.add_argument('--postlocal_geometry_reference_batches', type=int, default=0,
+                        help='Official test batches per measurement; 0 uses the full test set.')
+    parser.add_argument('--log_postlocal_logit_geometry', action='store_true',
+                        help='Fit round-start frozen linear probes and measure post-local cross-depth logits.')
+    parser.add_argument('--postlocal_logit_probe_epochs', type=int, default=30,
+                        help='Linear-probe epochs at each measured round.')
+    parser.add_argument('--postlocal_logit_probe_lr', type=float, default=0.1,
+                        help='Learning rate for round-wise analysis-only linear probes.')
+    parser.add_argument('--postlocal_logit_probe_weight_decay', type=float, default=5e-4,
+                        help='Weight decay for round-wise analysis-only linear probes.')
+    parser.add_argument('--postlocal_logit_probe_batch_size', type=int, default=512,
+                        help='Batch size for probe feature extraction and linear-head fitting.')
+    parser.add_argument('--postlocal_logit_probe_samples_per_class', type=int, default=500,
+                        help='Augmentation-free train samples/class for fitting probes; 0 uses all.')
     
     
     parser.add_argument('--min_threshold', type=float, default=0.8, help='시작 임계값 (Dynamic Threshold용)')
@@ -1375,6 +1814,19 @@ def main():
         global_counts = np.bincount(global_targets, minlength=args.num_classes).astype(np.float64)
         if float(global_counts.sum()) > 0.0:
             args.byot_client_skew_global_label_probs = (global_counts / global_counts.sum()).tolist()
+
+    postlocal_logit_probe_loader = None
+    postlocal_logit_probe_samples = 0
+    if getattr(args, "log_postlocal_logit_geometry", False):
+        postlocal_logit_probe_loader, postlocal_logit_probe_samples = (
+            build_postlocal_logit_probe_loader(
+                global_train_dataset, global_test_dataset, args, device
+            )
+        )
+        logger.info(
+            "Prepared augmentation-free logit-probe train reference: "
+            f"samples={postlocal_logit_probe_samples}"
+        )
 
     # ==========================================================================
     # [통합 수정] 2. 모델 선택 로직 (Base vs Ours)
@@ -1503,6 +1955,9 @@ def main():
         'byot_sample_entropy_mean': [],
         'byot_prediction_mutual_info_mean': [],
         'byot_prediction_entropy_mutual_info_corr': [],
+        # Sparse multi-round records. Each entry contains the round-start
+        # global geometry, raw post-local client geometries, and client macros.
+        'postlocal_feature_geometry': [],
         'max': 0, 'avg_10': 0, 'avg_30': 0, 'avg_50': 0
     }
     for group in LAYERWISE_UPDATE_GROUPS:
@@ -1643,6 +2098,77 @@ def main():
                 max(1, int(getattr(args, 'representation_probe_batches', 8))),
             )
 
+        should_measure_postlocal_geometry = (
+            (
+                getattr(args, 'log_postlocal_feature_geometry', False)
+                or getattr(args, 'log_postlocal_logit_geometry', False)
+            )
+            and int(getattr(args, 'postlocal_geometry_interval', 0)) > 0
+            and (
+                round == 0
+                or (round + 1) % int(getattr(args, 'postlocal_geometry_interval', 5)) == 0
+                or round == int(args.round) - 1
+            )
+        )
+        round_start_global_geometry = None
+        round_start_global_logits = None
+        round_logit_probe_heads = None
+        round_logit_probe_metadata = None
+        if should_measure_postlocal_geometry:
+            reference_batches = max(
+                0, int(getattr(args, 'postlocal_geometry_reference_batches', 0))
+            )
+            if getattr(args, 'log_postlocal_logit_geometry', False):
+                round_logit_probe_heads, round_logit_probe_metadata = (
+                    fit_round_start_logit_probes(
+                        global_model,
+                        postlocal_logit_probe_loader,
+                        device,
+                        args,
+                        round,
+                    )
+                )
+                global_features, global_feature_targets = collect_reference_raw_features(
+                    global_model,
+                    global_test_dataloader,
+                    device,
+                    max_batches=reference_batches,
+                )
+                round_start_global_geometry = _balanced_feature_geometry(
+                    global_features, global_feature_targets
+                )
+                round_start_global_logits = compute_depth_logit_metrics(
+                    global_features,
+                    global_feature_targets,
+                    round_logit_probe_heads,
+                    device,
+                    int(args.num_classes),
+                )
+                del global_features, global_feature_targets
+                round_logit_probe_metadata["reference_test_samples"] = int(
+                    round_start_global_geometry["final"]["samples"]
+                )
+                round_logit_probe_metadata["global_probe_accuracy_pct"] = {
+                    depth: round_start_global_logits["sanity"][depth]["accuracy_pct"]
+                    for depth in POSTLOCAL_GEOMETRY_DEPTHS
+                }
+                logger.info(
+                    "Round-start logit probes: "
+                    + ", ".join(
+                        f"{depth}={accuracy:.2f}%"
+                        for depth, accuracy in round_logit_probe_metadata[
+                            "global_probe_accuracy_pct"
+                        ].items()
+                    )
+                )
+            else:
+                round_start_global_geometry = compute_reference_feature_geometry(
+                    global_model,
+                    global_test_dataloader,
+                    device,
+                    max_batches=reference_batches,
+                )
+
         old_w = copy.deepcopy(global_model.state_dict())
         
         args.current_round = round + 1
@@ -1676,6 +2202,40 @@ def main():
             avg_byot_alpha_mean = float(getattr(args, "byot_alpha", 0.0))
             avg_byot_alpha_min = avg_byot_alpha_mean
             avg_byot_alpha_max = avg_byot_alpha_mean
+
+        if should_measure_postlocal_geometry:
+            geometry_record = compute_postlocal_feature_geometry_record(
+                round,
+                round_start_global_geometry,
+                nets_this_round,
+                global_test_dataloader,
+                device,
+                client_count=int(getattr(args, 'postlocal_geometry_client_count', 0)),
+                max_batches=max(0, int(getattr(args, 'postlocal_geometry_reference_batches', 0))),
+                probe_heads=round_logit_probe_heads,
+                global_logits=round_start_global_logits,
+                probe_metadata=round_logit_probe_metadata,
+                num_classes=int(args.num_classes),
+            )
+            pkl_dict['postlocal_feature_geometry'].append(geometry_record)
+            final_geometry = geometry_record['postlocal_client_macro']['final']
+            logger.info(
+                "Post-local feature geometry: "
+                f"clients={geometry_record['measured_client_count']}, "
+                f"final W={final_geometry['within_class_variance_mean']:.6f}, "
+                f"B={final_geometry['between_class_variance_mean']:.6f}"
+            )
+            if round_logit_probe_heads is not None:
+                logit_summary = geometry_record[
+                    'postlocal_logit_client_macro'
+                ]['depth_summary']
+                logger.info(
+                    "Post-local logit geometry: "
+                    f"cos={logit_summary['off_diagonal_centered_cosine_mean']['mean']:.6f}, "
+                    f"var={logit_summary['directional_variance_mean']['mean']:.6f}"
+                )
+                del round_logit_probe_heads
+                torch.cuda.empty_cache()
 
         # 로그 저장
         pkl_dict['avg_train_loss'].append(avg_loss)
@@ -1994,6 +2554,54 @@ def main():
     finally:
         if os.path.exists(temp_result_path):
             os.remove(temp_result_path)
+
+    if (
+        getattr(args, "log_postlocal_feature_geometry", False)
+        or getattr(args, "log_postlocal_logit_geometry", False)
+    ):
+        geometry_suffix = (
+            '_postlocal_internal_geometry.json'
+            if getattr(args, "log_postlocal_logit_geometry", False)
+            else '_postlocal_feature_geometry.json'
+        )
+        geometry_result_path = os.path.join(
+            args.logdir, log_file_name + geometry_suffix
+        )
+        geometry_temp_path = f"{geometry_result_path}.tmp.{os.getpid()}"
+        geometry_payload = {
+            "experiment": (
+                "multi_round_within_client_postlocal_internal_geometry"
+                if getattr(args, "log_postlocal_logit_geometry", False)
+                else "multi_round_within_client_postlocal_feature_geometry"
+            ),
+            "args": _args_snapshot(args),
+            "global_train_samples": int(len(global_train_dataset)),
+            "client_train_sizes": [int(len(dataset)) for dataset in client_datasets],
+            "reference_set": "official_test_set",
+            "feature_definition": "raw_trunk_gap_then_samplewise_l2_normalization",
+            "logit_definition": (
+                "per-round frozen global linear probes; per-sample class-centered "
+                "and L2-normalized logit directions"
+                if getattr(args, "log_postlocal_logit_geometry", False)
+                else None
+            ),
+            "probe_train_split": (
+                "augmentation-free official training split"
+                if getattr(args, "log_postlocal_logit_geometry", False)
+                else None
+            ),
+            "probe_train_samples": int(postlocal_logit_probe_samples),
+            "client_aggregation": "macro_mean_over_measured_postlocal_clients",
+            "records": pkl_dict['postlocal_feature_geometry'],
+        }
+        try:
+            with open(geometry_temp_path, 'w', encoding='utf-8') as file:
+                json.dump(geometry_payload, file, indent=2, ensure_ascii=False)
+            os.replace(geometry_temp_path, geometry_result_path)
+        finally:
+            if os.path.exists(geometry_temp_path):
+                os.remove(geometry_temp_path)
+        logger.info(f"Saved post-local internal geometry: {geometry_result_path}")
         
     if wandb_run is not None:
         wandb_run.finish()

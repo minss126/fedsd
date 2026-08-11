@@ -53,7 +53,7 @@ def init_net(dataset, num_nets, args, device='cpu', base=False):
         elif args.model == 'resnet18_byot':
             net = multi_resnet18_kd(num_classes=num_classes, in_channels=args.in_channels)
         elif args.model == 'resnet50_byot':
-            net = multi_resnet50_kd(num_classes=num_classes)
+            net = multi_resnet50_kd(num_classes=num_classes, in_channels=args.in_channels)
         elif args.model == 'mobilenet':
             if base:
                 net = mobilenet_v2.MobileNetV2(num_classes=num_classes, in_channels=args.in_channels, norm_layer=norm_layer, fan=args.fan, linit=args.linit, last_fc=args.last_fc, no_init=args.no_init)

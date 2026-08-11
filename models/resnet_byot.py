@@ -232,8 +232,14 @@ class Multi_ResNet(nn.Module):
         # [수정] 예측값 4개를 리스트로 묶어서 맨 앞에 둠 (순서: Branch1 -> 2 -> 3 -> Final)
         return x, middle_output1, middle_output2, middle_output3, final_fea, middle1_fea, middle2_fea, middle3_fea 
 
-def multi_resnet50_kd(num_classes=1000):
-    return Multi_ResNet(BottleneckBlock, [3,4,6,3], num_classes=num_classes)
+def multi_resnet50_kd(num_classes=1000, in_channels=3):
+    """Construct the ResNet-50 BYOT model with the shared input contract."""
+    return Multi_ResNet(
+        BottleneckBlock,
+        [3, 4, 6, 3],
+        num_classes=num_classes,
+        in_channels=in_channels,
+    )
 
 def multi_resnet18_kd(num_classes=1000, in_channels=3):
     return Multi_ResNet(BasicBlock, [2,2,2,2], num_classes=num_classes, in_channels=in_channels)

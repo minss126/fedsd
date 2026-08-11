@@ -64,13 +64,16 @@ def apply_server_side_optimization(args, global_w, old_w, nets_this_round, fed_a
     """
     서버 측 최적화 알고리즘 적용 (FedAvgM, FedAdam 등)
     """
-    # FedAvg (기본) 인 경우 아무 작업 없이 반환
-    if args.alg == 'fedavg' or args.alg == 'fedbyot' or args.alg == 'flocora':
-        return global_w, moment_first, moment_second
-
-    # FedAvgM (Server Momentum)
-    if args.alg == 'fedavgM':
-        beta = args.server_momentum
+    # FedAvgM (server momentum).  A positive ``server_momentum`` is also an
+    # explicit composition switch for objectives such as ``fedbyot``: local
+    # training remains BYOT while the server aggregates with FedAvgM.
+    # Standalone ``--alg fedavgM`` keeps its original behavior.
+    use_fedavgm = (
+        args.alg == 'fedavgM'
+        or float(getattr(args, 'server_momentum', 0.0)) > 0.0
+    )
+    if use_fedavgm:
+        beta = float(getattr(args, 'server_momentum', 0.0))
         for key in global_w:
             if 'num_batches_tracked' in key or 'running' in key:
                 continue
@@ -78,7 +81,9 @@ def apply_server_side_optimization(args, global_w, old_w, nets_this_round, fed_a
             update_delta = global_w[key] - old_w[key]
             moment_first[key] = beta * moment_first[key] + update_delta
             global_w[key] = old_w[key] + moment_first[key]
-            
+
         return global_w, moment_first, moment_second
 
+    # FedAvg/FedBYOT and algorithms without a server optimizer use the
+    # aggregated client model directly.
     return global_w, moment_first, moment_second
