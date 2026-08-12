@@ -21,6 +21,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Keeps large ResNet50-BYOT allocations from accumulating unusable reserved
+# blocks across train/evaluation transitions.  An explicit user value wins.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     cat <<'EOF'
 Usage:
@@ -33,6 +37,7 @@ Optional overrides:
   SEED=1                      Change the seed.
   BATCH_SIZE=64               Default batch size for ResNet-18/MobileNet.
   RESNET50_BATCH_SIZE=32      Batch size for both ResNet-50 variants.
+  RESNET50_TEST_BATCH_SIZE=32 Evaluation batch size for ResNet-50 BYOT.
   FEDAVGM_MOMENTUM=0.9        Server momentum for FedAvgM.
 EOF
     exit 0
@@ -57,6 +62,7 @@ SEED="${SEED:-0}"
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-5}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 RESNET50_BATCH_SIZE="${RESNET50_BATCH_SIZE:-32}"
+RESNET50_TEST_BATCH_SIZE="${RESNET50_TEST_BATCH_SIZE:-32}"
 NUM_CLIENTS="${NUM_CLIENTS:-100}"
 SAMPLE_FRACTION="${SAMPLE_FRACTION:-0.1}"
 
@@ -154,6 +160,7 @@ configure_axis() {
             BYOT_MODEL="mobilenet_byot"
             PLAIN_MODEL="mobilenet"
             JOB_BATCH_SIZE="$BATCH_SIZE"
+            JOB_TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-512}"
             ;;
         model_resnet50)
             AXIS_GROUP="model"
@@ -161,6 +168,10 @@ configure_axis() {
             BYOT_MODEL="resnet50_byot"
             PLAIN_MODEL="resnet50"
             JOB_BATCH_SIZE="$RESNET50_BATCH_SIZE"
+            # ResNet50-BYOT evaluates all three branch bottlenecks.  The
+            # framework default (512) needs an extra ~4 GiB at 64x64 and
+            # overflows a 20 GiB GPU, even when local training batch=32 fits.
+            JOB_TEST_BATCH_SIZE="$RESNET50_TEST_BATCH_SIZE"
             ;;
         mechanism_fedprox)
             AXIS_GROUP="mechanism"
@@ -168,6 +179,7 @@ configure_axis() {
             BYOT_MODEL="resnet18_byot"
             PLAIN_MODEL="resnet18"
             JOB_BATCH_SIZE="$BATCH_SIZE"
+            JOB_TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-512}"
             BYOT_FL_ARGS=(--use_fedprox --mu "$FEDPROX_MU")
             PLAIN_FL_ARGS=(--alg fedprox --mu "$FEDPROX_MU")
             ;;
@@ -177,6 +189,7 @@ configure_axis() {
             BYOT_MODEL="resnet18_byot"
             PLAIN_MODEL="resnet18"
             JOB_BATCH_SIZE="$BATCH_SIZE"
+            JOB_TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-512}"
             LOSS_TEMPERATURE="$MOON_TEMPERATURE"
             BYOT_FL_ARGS=(--use_moon --mu "$MOON_MU")
             PLAIN_FL_ARGS=(--alg moon --mu "$MOON_MU" --temperature "$MOON_TEMPERATURE")
@@ -187,6 +200,7 @@ configure_axis() {
             BYOT_MODEL="resnet18_byot"
             PLAIN_MODEL="resnet18"
             JOB_BATCH_SIZE="$BATCH_SIZE"
+            JOB_TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-512}"
             # fedbyot + positive server_momentum activates the compositional
             # FedAvgM path in fl_utils.apply_server_side_optimization.
             BYOT_FL_ARGS=(--server_momentum "$FEDAVGM_MOMENTUM")
@@ -258,6 +272,7 @@ run_job() {
         --dataset "$DATASET" --datadir "$DATA_DIR" --num_classes 100
         --n_clients "$NUM_CLIENTS" --sample_fraction "$SAMPLE_FRACTION"
         --epochs "$LOCAL_EPOCHS" --lr "$LR" --batch_size "$JOB_BATCH_SIZE"
+        --test_batch_size "$JOB_TEST_BATCH_SIZE"
         --num_workers "$NUM_WORKERS" --round "$ROUNDS" --seed "$SEED"
         --device "cuda:${gpu_id}" --logdir "$LOG_ROOT"
         --log_file_name "${AXIS_GROUP}/${AXIS_LABEL}/${DATASET}/${partition}/${AXIS_LABEL}/${name}"
@@ -290,7 +305,7 @@ run_job() {
     fi
     CMD+=("${WANDB_FLAGS[@]}")
 
-    echo "[GPU ${gpu_id}] start: ${axis} | ${dataset} | ${partition} | ${method} | R=${ROUNDS}, warm=${WARMUP_ROUNDS}, batch=${JOB_BATCH_SIZE}"
+    echo "[GPU ${gpu_id}] start: ${axis} | ${dataset} | ${partition} | ${method} | R=${ROUNDS}, warm=${WARMUP_ROUNDS}, batch=${JOB_BATCH_SIZE}/${JOB_TEST_BATCH_SIZE}"
     if [[ "$DRY_RUN" == "1" ]]; then
         printf '[dry-run][GPU %s] ' "$gpu_id"
         printf '%q ' "${CMD[@]}"
@@ -384,7 +399,7 @@ echo "jobs=${JOB_COUNT}, gpus=${GPUS[*]}, seed=${SEED}"
 echo "methods=plain fixed_lambda=${FIXED_LAMBDA} soft_b_adaptive"
 echo "adaptive: T_KD=${KD_TEMPERATURE}, T_proxy=${PROXY_TEMPERATURE}, lmax=${LAMBDA_MAX}, tau=${SOFT_TAU}, T_soft=${SOFT_TEMPERATURE}, warmup=${LAMBDA_WARMUP_RATIO}R"
 echo "FedProx mu=${FEDPROX_MU}; MOON mu=${MOON_MU}, T=${MOON_TEMPERATURE}; FedAvgM momentum=${FEDAVGM_MOMENTUM}"
-echo "rounds: cifar=${CIFAR100_ROUNDS}, tiny=${TINYIMAGENET_ROUNDS}, imagenet=${IMAGENET100_ROUNDS}; ResNet50 batch=${RESNET50_BATCH_SIZE}"
+echo "rounds: cifar=${CIFAR100_ROUNDS}, tiny=${TINYIMAGENET_ROUNDS}, imagenet=${IMAGENET100_ROUNDS}; ResNet50 train/test batch=${RESNET50_BATCH_SIZE}/${RESNET50_TEST_BATCH_SIZE}"
 for ((i = 0; i < NUM_GPUS; i++)); do
     job_lines=$(printf '%s' "${QUEUES[$i]}" | sed '/^$/d' | wc -l)
     echo "GPU ${GPUS[$i]}: ${job_lines} queued jobs (relative load ${LOADS[$i]})"
