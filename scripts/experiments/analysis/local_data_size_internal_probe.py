@@ -49,8 +49,8 @@ DEPTHS = ("b1", "b2", "b3", "final")
 PAIRS = (
     ("b1", "b2"),
     ("b1", "b3"),
-    ("b2", "b3"),
     ("b1", "final"),
+    ("b2", "b3"),
     ("b2", "final"),
     ("b3", "final"),
 )

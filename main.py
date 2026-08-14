@@ -6,6 +6,7 @@ import pickle
 import random
 import os
 import json
+import hashlib
 import numpy as np
 
 import sys
@@ -70,6 +71,42 @@ def _extract_dataset_targets(dataset):
                 return values.detach().cpu().numpy()
             return np.asarray(values)
     return None
+
+
+def _limit_client_data_map(client_data_map, samples_per_client, seed):
+    """Take deterministic nested prefixes from pre-existing client pools.
+
+    The permutation seed deliberately does not depend on ``samples_per_client``.
+    Separate runs with the same partition/seed therefore satisfy
+    D_100 subset D_250 subset ... for every client while preserving the
+    original disjoint IID client pools.
+    """
+    samples_per_client = int(samples_per_client)
+    if samples_per_client <= 0:
+        return client_data_map, {}
+
+    limited, provenance = {}, {}
+    for client_id in sorted(client_data_map):
+        base_indices = np.asarray(client_data_map[client_id], dtype=np.int64)
+        if samples_per_client > len(base_indices):
+            raise ValueError(
+                f"--client_samples_per_client={samples_per_client} exceeds "
+                f"client {client_id}'s base pool size {len(base_indices)}."
+            )
+        subset_seed = int(seed) * 1_000_003 + int(client_id) * 97_409 + 17
+        rng = np.random.default_rng(subset_seed)
+        order = rng.permutation(len(base_indices))
+        selected = np.ascontiguousarray(
+            base_indices[order[:samples_per_client]], dtype=np.int64
+        )
+        limited[int(client_id)] = selected
+        provenance[int(client_id)] = {
+            "base_samples": int(len(base_indices)),
+            "selected_samples": int(len(selected)),
+            "subset_seed": int(subset_seed),
+            "indices_sha256": hashlib.sha256(selected.tobytes()).hexdigest(),
+        }
+    return limited, provenance
 
 
 def _layerwise_update_group(key):
@@ -1022,6 +1059,43 @@ def compute_depth_logit_metrics(features, targets, heads, device, num_classes):
     }
 
 
+def compute_cross_depth_cka_metrics(features, device, eps=1e-12):
+    """Centered linear CKA between every raw-trunk depth on one reference set."""
+    centered, self_norm_sq = {}, {}
+    for depth in POSTLOCAL_GEOMETRY_DEPTHS:
+        value = features[depth].to(device=device, dtype=torch.float32)
+        value = value - value.mean(dim=0, keepdim=True)
+        centered[depth] = value
+        self_norm_sq[depth] = torch.sum((value.T @ value) ** 2)
+
+    pairwise, values = {}, []
+    depths = POSTLOCAL_GEOMETRY_DEPTHS
+    for left_index in range(len(depths)):
+        for right_index in range(left_index + 1, len(depths)):
+            left, right = depths[left_index], depths[right_index]
+            cross_norm_sq = torch.sum((centered[left].T @ centered[right]) ** 2)
+            value = float(
+                (
+                    cross_norm_sq
+                    / torch.sqrt(
+                        self_norm_sq[left] * self_norm_sq[right]
+                    ).clamp_min(eps)
+                ).item()
+            )
+            pairwise[f"{left}-{right}"] = {"linear_cka": value}
+            values.append(value)
+    return {
+        "definition": (
+            "centered linear CKA on GAP raw-trunk features over the common "
+            "official-test reference samples"
+        ),
+        "pairwise": pairwise,
+        "depth_summary": {
+            "off_diagonal_linear_cka_mean": float(np.mean(values)),
+        },
+    }
+
+
 def _macro_postlocal_geometry(client_geometries, global_geometry):
     """Macro-average client-internal scalars, preserving raw client values."""
     postlocal_macro, delta_macro = {}, {}
@@ -1071,7 +1145,7 @@ def _nested_numeric_client_macro(client_values, baseline):
 def compute_postlocal_feature_geometry_record(
     round_index, global_geometry, nets_this_round, reference_loader, device,
     client_count, max_batches=0, probe_heads=None, global_logits=None,
-    probe_metadata=None, num_classes=None,
+    global_cka=None, probe_metadata=None, num_classes=None,
 ):
     """Measure post-local/pre-aggregation feature and optional logit geometry."""
     available_ids = sorted(int(client_id) for client_id in nets_this_round)
@@ -1091,6 +1165,7 @@ def compute_postlocal_feature_geometry_record(
         client_result = {
             "client_id": client_id,
             "geometry": _balanced_feature_geometry(features, targets),
+            "cka": compute_cross_depth_cka_metrics(features, device),
         }
         if probe_heads is not None:
             client_result["logits"] = compute_depth_logit_metrics(
@@ -1110,7 +1185,16 @@ def compute_postlocal_feature_geometry_record(
         "clients": client_geometries,
         "postlocal_client_macro": postlocal_macro,
         "delta_from_round_start_global_macro": delta_macro,
+        "round_start_global_cka": global_cka,
     }
+    if global_cka is not None:
+        cka_macro, cka_delta = _nested_numeric_client_macro(
+            [item["cka"] for item in client_geometries], global_cka
+        )
+        record.update({
+            "postlocal_cka_client_macro": cka_macro,
+            "delta_from_round_start_global_cka_macro": cka_delta,
+        })
     if probe_heads is not None:
         logit_macro, logit_delta = _nested_numeric_client_macro(
             [item["logits"] for item in client_geometries], global_logits
@@ -1411,6 +1495,22 @@ def get_args():
     parser.add_argument('--round', type=int, default=500, help='number of maximum communication round')
     parser.add_argument('--n_clients', type=int, default=100, help='number of workers in a distributed cluster')
     # 데이터는 클라이언트들에게 겹치지않게 분배됩니다
+    parser.add_argument(
+        '--client_samples_per_client', type=int, default=0,
+        help=(
+            'After the ordinary client partition is created, retain this many '
+            'samples in every client using deterministic nested prefixes. '
+            'Zero keeps each full client pool.'
+        ),
+    )
+    parser.add_argument(
+        '--local_steps_per_round', type=int, default=0,
+        help=(
+            'FedAvg-only diagnostic override: use exactly this many optimizer '
+            'steps per selected client and round, cycling its dataloader as '
+            'needed. Zero uses --epochs.'
+        ),
+    )
     parser.add_argument('--beta', type=float, default=0.3, help='The parameter for the dirichlet distribution for data partitioning')
     # noniid 조절, 작을수록 noniid
     parser.add_argument('--min_require_size', type=int, default=64, help='the minimum number of data for each client')
@@ -1782,6 +1882,23 @@ def main():
     
     # 2. 데이터 파티셔닝 (Client들에게 데이터 나누기)
     client_data_map = partition_data(global_train_dataset, args, logger)
+
+    # Optional fixed-K/local-n control.  The ordinary partition is created
+    # first, so clients remain disjoint.  Only the prefix length changes across
+    # n conditions, while the per-client permutation stays identical.
+    client_subset_provenance = {}
+    if int(getattr(args, 'client_samples_per_client', 0)) > 0:
+        client_data_map, client_subset_provenance = _limit_client_data_map(
+            client_data_map,
+            int(args.client_samples_per_client),
+            int(args.seed),
+        )
+        args.client_subset_provenance = client_subset_provenance
+        logger.info(
+            'Applied deterministic nested client-data limit: '
+            f'n={args.client_samples_per_client}, clients={args.n_clients}, '
+            f'total_unique={sum(len(indices) for indices in client_data_map.values())}'
+        )
     
     # 3. 클라이언트별 데이터셋 생성
     client_datasets = get_client_datasets(global_train_dataset, client_data_map, args)
@@ -2157,6 +2274,7 @@ def main():
         )
         round_start_global_geometry = None
         round_start_global_logits = None
+        round_start_global_cka = None
         round_logit_probe_heads = None
         round_logit_probe_metadata = None
         if should_measure_postlocal_geometry:
@@ -2181,6 +2299,9 @@ def main():
                 )
                 round_start_global_geometry = _balanced_feature_geometry(
                     global_features, global_feature_targets
+                )
+                round_start_global_cka = compute_cross_depth_cka_metrics(
+                    global_features, device
                 )
                 round_start_global_logits = compute_depth_logit_metrics(
                     global_features,
@@ -2259,6 +2380,7 @@ def main():
                 max_batches=max(0, int(getattr(args, 'postlocal_geometry_reference_batches', 0))),
                 probe_heads=round_logit_probe_heads,
                 global_logits=round_start_global_logits,
+                global_cka=round_start_global_cka,
                 probe_metadata=round_logit_probe_metadata,
                 num_classes=int(args.num_classes),
             )
@@ -2626,8 +2748,23 @@ def main():
             "args": _args_snapshot(args),
             "global_train_samples": int(len(global_train_dataset)),
             "client_train_sizes": [int(len(dataset)) for dataset in client_datasets],
+            "active_client_train_samples": int(
+                sum(len(dataset) for dataset in client_datasets)
+            ),
+            "client_data_overlap": "disjoint_across_clients",
+            "client_data_nesting": (
+                "deterministic_nested_prefix_across_sample_size_conditions"
+                if int(getattr(args, "client_samples_per_client", 0)) > 0
+                else None
+            ),
             "reference_set": "official_test_set",
             "feature_definition": "raw_trunk_gap_then_samplewise_l2_normalization",
+            "cka_definition": (
+                "centered linear CKA on raw-trunk GAP features over the same "
+                "official-test samples"
+                if getattr(args, "log_postlocal_logit_geometry", False)
+                else None
+            ),
             "logit_definition": (
                 "per-round frozen global linear probes; per-sample class-centered "
                 "and L2-normalized logit directions"

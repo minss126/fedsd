@@ -979,40 +979,60 @@ def fedavg(net, train_dataloader, optimizer, device, args):
     feddecorr = FedDecorrLoss()
 
     total_loss = 0.0
-    for epoch in range(args.epochs):
-        for step, (x, target) in enumerate(train_dataloader):
-            x, target = x.to(device), target.to(device)
-            optimizer.zero_grad()
-            target = target.long()
-            
-            # A BYOT-shaped model with SD disabled is a teacher-only control.
-            # Skip private branch paths entirely so their BatchNorm buffers do
-            # not change and cannot contaminate client-update diagnostics.
-            if hasattr(net, "forward_teacher") and not getattr(args, 'use_sd', False):
-                features, out = net.forward_teacher(x)
-                raw_out = (features, out)
-            else:
-                raw_out = net(x)
-                features, out = unpack_model_output(raw_out)
+    completed_steps = 0
 
-            loss = criterion(out, target)
+    def update(batch):
+        nonlocal total_loss, completed_steps
+        x, target = batch
+        x, target = x.to(device), target.to(device)
+        optimizer.zero_grad()
+        target = target.long()
             
-            if getattr(args, 'use_sd', False):
-                loss += compute_sd_loss(raw_out, target, device, args)
-            
-            total_loss += loss.item()
-            
-            # features가 None이 아닐 때만 feddecorr 적용
-            if args.feddecorr and features is not None:
-                loss_feddecorr = feddecorr(features)
-                loss = loss + args.feddecorr_coef * loss_feddecorr
+        # A BYOT-shaped model with SD disabled is a teacher-only control.
+        # Skip private branch paths entirely so their BatchNorm buffers do
+        # not change and cannot contaminate client-update diagnostics.
+        if hasattr(net, "forward_teacher") and not getattr(args, 'use_sd', False):
+            features, out = net.forward_teacher(x)
+            raw_out = (features, out)
+        else:
+            raw_out = net(x)
+            features, out = unpack_model_output(raw_out)
 
-            loss.backward()
-            optimizer.step()
+        loss = criterion(out, target)
+            
+        if getattr(args, 'use_sd', False):
+            loss += compute_sd_loss(raw_out, target, device, args)
+            
+        total_loss += loss.item()
+            
+        # features가 None이 아닐 때만 feddecorr 적용
+        if args.feddecorr and features is not None:
+            loss_feddecorr = feddecorr(features)
+            loss = loss + args.feddecorr_coef * loss_feddecorr
+
+        loss.backward()
+        optimizer.step()
+
+        completed_steps += 1
+
+    requested_steps = int(getattr(args, 'local_steps_per_round', 0))
+    if requested_steps > 0:
+        iterator = iter(train_dataloader)
+        while completed_steps < requested_steps:
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                iterator = iter(train_dataloader)
+                batch = next(iterator)
+            update(batch)
+    else:
+        for epoch in range(args.epochs):
+            for batch in train_dataloader:
+                update(batch)
 
     net.zero_grad()
 
-    return total_loss / max(1, len(train_dataloader)) / args.epochs
+    return total_loss / max(1, completed_steps)
 
 def fedrs(net, train_dataloader, optimizer, device, args):
     criterion = nn.CrossEntropyLoss()
