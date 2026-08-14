@@ -14,12 +14,13 @@ Two modes are provided:
 ``run``
     Fork the same global checkpoint into several local models, train each fork
     on a deterministic IID subset of the requested size, and evaluate internal
-    feature geometry and depth-to-depth semantic consistency on the full
-    official CIFAR-100 test set.
+    feature geometry and/or depth-to-depth semantic consistency on the full
+    official test set.
 """
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -45,11 +46,19 @@ from models.resnet_byot import multi_resnet18_kd
 
 
 DEPTHS = ("b1", "b2", "b3", "final")
-PAIRS = tuple(
-    (DEPTHS[left], DEPTHS[right])
-    for left in range(len(DEPTHS))
-    for right in range(left + 1, len(DEPTHS))
+PAIRS = (
+    ("b1", "b2"),
+    ("b1", "b3"),
+    ("b2", "b3"),
+    ("b1", "final"),
+    ("b2", "final"),
+    ("b3", "final"),
 )
+
+DATASET_NUM_CLASSES = {
+    "cifar10": 10,
+    "cifar100": 100,
+}
 
 
 def parse_args():
@@ -58,6 +67,17 @@ def parse_args():
 
     def add_common(subparser):
         subparser.add_argument("--global_checkpoint", required=True)
+        subparser.add_argument(
+            "--dataset", choices=tuple(DATASET_NUM_CLASSES), default="cifar100"
+        )
+        subparser.add_argument(
+            "--metrics", choices=("all", "logits", "cka", "logits_cka"),
+            default="all",
+            help=(
+                "Metric family: all=feature geometry+logits, logits=probe logits, "
+                "cka=probe-free cross-depth linear CKA, logits_cka=both logits and CKA."
+            ),
+        )
         subparser.add_argument("--datadir", default="./data")
         subparser.add_argument("--device", default="cuda:0")
         subparser.add_argument("--batch_size", type=int, default=256)
@@ -143,13 +163,13 @@ def dataset_targets(dataset):
     raise ValueError("Dataset does not expose targets.")
 
 
-def class_balanced_subset(dataset, samples_per_class, seed):
+def class_balanced_subset(dataset, samples_per_class, seed, num_classes):
     if samples_per_class <= 0:
         return dataset, len(dataset)
     labels = dataset_targets(dataset)
     selected = []
     rng = np.random.default_rng(seed)
-    for class_id in range(100):
+    for class_id in range(num_classes):
         indices = np.flatnonzero(labels == class_id)
         if len(indices) < samples_per_class:
             raise ValueError(
@@ -164,19 +184,27 @@ def class_balanced_subset(dataset, samples_per_class, seed):
 
 
 def load_datasets(args):
-    args.dataset = "cifar100"
+    args.dataset = str(args.dataset)
     args.in_channels = 3
-    args.num_classes = 100
+    args.num_classes = DATASET_NUM_CLASSES[args.dataset]
     args.cifar100_class_count = 0
     args.cifar100_subset_seed = 0
     train_dataset, _, test_dataset = get_global_dataset(args)
     return train_dataset, test_dataset
 
 
-def load_global_model(checkpoint_path, device):
+def load_global_model(checkpoint_path, dataset, device):
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state = checkpoint.get("global_model", checkpoint)
-    model = multi_resnet18_kd(num_classes=100, in_channels=3)
+    checkpoint_args = checkpoint.get("args", {})
+    checkpoint_dataset = checkpoint_args.get("dataset") if isinstance(checkpoint_args, dict) else None
+    if checkpoint_dataset is not None and checkpoint_dataset != dataset:
+        raise ValueError(
+            f"Checkpoint dataset is {checkpoint_dataset}, but --dataset is {dataset}."
+        )
+    model = multi_resnet18_kd(
+        num_classes=DATASET_NUM_CLASSES[dataset], in_channels=3
+    )
     model.load_state_dict(state, strict=True)
     model.to(device)
     return model, checkpoint
@@ -217,7 +245,7 @@ def extract_features(model, dataloader, device):
 def fit_linear_probes(features, targets, args, device):
     dimensions = {depth: int(features[depth].size(1)) for depth in DEPTHS}
     heads = nn.ModuleDict({
-        depth: nn.Linear(dimensions[depth], 100) for depth in DEPTHS
+        depth: nn.Linear(dimensions[depth], args.num_classes) for depth in DEPTHS
     }).to(device)
     dataset = TensorDataset(*(features[depth] for depth in DEPTHS), targets)
     loader = DataLoader(
@@ -262,9 +290,9 @@ def fit_linear_probes(features, targets, args, device):
     return heads, dimensions
 
 
-def build_heads(dimensions, state, device):
+def build_heads(dimensions, state, num_classes, device):
     heads = nn.ModuleDict({
-        depth: nn.Linear(int(dimensions[depth]), 100) for depth in DEPTHS
+        depth: nn.Linear(int(dimensions[depth]), num_classes) for depth in DEPTHS
     }).to(device)
     heads.load_state_dict(state, strict=True)
     heads.eval()
@@ -283,7 +311,7 @@ def js_divergence(left, right, eps=1e-12):
     )
 
 
-def feature_geometry(features, targets):
+def feature_geometry(features, targets, num_classes):
     result = {}
     for depth in DEPTHS:
         raw = features[depth].float()
@@ -292,7 +320,7 @@ def feature_geometry(features, targets):
         class_means = []
         within_per_class = []
         class_counts = []
-        for class_id in range(100):
+        for class_id in range(num_classes):
             class_features = normalized[targets == class_id]
             if class_features.numel() == 0:
                 raise ValueError(f"Reference set has no samples for class {class_id}.")
@@ -322,7 +350,7 @@ def feature_geometry(features, targets):
     return result
 
 
-def logit_metrics(features, targets, heads, device):
+def logit_metrics(features, targets, heads, num_classes, device):
     logits = {}
     with torch.no_grad():
         for depth in DEPTHS:
@@ -346,7 +374,10 @@ def logit_metrics(features, targets, heads, device):
     sanity = {}
     for depth in DEPTHS:
         probs = probabilities[depth]
-        entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=1) / math.log(100)
+        entropy = (
+            -(probs * probs.clamp_min(1e-12).log()).sum(dim=1)
+            / math.log(num_classes)
+        )
         centered_norm = torch.linalg.vector_norm(centered[depth], dim=1)
         sanity[depth] = {
             "accuracy_pct": float(
@@ -406,53 +437,130 @@ def logit_metrics(features, targets, heads, device):
     }
 
 
-def evaluate_internal_metrics(model, heads, dataloader, device):
-    features, targets = extract_features(model, dataloader, device)
-    result = {
-        "feature_geometry": feature_geometry(features, targets),
-        "logits": logit_metrics(features, targets, heads, device),
+def linear_cka(left, right, eps=1e-12):
+    """Centered linear CKA via feature-space products, without an N x N Gram."""
+    left = left.float()
+    right = right.float()
+    left = left - left.mean(dim=0, keepdim=True)
+    right = right - right.mean(dim=0, keepdim=True)
+    cross_norm_sq = torch.sum((left.T @ right) ** 2)
+    left_norm_sq = torch.sum((left.T @ left) ** 2)
+    right_norm_sq = torch.sum((right.T @ right) ** 2)
+    return float(
+        (cross_norm_sq / (torch.sqrt(left_norm_sq * right_norm_sq) + eps)).item()
+    )
+
+
+def cka_metrics(features, device):
+    # Keep the full-test feature matrices on the accelerator while computing
+    # cross-products. This avoids both N x N Gram matrices and multi-billion-
+    # operation CPU matmuls for every local fork.
+    centered = {}
+    self_norm_sq = {}
+    for depth in DEPTHS:
+        value = features[depth].to(device=device, dtype=torch.float32)
+        value = value - value.mean(dim=0, keepdim=True)
+        centered[depth] = value
+        self_norm_sq[depth] = torch.sum((value.T @ value) ** 2)
+    pairwise = {}
+    values = []
+    for left, right in PAIRS:
+        cross_norm_sq = torch.sum((centered[left].T @ centered[right]) ** 2)
+        value = float(
+            (
+                cross_norm_sq
+                / torch.sqrt(self_norm_sq[left] * self_norm_sq[right]).clamp_min(1e-12)
+            ).item()
+        )
+        pairwise[f"{left}-{right}"] = {"linear_cka": value}
+        values.append(value)
+    return {
+        "definition": (
+            "centered linear CKA on GAP raw-trunk features over the common "
+            "reference samples; computed in feature space"
+        ),
+        "pairwise": pairwise,
+        "depth_summary": {
+            "off_diagonal_linear_cka_mean": float(np.mean(values)),
+        },
     }
+
+
+def evaluate_internal_metrics(model, heads, dataloader, num_classes, metrics, device):
+    features, targets = extract_features(model, dataloader, device)
+    result = {}
+    if metrics in ("all", "logits", "logits_cka"):
+        if heads is None:
+            raise ValueError(f"metrics={metrics} requires fitted linear-probe heads.")
+        result["logits"] = logit_metrics(
+            features, targets, heads, num_classes, device
+        )
+    if metrics == "all":
+        result["feature_geometry"] = feature_geometry(
+            features, targets, num_classes
+        )
+    if metrics in ("cka", "logits_cka"):
+        result["cka"] = cka_metrics(features, device)
     del features, targets
     return result
 
 
 def selected_deltas(post, pre):
     feature_delta = {}
-    for depth in DEPTHS:
-        feature_delta[depth] = {}
+    if "feature_geometry" in post and "feature_geometry" in pre:
+        for depth in DEPTHS:
+            feature_delta[depth] = {}
+            for key in (
+                "within_class_variance", "between_class_variance",
+                "between_within_ratio", "raw_feature_norm_mean",
+            ):
+                feature_delta[depth][key] = float(
+                    post["feature_geometry"][depth][key]
+                    - pre["feature_geometry"][depth][key]
+                )
+    result = {}
+    if "logits" in post and "logits" in pre:
+        pair_delta = {}
+        for pair_name in post["logits"]["pairwise"]:
+            pair_delta[pair_name] = {}
+            for key in (
+                "centered_logit_cosine_mean", "softmax_js_divergence_mean",
+                "absolute_true_label_probability_gap_mean",
+            ):
+                pair_delta[pair_name][key] = float(
+                    post["logits"]["pairwise"][pair_name][key]
+                    - pre["logits"]["pairwise"][pair_name][key]
+                )
+        summary_delta = {}
         for key in (
-            "within_class_variance", "between_class_variance",
-            "between_within_ratio", "raw_feature_norm_mean",
+            "directional_variance_mean", "off_diagonal_centered_cosine_mean",
+            "depth_semantic_inconsistency_mean", "off_diagonal_softmax_js_mean",
         ):
-            feature_delta[depth][key] = float(
-                post["feature_geometry"][depth][key]
-                - pre["feature_geometry"][depth][key]
+            summary_delta[key] = float(
+                post["logits"]["depth_summary"][key]
+                - pre["logits"]["depth_summary"][key]
             )
-    pair_delta = {}
-    for pair_name in post["logits"]["pairwise"]:
-        pair_delta[pair_name] = {}
-        for key in (
-            "centered_logit_cosine_mean", "softmax_js_divergence_mean",
-            "absolute_true_label_probability_gap_mean",
-        ):
-            pair_delta[pair_name][key] = float(
-                post["logits"]["pairwise"][pair_name][key]
-                - pre["logits"]["pairwise"][pair_name][key]
+        result["pairwise_logits"] = pair_delta
+        result["depth_summary"] = summary_delta
+    if "cka" in post and "cka" in pre:
+        result["pairwise_cka"] = {
+            pair_name: {
+                "linear_cka": float(
+                    post["cka"]["pairwise"][pair_name]["linear_cka"]
+                    - pre["cka"]["pairwise"][pair_name]["linear_cka"]
+                )
+            }
+            for pair_name in post["cka"]["pairwise"]
+        }
+        result["cka_depth_summary"] = {
+            "off_diagonal_linear_cka_mean": float(
+                post["cka"]["depth_summary"]["off_diagonal_linear_cka_mean"]
+                - pre["cka"]["depth_summary"]["off_diagonal_linear_cka_mean"]
             )
-    summary_delta = {}
-    for key in (
-        "directional_variance_mean", "off_diagonal_centered_cosine_mean",
-        "depth_semantic_inconsistency_mean", "off_diagonal_softmax_js_mean",
-    ):
-        summary_delta[key] = float(
-            post["logits"]["depth_summary"][key]
-            - pre["logits"]["depth_summary"][key]
-        )
-    return {
-        "feature_geometry": feature_delta,
-        "pairwise_logits": pair_delta,
-        "depth_summary": summary_delta,
-    }
+        }
+    if feature_delta:
+        result["feature_geometry"] = feature_delta
+    return result
 
 
 def local_subset_indices(dataset_size, sample_size, seed, client_id):
@@ -517,42 +625,64 @@ def train_teacher_only(model, dataloader, args, device):
 
 def prepare_mode(args, device):
     train_dataset, test_dataset = load_datasets(args)
-    probe_train_base = copy.copy(train_dataset)
-    probe_train_base.transform = test_dataset.transform
-    probe_train, probe_count = class_balanced_subset(
-        probe_train_base, args.probe_samples_per_class, args.seed
-    )
+    needs_logits = args.metrics in ("all", "logits", "logits_cka")
+    probe_loader = None
+    probe_count = 0
+    if needs_logits:
+        probe_train_base = copy.copy(train_dataset)
+        probe_train_base.transform = test_dataset.transform
+        probe_train, probe_count = class_balanced_subset(
+            probe_train_base, args.probe_samples_per_class,
+            args.seed, args.num_classes
+        )
+        probe_loader = DataLoader(
+            probe_train, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=device.type == "cuda",
+        )
     reference_test, reference_count = class_balanced_subset(
-        test_dataset, args.test_samples_per_class, args.seed + 1
-    )
-    probe_loader = DataLoader(
-        probe_train, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=device.type == "cuda",
+        test_dataset, args.test_samples_per_class, args.seed + 1, args.num_classes
     )
     reference_loader = DataLoader(
         reference_test, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=device.type == "cuda",
     )
-    model, global_checkpoint = load_global_model(args.global_checkpoint, device)
-    features, targets = extract_features(model, probe_loader, device)
-    heads, dimensions = fit_linear_probes(features, targets, args, device)
-    del features, targets
-    baseline_metrics = evaluate_internal_metrics(model, heads, reference_loader, device)
+    model, global_checkpoint = load_global_model(
+        args.global_checkpoint, args.dataset, device
+    )
+    heads = None
+    dimensions = {}
+    if needs_logits:
+        features, targets = extract_features(model, probe_loader, device)
+        heads, dimensions = fit_linear_probes(features, targets, args, device)
+        del features, targets
+    baseline_metrics = evaluate_internal_metrics(
+        model, heads, reference_loader, args.num_classes, args.metrics, device
+    )
     payload = {
         "format_version": 1,
         "experiment": "within_client_local_data_size_probe",
         "global_checkpoint": os.path.abspath(args.global_checkpoint),
         "global_round": int(global_checkpoint.get("round", -1)),
+        "global_completed_rounds": int(
+            global_checkpoint.get(
+                "completed_rounds", int(global_checkpoint.get("round", -1)) + 1
+            )
+        ),
         "global_checkpoint_args": global_checkpoint.get("args", {}),
+        "dataset": args.dataset,
+        "num_classes": int(args.num_classes),
+        "metrics": args.metrics,
         "probe_definition": (
+            "probe-free centered linear CKA on GAP raw-trunk features"
+            if not needs_logits else
             "depth-specific GAP linear heads fitted once on frozen round-start "
             "global raw trunk features and frozen for every local fork"
         ),
         "head_dimensions": dimensions,
-        "heads_state_dict": heads.state_dict(),
+        "heads_state_dict": {} if heads is None else heads.state_dict(),
         "probe_train_samples": int(probe_count),
         "reference_test_samples": int(reference_count),
-        "reference_split": "official_cifar100_test",
+        "reference_split": f"official_{args.dataset}_test",
         "reference_samples_per_class": int(args.test_samples_per_class),
         "reference_selection_seed": int(args.seed + 1),
         "probe_epochs": int(args.probe_epochs),
@@ -563,14 +693,20 @@ def prepare_mode(args, device):
     }
     atomic_torch_save(payload, args.probe_output)
     print(f"saved shared probe: {args.probe_output}", flush=True)
-    print(json.dumps({
+    status = {
         "probe_train_samples": probe_count,
         "reference_test_samples": reference_count,
-        "global_probe_accuracy_pct": {
+    }
+    if "logits" in baseline_metrics:
+        status["global_probe_accuracy_pct"] = {
             depth: baseline_metrics["logits"]["sanity"][depth]["accuracy_pct"]
             for depth in DEPTHS
-        },
-    }, indent=2), flush=True)
+        }
+    if "cka" in baseline_metrics:
+        status["global_mean_pairwise_linear_cka"] = baseline_metrics[
+            "cka"
+        ]["depth_summary"]["off_diagonal_linear_cka_mean"]
+    print(json.dumps(status, indent=2), flush=True)
 
 
 def run_mode(args, device):
@@ -587,12 +723,23 @@ def run_mode(args, device):
         test_dataset,
         args.test_samples_per_class,
         int(probe.get("reference_selection_seed", 1)),
+        args.num_classes,
     )
     reference_loader = DataLoader(
         reference_test, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=device.type == "cuda",
     )
-    base_model, global_checkpoint = load_global_model(args.global_checkpoint, device)
+    if probe.get("dataset", "cifar100") != args.dataset:
+        raise ValueError(
+            f"Probe dataset is {probe.get('dataset')}, but --dataset is {args.dataset}."
+        )
+    if probe.get("metrics", "all") != args.metrics:
+        raise ValueError(
+            f"Probe metrics mode is {probe.get('metrics')}, but --metrics is {args.metrics}."
+        )
+    base_model, global_checkpoint = load_global_model(
+        args.global_checkpoint, args.dataset, device
+    )
     base_state = {
         key: value.detach().cpu().clone() for key, value in base_model.state_dict().items()
     }
@@ -606,9 +753,12 @@ def run_mode(args, device):
             "Probe/global mismatch: probe was fitted for "
             f"{recorded_global}, but run requested {expected_global}."
         )
-    heads = build_heads(
-        probe["head_dimensions"], probe["heads_state_dict"], device
-    )
+    heads = None
+    if args.metrics in ("all", "logits", "logits_cka"):
+        heads = build_heads(
+            probe["head_dimensions"], probe["heads_state_dict"],
+            args.num_classes, device
+        )
     global_reference = probe["global_reference_metrics"]
 
     clients = []
@@ -631,19 +781,26 @@ def run_mode(args, device):
             pin_memory=device.type == "cuda", generator=loader_generator,
         )
 
-        model = multi_resnet18_kd(num_classes=100, in_channels=3).to(device)
+        model = multi_resnet18_kd(
+            num_classes=args.num_classes, in_channels=3
+        ).to(device)
         model.load_state_dict(base_state, strict=True)
         training = train_teacher_only(model, local_loader, args, device)
         model.eval()
-        post_metrics = evaluate_internal_metrics(model, heads, reference_loader, device)
+        post_metrics = evaluate_internal_metrics(
+            model, heads, reference_loader, args.num_classes, args.metrics, device
+        )
         deltas = selected_deltas(post_metrics, global_reference)
 
         local_labels = dataset_targets(train_dataset)[indices]
-        counts = np.bincount(local_labels, minlength=100)
+        counts = np.bincount(local_labels, minlength=args.num_classes)
         clients.append({
             "client_id": int(client_id),
             "client_seed": int(client_seed),
             "subset_seed": int(subset_seed),
+            "subset_indices_sha256": hashlib.sha256(
+                np.ascontiguousarray(indices, dtype=np.int64).tobytes()
+            ).hexdigest(),
             "sampling_scheme": "iid_nested_prefix_without_replacement_within_client",
             "local_samples": int(args.sample_size),
             "observed_classes": int(np.count_nonzero(counts)),
@@ -654,12 +811,21 @@ def run_mode(args, device):
             "postlocal_metrics": post_metrics,
             "delta_from_round_start_global": deltas,
         })
+        progress_metric = ""
+        if "logits" in post_metrics:
+            progress_metric = (
+                " depth_inconsistency="
+                f"{post_metrics['logits']['depth_summary']['depth_semantic_inconsistency_mean']:.4f}"
+            )
+        elif "cka" in post_metrics:
+            progress_metric = (
+                " mean_pairwise_cka="
+                f"{post_metrics['cka']['depth_summary']['off_diagonal_linear_cka_mean']:.4f}"
+            )
         print(
             f"client={client_id:02d} n={args.sample_size} "
             f"steps={training['optimizer_steps']} "
-            f"loss={training['loss_per_example']:.4f} "
-            f"depth_inconsistency="
-            f"{post_metrics['logits']['depth_summary']['depth_semantic_inconsistency_mean']:.4f}",
+            f"loss={training['loss_per_example']:.4f}{progress_metric}",
             flush=True,
         )
         model.to("cpu")
@@ -671,10 +837,18 @@ def run_mode(args, device):
         "format_version": 1,
         "experiment": "within_client_local_data_size_probe",
         "research_axis": "within_client_across_depths",
+        "dataset": args.dataset,
+        "num_classes": int(args.num_classes),
+        "metrics": args.metrics,
         "global_checkpoint": expected_global,
         "global_round": int(global_checkpoint.get("round", -1)),
+        "global_completed_rounds": int(
+            global_checkpoint.get(
+                "completed_rounds", int(global_checkpoint.get("round", -1)) + 1
+            )
+        ),
         "probe_checkpoint": os.path.abspath(args.probe_checkpoint),
-        "reference_split": "official_cifar100_test",
+        "reference_split": f"official_{args.dataset}_test",
         "reference_test_samples": int(reference_count),
         "sample_size": int(args.sample_size),
         "sampling_seed": int(args.seed),

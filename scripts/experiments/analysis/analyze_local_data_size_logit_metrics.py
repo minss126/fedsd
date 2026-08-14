@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-DEPTH_PAIRS = ("b1-b2", "b1-b3", "b1-final", "b2-b3", "b2-final", "b3-final")
+DEPTH_PAIRS = ("b1-b2", "b1-b3", "b2-b3", "b1-final", "b2-final", "b3-final")
 SETTINGS = (
     ("fixed_step", "Fixed step", "logs/analysis/logs_local_data_size_internal_probe"),
     ("fixed_epoch", "Fixed epoch", "logs/analysis/logs_local_data_size_internal_probe_epochs"),

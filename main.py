@@ -1636,6 +1636,12 @@ def get_args():
     parser.add_argument('--save_final_ckpt', action='store_true',
                         help='Save the final global-model checkpoint after the last communication round.')
     parser.add_argument(
+        '--save_global_ckpt_rounds', default='',
+        help='Comma-separated completed-round counts at which to save the global model. '
+             'For example, 0,10,50,100 saves initialization and the models after '
+             '10, 50, and 100 aggregations.',
+    )
+    parser.add_argument(
         '--save_final_client_ckpts', action='store_true',
         help='Save a deterministic subset of post-local client models from the final round for offline probes.',
     )
@@ -1881,6 +1887,45 @@ def main():
 
     # 가중치 복사 (Base -> Global)
     global_model.load_state_dict(base_global_model.state_dict())
+
+    checkpoint_rounds = set()
+    raw_checkpoint_rounds = str(
+        getattr(args, 'save_global_ckpt_rounds', '') or ''
+    ).strip()
+    if raw_checkpoint_rounds:
+        for token in raw_checkpoint_rounds.split(','):
+            completed_rounds = int(token.strip())
+            if completed_rounds < 0 or completed_rounds > int(args.round):
+                raise ValueError(
+                    '--save_global_ckpt_rounds values must be between 0 and '
+                    f'--round={args.round}; got {completed_rounds}.'
+                )
+            checkpoint_rounds.add(completed_rounds)
+
+    def save_global_round_checkpoint(completed_rounds, accuracy=None):
+        ckpt_dir = args.ckpt_dir if args.ckpt_dir is not None else args.logdir
+        checkpoint_path = os.path.join(
+            ckpt_dir, f'{log_file_name}_round{int(completed_rounds):04d}.pt'
+        )
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        checkpoint = {
+            # Retain the historical zero-based round field while recording the
+            # unambiguous number of completed aggregations separately.
+            'round': int(completed_rounds) - 1,
+            'completed_rounds': int(completed_rounds),
+            'accuracy': None if accuracy is None else float(accuracy),
+            'checkpoint_role': 'aggregated_global_after_completed_rounds',
+            'args': _args_snapshot(args),
+            'global_model': global_model.state_dict(),
+        }
+        torch.save(checkpoint, checkpoint_path)
+        logger.info(
+            f'Saved global checkpoint after {completed_rounds} completed rounds: '
+            f'{checkpoint_path}'
+        )
+
+    if 0 in checkpoint_rounds:
+        save_global_round_checkpoint(0)
     
     ema_model = None
     if getattr(args, "use_ema_teacher", False):
@@ -2481,6 +2526,10 @@ def main():
 
         # 로그 출력
         logger.info(f"Round {round} result: Acc={test_acc_global:.2f}, Loss={test_loss:.4f}, Best={best_accuracy:.2f}")
+
+        completed_rounds = int(round) + 1
+        if completed_rounds in checkpoint_rounds:
+            save_global_round_checkpoint(completed_rounds, test_acc_global)
         
         if len(test_branches) > 1:
             logger.info(f" └─ [Branch Acc] B1(Shallow):{test_branches[0]:.2f}% | B2:{test_branches[1]:.2f}% | B3:{test_branches[2]:.2f}% | Teacher:{test_branches[3]:.2f}%")

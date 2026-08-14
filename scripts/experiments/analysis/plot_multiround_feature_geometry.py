@@ -18,10 +18,13 @@ import numpy as np
 
 
 DEPTHS = ("b1", "b2", "b3", "final")
-DEPTH_PAIRS = tuple(
-    f"{DEPTHS[left]}-{DEPTHS[right]}"
-    for left in range(len(DEPTHS))
-    for right in range(left + 1, len(DEPTHS))
+DEPTH_PAIRS = (
+    "b1-b2",
+    "b1-b3",
+    "b2-b3",
+    "b1-final",
+    "b2-final",
+    "b3-final",
 )
 METRICS = (
     ("within_class_variance", "Within-class variance"),
