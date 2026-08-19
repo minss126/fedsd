@@ -2739,6 +2739,13 @@ def main():
             args.logdir, log_file_name + geometry_suffix
         )
         geometry_temp_path = f"{geometry_result_path}.tmp.{os.getpid()}"
+        if isinstance(client_datasets, dict):
+            geometry_client_datasets = [
+                client_datasets[client_id]
+                for client_id in sorted(client_datasets)
+            ]
+        else:
+            geometry_client_datasets = list(client_datasets)
         geometry_payload = {
             "experiment": (
                 "multi_round_within_client_postlocal_internal_geometry"
@@ -2747,9 +2754,11 @@ def main():
             ),
             "args": _args_snapshot(args),
             "global_train_samples": int(len(global_train_dataset)),
-            "client_train_sizes": [int(len(dataset)) for dataset in client_datasets],
+            "client_train_sizes": [
+                int(len(dataset)) for dataset in geometry_client_datasets
+            ],
             "active_client_train_samples": int(
-                sum(len(dataset) for dataset in client_datasets)
+                sum(len(dataset) for dataset in geometry_client_datasets)
             ),
             "client_data_overlap": "disjoint_across_clients",
             "client_data_nesting": (

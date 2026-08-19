@@ -20,7 +20,7 @@ DATASETS=(${DATASETS_OVERRIDE:-cifar10 cifar100})
 SAMPLE_SIZES=(${SAMPLE_SIZES_OVERRIDE:-100 500 2500})
 SEEDS=(${SEEDS_OVERRIDE:-0 1 2})
 BUDGETS=(${BUDGETS_OVERRIDE:-fixed_step fixed_epoch})
-N_CLIENTS="${N_CLIENTS:-20}"
+TOTAL_TRAIN_SAMPLES="${TOTAL_TRAIN_SAMPLES:-50000}"
 ROUNDS="${ROUNDS:-100}"
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-5}"
 LOCAL_STEPS="${LOCAL_STEPS:-100}"
@@ -32,8 +32,6 @@ BATCH_SIZE="${BATCH_SIZE:-50}"
 TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-512}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 
-# With interval=ROUNDS, main.py measures the first local update and the final
-# local update.  The final record is the primary endpoint.
 GEOMETRY_INTERVAL="${GEOMETRY_INTERVAL:-$ROUNDS}"
 GEOMETRY_CLIENT_COUNT="${GEOMETRY_CLIENT_COUNT:-0}"
 GEOMETRY_REFERENCE_BATCHES="${GEOMETRY_REFERENCE_BATCHES:-0}"
@@ -43,24 +41,26 @@ PROBE_WEIGHT_DECAY="${PROBE_WEIGHT_DECAY:-5e-4}"
 PROBE_BATCH_SIZE="${PROBE_BATCH_SIZE:-512}"
 PROBE_SAMPLES_PER_CLASS="${PROBE_SAMPLES_PER_CLASS:-0}"
 
-OUTPUT_ROOT="${OUTPUT_ROOT:-logs/analysis/logs_end_to_end_local_n_fl}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-logs/analysis/logs_end_to_end_kn_matched_fl}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
-echo "========== End-to-end local-n FedAvg motivation =========="
+echo "========== End-to-end K/n-matched FedAvg motivation =========="
 echo "gpus=${GPUS[*]}"
-echo "datasets=${DATASETS[*]}, K=${N_CLIENTS}, rounds=${ROUNDS}, seeds=${SEEDS[*]}"
-echo "local sample sizes=${SAMPLE_SIZES[*]} (disjoint client pools; nested within client across n)"
+echo "datasets=${DATASETS[*]}, rounds=${ROUNDS}, seeds=${SEEDS[*]}"
+echo "local sample sizes=${SAMPLE_SIZES[*]}; mapping: n=100/K=500, n=500/K=100, n=2500/K=20"
+echo "every condition uses 50,000 unique IID samples with full participation"
 echo "budgets=${BUDGETS[*]}: fixed_step=${LOCAL_STEPS}, fixed_epoch=${LOCAL_EPOCHS}"
-echo "trajectory=independent from round 0 for every dataset/budget/n/seed condition"
 echo "LR=cosine over ${ROUNDS} rounds, lr=${LR}, eta_min=${ETA_MIN}"
 echo "measurement=first and final post-local/pre-aggregation models, all selected clients"
-echo "metrics=frozen-probe logits + cross-depth linear CKA on full official test set"
-echo "probe=trajectory-specific round-start heads fitted on full official train set"
-echo "estimated clean 4-GPU wall time: about 18-32 hours for both budgets/datasets/3 seeds"
-echo "fixed-epoch only estimate: about 9-15 hours"
+echo "time: fixed-epoch ~30-55h; both budgets ~14-26d"
+echo "memory-safe queue: ${GPUS[0]} serializes K>=500; other GPUs run K<500"
+
+"$PYTHON_BIN" scripts/experiments/analysis/recover_end_to_end_local_n_geometry.py \
+    --output_root "$OUTPUT_ROOT"
 
 run_job() {
     local gpu=$1 dataset=$2 budget=$3 sample_size=$4 seed=$5
+    local n_clients=$((TOTAL_TRAIN_SAMPLES / sample_size))
     local setting="${dataset}/${budget}/sample_${sample_size}/seed_${seed}"
     local method="teacher_only_end_to_end_local_n"
     local run_dir="${OUTPUT_ROOT}/${setting}"
@@ -80,11 +80,11 @@ run_job() {
         return 1
     fi
 
-    echo "[GPU ${gpu}] start ${dataset} ${budget} n=${sample_size} seed=${seed}"
+    echo "[GPU ${gpu}] start ${dataset} ${budget} K=${n_clients} n=${sample_size} seed=${seed}"
     "$PYTHON_BIN" main.py \
         --dataset "$dataset" --datadir ./data \
         --model resnet18_byot --alg fedavg --partition iid \
-        --n_clients "$N_CLIENTS" --sample_fraction 1.0 \
+        --n_clients "$n_clients" --sample_fraction 1.0 \
         --client_samples_per_client "$sample_size" \
         --client_keep_last_batch \
         --round "$ROUNDS" --epochs "$LOCAL_EPOCHS" \
@@ -109,7 +109,7 @@ run_job() {
         --logdir "$OUTPUT_ROOT" --log_file_name "${setting}/${method}" \
         "${step_flags[@]}" \
         > "$terminal_log" 2>&1
-    echo "[GPU ${gpu}] done ${dataset} ${budget} n=${sample_size} seed=${seed}"
+    echo "[GPU ${gpu}] done ${dataset} ${budget} K=${n_clients} n=${sample_size} seed=${seed}"
 }
 
 run_queue() {
@@ -123,8 +123,6 @@ run_queue() {
     done
 }
 
-# Greedy scheduling by approximate local optimizer steps.  A whole FL
-# trajectory remains on one GPU; only independent conditions run in parallel.
 declare -a QUEUES LOADS
 for ((index = 0; index < NUM_GPUS; index++)); do
     QUEUES[$index]=""
@@ -136,12 +134,14 @@ trap 'rm -f "$jobs_file"' EXIT
 for dataset in "${DATASETS[@]}"; do
     for budget in "${BUDGETS[@]}"; do
         for sample_size in "${SAMPLE_SIZES[@]}"; do
+            n_clients=$((TOTAL_TRAIN_SAMPLES / sample_size))
+            if [ $((n_clients * sample_size)) -ne "$TOTAL_TRAIN_SAMPLES" ]; then echo "invalid K*n mapping" >&2; exit 1; fi
             for seed in "${SEEDS[@]}"; do
                 if [ "$budget" = "fixed_step" ]; then
-                    weight=$((N_CLIENTS * LOCAL_STEPS * ROUNDS))
+                    weight=$((n_clients * LOCAL_STEPS * ROUNDS))
                 else
                     batches=$(((sample_size + BATCH_SIZE - 1) / BATCH_SIZE))
-                    weight=$((N_CLIENTS * batches * LOCAL_EPOCHS * ROUNDS))
+                    weight=$((n_clients * batches * LOCAL_EPOCHS * ROUNDS))
                 fi
                 printf '%012d|%s|%s|%s|%s\n' \
                     "$weight" "$dataset" "$budget" "$sample_size" "$seed" >> "$jobs_file"
@@ -152,10 +152,15 @@ done
 
 job_count=0
 while IFS='|' read -r weight dataset budget sample_size seed; do
-    min_index=0
-    for ((index = 1; index < NUM_GPUS; index++)); do
-        if [ "${LOADS[$index]}" -lt "${LOADS[$min_index]}" ]; then min_index=$index; fi
-    done
+    job_n_clients=$((TOTAL_TRAIN_SAMPLES / sample_size))
+    if [ "$job_n_clients" -ge 500 ]; then
+        min_index=0
+    else
+        min_index=1
+        for ((index = 2; index < NUM_GPUS; index++)); do
+            if [ "${LOADS[$index]}" -lt "${LOADS[$min_index]}" ]; then min_index=$index; fi
+        done
+    fi
     numeric_weight=$((10#$weight))
     QUEUES[$min_index]+="${dataset}|${budget}|${sample_size}|${seed}"$'\n'
     LOADS[$min_index]=$((LOADS[$min_index] + numeric_weight))
@@ -185,4 +190,4 @@ for dataset in "${DATASETS[@]}"; do
     done
 done
 
-echo "Completed ${job_count} independent local-n FL trajectories under ${OUTPUT_ROOT}"
+echo "Completed ${job_count} independent K/n-matched FL trajectories under ${OUTPUT_ROOT}"
