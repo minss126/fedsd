@@ -2110,6 +2110,10 @@ def main():
         'byot_effective_alpha_mean': [],
         'byot_effective_alpha_min': [],
         'byot_effective_alpha_max': [],
+        # Raw selected-client values for client-wise lambda diagnostics.
+        # Each list item is one round, keyed by integer client id.
+        'byot_effective_alpha_client_stats': [],
+        'byot_client_reliability_stats': [],
         # Optional prediction-entropy decomposition diagnostics.  Each item
         # stores the selected clients' raw b/u/d values for one round.
         'byot_prediction_entropy_client_stats': [],
@@ -2414,6 +2418,12 @@ def main():
         pkl_dict['byot_effective_alpha_mean'].append(avg_byot_alpha_mean)
         pkl_dict['byot_effective_alpha_min'].append(avg_byot_alpha_min)
         pkl_dict['byot_effective_alpha_max'].append(avg_byot_alpha_max)
+        pkl_dict['byot_effective_alpha_client_stats'].append(
+            getattr(args, "_last_client_byot_alpha_stats", {})
+        )
+        pkl_dict['byot_client_reliability_stats'].append(
+            getattr(args, "_last_round_client_reliability_proxy_stats", {})
+        )
         client_proxy_stats = getattr(args, "_last_round_client_skew_proxy_stats", {})
         pkl_dict['byot_prediction_entropy_client_stats'].append(client_proxy_stats)
         if client_proxy_stats:

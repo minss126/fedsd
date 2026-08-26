@@ -864,6 +864,7 @@ def weighted_byot_kd_loss(student_logits, teacher_prob, sample_alpha, temperatur
 def estimate_client_byot_alpha(net, train_dataloader, device, args, fallback_alpha):
     proxy = getattr(args, "byot_client_proxy", "none")
     if proxy == "none":
+        args._last_client_reliability_proxy_stats = None
         return fallback_alpha
 
     alpha_min = float(getattr(args, "byot_client_alpha_min", 0.01))
@@ -898,12 +899,20 @@ def estimate_client_byot_alpha(net, train_dataloader, device, args, fallback_alp
         net.train()
 
     if total_count == 0:
+        args._last_client_reliability_proxy_stats = None
         return fallback_alpha
 
-    reliability = _clamp_unit(total_score / total_count)
+    raw_reliability = _clamp_unit(total_score / total_count)
     reliability_power = max(float(getattr(args, "byot_client_reliability_power", 1.0)), 1e-8)
-    reliability = reliability ** reliability_power
+    reliability = raw_reliability ** reliability_power
     client_alpha = alpha_min + (alpha_max - alpha_min) * reliability
+    args._last_client_reliability_proxy_stats = {
+        "proxy": proxy,
+        "raw_reliability": float(raw_reliability),
+        "reliability": float(reliability),
+        "mapped_scale": float(client_alpha),
+        "sample_count": int(total_count),
+    }
     if getattr(args, "byot_client_alpha_mode", "map") == "multiply":
         return fallback_alpha * client_alpha
     return client_alpha
@@ -4339,6 +4348,7 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     total_byot_alpha_min = 0.0
     total_byot_alpha_max = 0.0
     client_byot_alpha_stats = {}
+    client_reliability_proxy_stats = {}
     client_skew_proxy_stats = {}
     total_correct_conf = 0.0
     total_zero_kd = 0.0 
@@ -4363,6 +4373,7 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
         # scratch value, even when diagnostics are disabled, so stale runtime
         # state can never become a recursively nested round statistic.
         args._last_client_skew_proxy_stats = None
+        args._last_client_reliability_proxy_stats = None
         start_time = time.time() # [NEW] 로컬 클라이언트 학습 시작 시간 기록
         net.train()
         
@@ -4542,6 +4553,9 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
             "min": float(byot_alpha_min),
             "max": float(byot_alpha_max),
         }
+        reliability_stats = getattr(args, "_last_client_reliability_proxy_stats", None)
+        if reliability_stats is not None:
+            client_reliability_proxy_stats[int(net_id)] = dict(reliability_stats)
         proxy_stats = getattr(args, "_last_client_skew_proxy_stats", None)
         if proxy_stats is not None:
             client_skew_proxy_stats[int(net_id)] = dict(proxy_stats)
@@ -4572,7 +4586,9 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     avg_byot_alpha_max = total_byot_alpha_max / num_clients
     avg_entropy = total_entropy / num_clients
     args._last_client_byot_alpha_stats = client_byot_alpha_stats
+    args._last_round_client_reliability_proxy_stats = client_reliability_proxy_stats
     args._last_round_client_skew_proxy_stats = client_skew_proxy_stats
+    args._last_client_reliability_proxy_stats = None
     args._last_client_skew_proxy_stats = None
     args._last_train_branch_frequency_stats = finalize_train_branch_freq_stats(total_branch_freq_stats)
     
