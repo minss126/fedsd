@@ -379,6 +379,46 @@ class ResNetCifar10(nn.Module):
 
         return features, y
 
+    def forward_fedmlb_features(self, x):
+        """Return the five local prefix endpoints used by FedMLB.
+
+        The endpoints match the official FedMLB ResNet decomposition:
+        stem, layer1, layer2, layer3, and layer4.  The ordinary final logits
+        are returned separately.  This method is intentionally kept on the
+        plain CIFAR ResNet so FedMLB does not acquire BYOT's private exits or
+        their communication payload.
+        """
+        out0 = self.relu(self.bn1(self.conv1(x)))
+        out1 = self.layer1(out0)
+        out2 = self.layer2(out1)
+        out3 = self.layer3(out2)
+        out4 = self.layer4(out3)
+        features = torch.flatten(self.avgpool(out4), 1)
+        logits = self.fc(features)
+        return (out0, out1, out2, out3, out4), logits
+
+    def forward_fedmlb_suffix(self, feature, level):
+        """Run a frozen global suffix from one FedMLB prefix endpoint.
+
+        ``level`` is one-based, following the official implementation:
+        1 starts after the stem and 5 starts after layer4.  Although the
+        global parameters are frozen, autograd must remain enabled so the
+        hybrid loss can propagate through the suffix into the local prefix.
+        """
+        if level < 1 or level > 5:
+            raise ValueError(f"FedMLB suffix level must be in [1, 5], got {level}.")
+        out = feature
+        if level <= 1:
+            out = self.layer1(out)
+        if level <= 2:
+            out = self.layer2(out)
+        if level <= 3:
+            out = self.layer3(out)
+        if level <= 4:
+            out = self.layer4(out)
+        out = torch.flatten(self.avgpool(out), 1)
+        return self.fc(out)
+
     def forward(self, x):
         return self._forward_impl(x)
 

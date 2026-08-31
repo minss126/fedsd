@@ -6,7 +6,176 @@ import numpy as np
 import torch.nn.functional as F
 import copy
 import time
+import random
 from torch.cuda.amp import autocast, GradScaler
+
+
+UPDATE_STEP_GROUPS = (
+    "all",
+    "shared_teacher",
+    "stem",
+    "layer1",
+    "layer2",
+    "layer3",
+    "layer4",
+    "teacher_head",
+    "branch_private",
+)
+
+
+def _update_step_parameter_groups(name):
+    """Return the diagnostic groups containing one named parameter."""
+    groups = ["all"]
+    if name.startswith(("conv1.", "bn1.")):
+        groups.extend(("shared_teacher", "stem"))
+    elif name.startswith("layer1."):
+        groups.extend(("shared_teacher", "layer1"))
+    elif name.startswith("layer2."):
+        groups.extend(("shared_teacher", "layer2"))
+    elif name.startswith("layer3."):
+        groups.extend(("shared_teacher", "layer3"))
+    elif name.startswith("layer4."):
+        groups.extend(("shared_teacher", "layer4"))
+    elif name.startswith("fc."):
+        groups.extend(("shared_teacher", "teacher_head"))
+    elif any(token in name for token in ("bottleneck", "middle_fc", "downsample")):
+        groups.append("branch_private")
+    return groups
+
+
+def _install_update_step_tracker(optimizer, model, client_id, args):
+    """Wrap ``optimizer.step`` and record one-step parameter displacements.
+
+    FedPart does not publish a formula for Figure 1. Its public model-distance
+    helper sums the L2 norm of each parameter tensor, which is retained here as
+    ``fedpart_l2sum``. Conventional global L2, relative L2, gradient L2, and LR
+    are recorded alongside it so optimizer and scale effects remain separable.
+    """
+    if not getattr(args, "log_update_step_size", False):
+        return None
+
+    named_parameters = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    original_step = optimizer.step
+    records = []
+    pending_common_ce = None
+
+    def stage_common_ce(loss):
+        """Measure Final-CE gradients without changing the actual optimizer step."""
+        nonlocal pending_common_ce
+        if not getattr(args, "log_update_step_common_ce", False):
+            return
+        shared = [
+            (name, parameter)
+            for name, parameter in named_parameters
+            if "shared_teacher" in _update_step_parameter_groups(name)
+        ]
+        gradients = torch.autograd.grad(
+            loss,
+            [parameter for _, parameter in shared],
+            retain_graph=True,
+            allow_unused=True,
+        )
+        accumulators = {
+            group: {"l2_sq": 0.0, "l2sum": 0.0}
+            for group in UPDATE_STEP_GROUPS
+        }
+        for (name, _), gradient in zip(shared, gradients):
+            if gradient is None:
+                continue
+            tensor_l2 = float(torch.linalg.vector_norm(gradient.detach().float()).item())
+            for group in _update_step_parameter_groups(name):
+                accumulators[group]["l2_sq"] += tensor_l2 * tensor_l2
+                accumulators[group]["l2sum"] += tensor_l2
+        pending_common_ce = {
+            group: {
+                "common_ce_gradient_l2": float(math.sqrt(max(0.0, values["l2_sq"]))),
+                "common_ce_gradient_l2sum": float(values["l2sum"]),
+            }
+            for group, values in accumulators.items()
+            if values["l2_sq"] > 0.0
+        }
+
+    optimizer._stage_update_step_common_ce = stage_common_ce
+
+    def tracked_step(*step_args, **step_kwargs):
+        nonlocal pending_common_ce
+        active = [
+            (name, parameter, parameter.detach().clone())
+            for name, parameter in named_parameters
+            if parameter.grad is not None
+        ]
+        accumulators = {
+            group: {
+                "fedpart_l2sum": 0.0,
+                "l2_sq": 0.0,
+                "parameter_l2_sq": 0.0,
+                "gradient_l2_sq": 0.0,
+                "parameter_tensors": 0,
+            }
+            for group in UPDATE_STEP_GROUPS
+        }
+
+        for name, parameter, before in active:
+            parameter_sq = float(torch.sum(before.float() * before.float()).item())
+            gradient = parameter.grad.detach()
+            gradient_sq = float(torch.sum(gradient.float() * gradient.float()).item())
+            for group in _update_step_parameter_groups(name):
+                stats = accumulators[group]
+                stats["parameter_l2_sq"] += parameter_sq
+                stats["gradient_l2_sq"] += gradient_sq
+                stats["parameter_tensors"] += 1
+
+        result = original_step(*step_args, **step_kwargs)
+
+        with torch.no_grad():
+            for name, parameter, before in active:
+                delta = parameter.detach() - before
+                tensor_l2 = float(torch.linalg.vector_norm(delta.float()).item())
+                delta_sq = tensor_l2 * tensor_l2
+                for group in _update_step_parameter_groups(name):
+                    stats = accumulators[group]
+                    stats["fedpart_l2sum"] += tensor_l2
+                    stats["l2_sq"] += delta_sq
+
+        finalized = {}
+        for group, stats in accumulators.items():
+            if stats["parameter_tensors"] == 0:
+                continue
+            l2 = math.sqrt(max(0.0, stats["l2_sq"]))
+            parameter_l2 = math.sqrt(max(0.0, stats["parameter_l2_sq"]))
+            gradient_l2 = math.sqrt(max(0.0, stats["gradient_l2_sq"]))
+            finalized[group] = {
+                "fedpart_l2sum": float(stats["fedpart_l2sum"]),
+                "l2": float(l2),
+                "relative_l2": float(l2 / max(parameter_l2, 1e-12)),
+                "gradient_l2": float(gradient_l2),
+                "parameter_l2": float(parameter_l2),
+                "parameter_tensors": int(stats["parameter_tensors"]),
+            }
+            if pending_common_ce is not None and group in pending_common_ce:
+                finalized[group].update(pending_common_ce[group])
+
+        records.append({
+            "client_id": int(client_id),
+            "local_step": int(len(records)),
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "groups": finalized,
+        })
+        pending_common_ce = None
+        return result
+
+    optimizer.step = tracked_step
+    return records
+
+
+def _stage_update_step_common_ce(optimizer, loss):
+    stage = getattr(optimizer, "_stage_update_step_common_ce", None)
+    if stage is not None:
+        stage(loss)
 
 from algs.decorr import FedDecorrLoss
 from algs.fedrcl import RCLloss
@@ -1008,7 +1177,8 @@ def fedavg(net, train_dataloader, optimizer, device, args):
             features, out = unpack_model_output(raw_out)
 
         loss = criterion(out, target)
-            
+        _stage_update_step_common_ce(optimizer, loss)
+
         if getattr(args, 'use_sd', False):
             loss += compute_sd_loss(raw_out, target, device, args)
             
@@ -1041,6 +1211,89 @@ def fedavg(net, train_dataloader, optimizer, device, args):
 
     net.zero_grad()
 
+    return total_loss / max(1, completed_steps)
+
+
+def fedmlb(net, global_model, train_dataloader, optimizer, device, args):
+    """FedMLB local update using local prefixes and frozen global suffixes.
+
+    This is a method-matched port of the official objective into the current
+    FL pipeline.  The round-start ``global_model`` is already frozen by
+    ``main.py``.  We deliberately do not wrap the suffix forwards in
+    ``torch.no_grad``: their parameters stay fixed, but gradients must pass
+    through them to the trainable local prefix endpoints.
+    """
+    required = ("forward_fedmlb_features", "forward_fedmlb_suffix")
+    if any(not hasattr(net, name) for name in required):
+        raise ValueError("--alg fedmlb requires --model resnet18.")
+    if any(not hasattr(global_model, name) for name in required):
+        raise ValueError("FedMLB global model does not expose the required suffix forward.")
+
+    main_weight = float(getattr(args, "fedmlb_main_ce_weight", 1.0))
+    hybrid_ce_weight = float(getattr(args, "fedmlb_hybrid_ce_weight", 1.0))
+    hybrid_kd_weight = float(getattr(args, "fedmlb_hybrid_kd_weight", 1.0))
+    temperature = float(getattr(args, "fedmlb_temperature", 1.0))
+    select_level = int(getattr(args, "fedmlb_select_level", -1))
+    grad_clip = float(getattr(args, "fedmlb_grad_clip", 10.0))
+    if temperature <= 0.0:
+        raise ValueError("--fedmlb_temperature must be positive.")
+    if select_level < -1 or select_level > 4:
+        raise ValueError("--fedmlb_select_level must be -1 or one of 0,1,2,3,4.")
+
+    criterion = nn.CrossEntropyLoss().to(device)
+    total_loss = 0.0
+    completed_steps = 0
+    net.train()
+    global_model.eval()
+
+    for _ in range(args.epochs):
+        for x, target in train_dataloader:
+            x, target = x.to(device), target.to(device).long()
+            optimizer.zero_grad()
+
+            local_features, local_logits = net.forward_fedmlb_features(x)
+            hybrid_logits = []
+            for level_index, local_feature in enumerate(local_features):
+                if select_level != -1 and select_level != level_index:
+                    continue
+                hybrid_logits.append(
+                    global_model.forward_fedmlb_suffix(local_feature, level_index + 1)
+                )
+
+            if not hybrid_logits:
+                raise RuntimeError("FedMLB produced no active hybrid pathway.")
+
+            main_ce = criterion(local_logits, target)
+            _stage_update_step_common_ce(optimizer, main_ce)
+            hybrid_ce = sum(criterion(logits, target) for logits in hybrid_logits)
+            hybrid_ce = hybrid_ce / len(hybrid_logits)
+
+            # Match the official implementation: KL(hybrid || local), with
+            # both distributions left in the graph and without an extra T^2
+            # multiplier.
+            hybrid_kd = sum(
+                F.kl_div(
+                    F.log_softmax(local_logits / temperature, dim=1),
+                    F.softmax(logits / temperature, dim=1),
+                    reduction="batchmean",
+                )
+                for logits in hybrid_logits
+            ) / len(hybrid_logits)
+
+            loss = (
+                main_weight * main_ce
+                + hybrid_ce_weight * hybrid_ce
+                + hybrid_kd_weight * hybrid_kd
+            )
+            loss.backward()
+            if grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
+            optimizer.step()
+
+            total_loss += float(loss.item())
+            completed_steps += 1
+
+    net.zero_grad()
     return total_loss / max(1, completed_steps)
 
 def fedrs(net, train_dataloader, optimizer, device, args):
@@ -1517,19 +1770,40 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
     student_temperature = _branch_kd_temperature(args, "byot_branch_kd_student_temperature")
     proxy_temperature = _byot_proxy_temperature(args)
     kd_loss_scale = _branch_kd_loss_scale(student_temperature, args)
-    base_alpha = get_effective_byot_alpha(train_dataloader, args)
-    alpha = estimate_client_byot_alpha(net, train_dataloader, device, args, base_alpha)
-    skew_reliability = estimate_client_skew_reliability(net, train_dataloader, device, args)
-    alpha *= get_client_skew_scale_from_reliability(skew_reliability, args)
-    lambda_gate = get_byot_lambda_granularity_gate(skew_reliability, args)
-    lambda_gate_enabled = getattr(args, "byot_lambda_gate_mode", "none") != "none"
-    class_alpha = estimate_class_byot_alpha(net, train_dataloader, device, args, alpha)
+    preserve_proxy_rng = bool(getattr(args, "preserve_byot_proxy_rng", False))
+    if preserve_proxy_rng:
+        python_rng_state = random.getstate()
+        numpy_rng_state = np.random.get_state()
+        torch_rng_state = torch.get_rng_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state(device)
+            if device.type == "cuda" and torch.cuda.is_available()
+            else None
+        )
+    try:
+        base_alpha = get_effective_byot_alpha(train_dataloader, args)
+        alpha = estimate_client_byot_alpha(net, train_dataloader, device, args, base_alpha)
+        skew_reliability = estimate_client_skew_reliability(net, train_dataloader, device, args)
+        alpha *= get_client_skew_scale_from_reliability(skew_reliability, args)
+        lambda_gate = get_byot_lambda_granularity_gate(skew_reliability, args)
+        lambda_gate_enabled = getattr(args, "byot_lambda_gate_mode", "none") != "none"
+        class_alpha = estimate_class_byot_alpha(net, train_dataloader, device, args, alpha)
+        active_branch_indices, branch_entropy_norm = get_byot_gated_active_branch_indices(
+            train_dataloader, args
+        )
+    finally:
+        if preserve_proxy_rng:
+            random.setstate(python_rng_state)
+            np.random.set_state(numpy_rng_state)
+            torch.set_rng_state(torch_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, device)
+
     branch_objective = getattr(args, "byot_branch_objective", "blend")
     branch_gradient_mode = getattr(args, "byot_branch_gradient_mode", "attached")
     branch_alphas = get_byot_branch_alphas(args, device)
     if branch_objective == "kd_only" and branch_alphas is not None:
         raise ValueError("--byot_branch_alphas is not supported with --byot_branch_objective kd_only.")
-    active_branch_indices, branch_entropy_norm = get_byot_gated_active_branch_indices(train_dataloader, args)
     beta = args.byot_beta
     
     criterion_ce = nn.CrossEntropyLoss().to(device)
@@ -1585,6 +1859,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                 
                 # 1. Main Loss (Teacher)
                 loss_main = criterion_ce(output, target)
+                _stage_update_step_common_ce(optimizer, loss_main)
                 
                 # 2. Student CE Loss
                 ce_branch_losses = [
@@ -4354,6 +4629,7 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     total_zero_kd = 0.0 
     total_kd_std = 0.0  
     total_branch_freq_stats = init_train_branch_freq_stats() if getattr(args, "log_train_branch_frequency_stats", False) else {}
+    args._last_round_update_step_records = []
     
     # [NEW] 시간 및 연산 효율 측정을 위한 누적 변수
     total_time = 0.0
@@ -4386,6 +4662,10 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
         elif args.optimizer == 'sgd':
             optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()),
                                   lr=lr, momentum=args.momentum, weight_decay=args.reg)
+
+        update_step_records = _install_update_step_tracker(
+            optimizer, net, net_id, args
+        )
 
         # [NEW] 기본값 설정
         ratio, rfd, feat_ratio, entropy = 1.0, 0.0, 1.0, 0.0
@@ -4453,6 +4733,16 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
             loss, wall_clock_time, compute_efficiency, correct_conf, zero_kd_classes, kd_std, entropy = fedbyot_rs_greedy(net, global_model, prev_net, dataloaders[net_id], optimizer, device, args)
             ratio = compute_efficiency
             
+        elif args.alg == 'fedmlb':
+            if dataloaders[net_id] is None:
+                print(f"[-] Client {net_id} has no data. Skipping FedMLB training.")
+                loss = 0.0
+            else:
+                loss = fedmlb(
+                    net, global_model, dataloaders[net_id], optimizer, device, args
+                )
+            wall_clock_time = time.time() - start_time
+
         elif args.alg == 'fedavg' or args.alg == 'fedavgM' or args.alg == 'fedag' or args.alg == 'fedadam' or args.alg == 'fedexp' or args.alg == 'flocora':
             if dataloaders[net_id] is None:
                 print(f"[-] Client {net_id} has no data. Skipping local training.")
@@ -4572,6 +4862,9 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
             # completed model back to CPU is safe and bounds GPU memory by one
             # client model even under 100-client full participation.
             net.to('cpu')
+
+        if update_step_records is not None:
+            args._last_round_update_step_records.extend(update_step_records)
 
     num_clients = len(nets)
     avg_loss = total_loss / num_clients

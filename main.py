@@ -57,6 +57,41 @@ def _args_snapshot(args):
     }
 
 
+def _initialize_paired_resnet_shared_path(model, seed):
+    """Deterministically initialize the common ResNet path by module name.
+
+    FedMLB uses a plain ResNet while the adaptive method adds private exits.
+    Normal sequential initialization would let those extra modules perturb the
+    RNG position (especially before ``fc``).  Name-specific generators give
+    both methods identical stem/layer1-4/fc initial parameters without
+    changing the private-exit initialization or the process RNG state.
+    """
+    shared_prefixes = ("conv1", "bn1", "layer1", "layer2", "layer3", "layer4", "fc")
+    for module_name, module in model.named_modules():
+        if not any(
+            module_name == prefix or module_name.startswith(prefix + ".")
+            for prefix in shared_prefixes
+        ):
+            continue
+        if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+            digest = hashlib.sha256(
+                f"dxfl-paired-resnet|{int(seed)}|{module_name}".encode("utf-8")
+            ).digest()
+            module_seed = int.from_bytes(digest[:8], "little") % (2**63 - 1)
+            generator = torch.Generator(device=module.weight.device)
+            generator.manual_seed(module_seed)
+            torch.nn.init.kaiming_normal_(
+                module.weight, mode="fan_in", nonlinearity="relu", generator=generator
+            )
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, (torch.nn.BatchNorm2d, torch.nn.GroupNorm)):
+            if module.weight is not None:
+                torch.nn.init.ones_(module.weight)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+
 def _extract_dataset_targets(dataset):
     """Return labels for a dataset or a torch Subset-style wrapper."""
     if hasattr(dataset, 'indices') and hasattr(dataset, 'dataset'):
@@ -215,6 +250,81 @@ def compute_client_update_drift(old_w, nets_this_round, fed_avg_freqs, layerwise
                     None if stats is None else stats[stat_name]
                 )
         return metrics
+
+
+def summarize_update_step_records(round_index, records):
+    """Macro-average optimizer-step diagnostics across participating clients."""
+    if not records:
+        return None
+
+    step_indices = sorted({int(record["local_step"]) for record in records})
+    step_summaries = []
+    for local_step in step_indices:
+        current = [
+            record for record in records
+            if int(record["local_step"]) == local_step
+        ]
+        group_names = sorted({
+            group
+            for record in current
+            for group in record.get("groups", {})
+        })
+        groups = {}
+        for group in group_names:
+            metric_names = sorted({
+                metric
+                for record in current
+                for metric in record.get("groups", {}).get(group, {})
+                if metric != "parameter_tensors"
+            })
+            metrics = {}
+            for metric in metric_names:
+                values = np.asarray([
+                    record["groups"][group][metric]
+                    for record in current
+                    if group in record.get("groups", {})
+                    and metric in record["groups"][group]
+                ], dtype=np.float64)
+                if values.size:
+                    metrics[metric] = {
+                        "mean": float(values.mean()),
+                        "std": float(values.std(ddof=1)) if values.size > 1 else 0.0,
+                        "count": int(values.size),
+                    }
+            groups[group] = metrics
+
+        learning_rates = np.asarray([record["lr"] for record in current], dtype=np.float64)
+        step_summaries.append({
+            "local_step": int(local_step),
+            "client_count": int(len(current)),
+            "lr_mean": float(learning_rates.mean()),
+            "groups": groups,
+        })
+
+    first_to_last = {}
+    if step_summaries:
+        first = step_summaries[0]["groups"]
+        last = step_summaries[-1]["groups"]
+        for group in sorted(set(first).intersection(last)):
+            first_to_last[group] = {}
+            for metric in sorted(set(first[group]).intersection(last[group])):
+                first_value = float(first[group][metric]["mean"])
+                last_value = float(last[group][metric]["mean"])
+                first_to_last[group][metric] = {
+                    "first": first_value,
+                    "last": last_value,
+                    "ratio": float(first_value / max(last_value, 1e-12)),
+                    "delta": float(first_value - last_value),
+                }
+
+    return {
+        "round": int(round_index),
+        "client_ids": sorted({int(record["client_id"]) for record in records}),
+        "client_count": int(len({int(record["client_id"]) for record in records})),
+        "local_step_count_max": int(max(step_indices) + 1),
+        "step_summaries": step_summaries,
+        "first_to_last": first_to_last,
+    }
 
 def _flatten_current_grads(model):
     grads = []
@@ -1456,6 +1566,12 @@ def get_args():
     parser.add_argument('--dataset', default='cifar10', help='dataset used for training')
     parser.add_argument('--model', default='resnet50', help='neural network used in training')
     parser.add_argument('--group_norm', action='store_true', help='replace batch_norm with group_norm')
+    parser.add_argument('--paired_resnet_init', action='store_true',
+                        help='Initialize the common ResNet stem/layers/fc identically by name across '
+                             'plain FedMLB and BYOT-shaped models for paired method comparisons.')
+    parser.add_argument('--paired_execution_rng', action='store_true',
+                        help='Reset Python/NumPy/Torch RNGs after method-specific model construction so '
+                             'paired methods begin client sampling and dataloader iteration identically.')
     # batchnorm -> groupnorm. 켜도되고 안켜도 되는데, groupnorm이 더 좋다는 연구결과가 있는데 꼭 그렇지는 않더라구요
     parser.add_argument('--num_groups', type=int, default=8, help='num of groups in group_norm')
     # group_norm의 groups
@@ -1565,6 +1681,19 @@ def get_args():
     ## FedDecorr
     parser.add_argument('--feddecorr', action='store_true')
     parser.add_argument('--feddecorr_coef', type=float, default=0.1)
+    ## FedMLB
+    parser.add_argument('--fedmlb_main_ce_weight', type=float, default=1.0,
+                        help='FedMLB weight for the ordinary all-local final CE loss.')
+    parser.add_argument('--fedmlb_hybrid_ce_weight', type=float, default=1.0,
+                        help='FedMLB weight for the mean hybrid-path CE loss.')
+    parser.add_argument('--fedmlb_hybrid_kd_weight', type=float, default=1.0,
+                        help='FedMLB weight for the mean hybrid-to-local KL loss.')
+    parser.add_argument('--fedmlb_temperature', type=float, default=1.0,
+                        help='Temperature in the FedMLB hybrid/local KL term.')
+    parser.add_argument('--fedmlb_select_level', type=int, default=-1,
+                        help='Use one FedMLB hybrid level in [0,4]; -1 uses all five levels.')
+    parser.add_argument('--fedmlb_grad_clip', type=float, default=10.0,
+                        help='FedMLB local gradient-norm clipping threshold; <=0 disables clipping.')
     ## FedRCL
     parser.add_argument('--tau_rcl', default=0.05, type=float)
     parser.add_argument('--threshold_rcl', default=0.7, type=float)
@@ -1674,6 +1803,9 @@ def get_args():
     parser.add_argument('--byot_proxy_temperature', type=float, default=1.0,
                         help='Temperature used only to measure BYOT reliability/skew proxies. '
                              'It is independent of branch-KD and MOON temperatures; 1.0 uses native logits.')
+    parser.add_argument('--preserve_byot_proxy_rng', action='store_true',
+                        help='Restore dataloader/augmentation RNG state after BYOT reliability proxy passes, '
+                             'keeping the subsequent optimizer-batch stream paired with baselines.')
     parser.add_argument('--byot_client_skew_proxy', default='none',
                         choices=['none', 'prediction_entropy', 'prediction_mutual_info', 'prediction_js_global',
                                  'label_entropy', 'label_js_global', 'max_concentration'],
@@ -1783,6 +1915,22 @@ def get_args():
                              'branch-private modules, and the teacher head.')
     parser.add_argument('--drift_log_interval', type=int, default=1,
                         help='Log client drift every N rounds when --log_client_drift is enabled.')
+    parser.add_argument(
+        '--log_update_step_size', action='store_true',
+        help=(
+            'Record every local optimizer-step displacement. Stores the '
+            'FedPart-style sum of per-tensor L2 norms plus conventional L2, '
+            'relative L2, gradient L2, and per-block controls.'
+        ),
+    )
+    parser.add_argument(
+        '--log_update_step_common_ce', action='store_true',
+        help=(
+            'With --log_update_step_size, additionally measure the shared '
+            'Final-CE gradient at every local state. This common-objective '
+            'control separates layer compatibility from KD loss scaling.'
+        ),
+    )
     parser.add_argument('--log_gradient_probe', action='store_true',
                         help='Probe CE/KD/combined gradient dissimilarity before local training.')
     parser.add_argument('--gradient_probe_interval', type=int, default=50,
@@ -2002,8 +2150,22 @@ def main():
         base_global_model = init_net(global_train_dataset, 1, args, device, True)[0]
         global_model = init_net(global_train_dataset, 1, args, device)[0]
 
+    if getattr(args, "paired_resnet_init", False):
+        if args.model not in ("resnet18", "resnet18_byot"):
+            raise ValueError("--paired_resnet_init supports resnet18 and resnet18_byot only.")
+        _initialize_paired_resnet_shared_path(base_global_model, args.seed)
+        logger.info("Applied deterministic name-paired initialization to the shared ResNet path.")
+
     # 가중치 복사 (Base -> Global)
     global_model.load_state_dict(base_global_model.state_dict())
+
+    if getattr(args, "paired_execution_rng", False):
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        logger.info("Reset execution RNGs after model construction for paired method comparison.")
 
     checkpoint_rounds = set()
     raw_checkpoint_rounds = str(
@@ -2055,9 +2217,39 @@ def main():
 
     moment_first, moment_second = fl_utils.init_server_optimizers(global_model)
 
+    model_parameter_count = int(sum(parameter.numel() for parameter in global_model.parameters()))
+    model_trainable_parameter_count = int(
+        sum(parameter.numel() for parameter in global_model.parameters() if parameter.requires_grad)
+    )
+    model_state_bytes = int(
+        sum(tensor.numel() * tensor.element_size() for tensor in global_model.state_dict().values())
+    )
+    selected_clients_per_round = max(int(args.sample_fraction * args.n_clients), 1)
+    # One full model download and one full model upload per selected client.
+    communication_bytes_per_round = int(
+        2 * selected_clients_per_round * model_state_bytes
+    )
+    device_name = (
+        torch.cuda.get_device_name(device)
+        if device.type == 'cuda' and torch.cuda.is_available()
+        else str(device)
+    )
+    logger.info(
+        "Cost metadata: "
+        f"params={model_parameter_count}, state_bytes={model_state_bytes}, "
+        f"selected_clients={selected_clients_per_round}, "
+        f"bidirectional_bytes_per_round={communication_bytes_per_round}"
+    )
+
     # [수정] 효율성(efficiency) 저장을 위한 리스트 추가
     pkl_dict = {
         'args': _args_snapshot(args),
+        'model_parameter_count': model_parameter_count,
+        'model_trainable_parameter_count': model_trainable_parameter_count,
+        'model_state_bytes': model_state_bytes,
+        'selected_clients_per_round': selected_clients_per_round,
+        'communication_bytes_per_round': communication_bytes_per_round,
+        'device_name': device_name,
         'avg_train_loss': [],
         'test_loss': [],
         'efficiency': [],
@@ -2067,6 +2259,7 @@ def main():
         'ece': [],          
         'branch_acc': [],   
         'round_time': [],   # 이 줄을 새로 추가
+        'peak_gpu_memory_bytes': [],
         'client_update_norm': [],
         'client_update_norm_sq': [],
         'client_mean_update_norm': [],
@@ -2124,6 +2317,10 @@ def main():
         # Sparse multi-round records. Each entry contains the round-start
         # global geometry, raw post-local client geometries, and client macros.
         'postlocal_feature_geometry': [],
+        # Sparse round records containing client-macro optimizer-step
+        # displacement trajectories. Populated only with
+        # --log_update_step_size to keep ordinary result files compact.
+        'update_step_size_rounds': [],
         'max': 0, 'avg_10': 0, 'avg_30': 0, 'avg_50': 0
     }
     for group in LAYERWISE_UPDATE_GROUPS:
@@ -2148,6 +2345,8 @@ def main():
     for round in range(args.round):
         args.current_round = round
         logger.info(f'round:{round}')
+        if device.type == 'cuda' and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
         t0 = time.time()
 
         # 1. 클라이언트 랜덤 선택 (이중 루프 제거함)
@@ -2373,6 +2572,25 @@ def main():
             avg_byot_alpha_min = avg_byot_alpha_mean
             avg_byot_alpha_max = avg_byot_alpha_mean
 
+        if getattr(args, "log_update_step_size", False):
+            step_record = summarize_update_step_records(
+                round,
+                getattr(args, "_last_round_update_step_records", []),
+            )
+            if step_record is not None:
+                pkl_dict["update_step_size_rounds"].append(step_record)
+                primary = (
+                    step_record.get("first_to_last", {})
+                    .get("shared_teacher", {})
+                    .get("fedpart_l2sum", {})
+                )
+                logger.info(
+                    "Update-step size (shared teacher, FedPart L2-sum): "
+                    f"first={primary.get('first', float('nan')):.6f}, "
+                    f"last={primary.get('last', float('nan')):.6f}, "
+                    f"first/last={primary.get('ratio', float('nan')):.4f}"
+                )
+
         if should_measure_postlocal_geometry:
             geometry_record = compute_postlocal_feature_geometry_record(
                 round,
@@ -2573,6 +2791,11 @@ def main():
         t1 = time.time()
         logger.info(f'1 Round train time: {t1 -t0} | Efficiency: {avg_ratio:.4f}')
         pkl_dict['round_time'].append(t1 - t0)
+        if device.type == 'cuda' and torch.cuda.is_available():
+            peak_gpu_memory_bytes = int(torch.cuda.max_memory_allocated(device))
+        else:
+            peak_gpu_memory_bytes = 0
+        pkl_dict['peak_gpu_memory_bytes'].append(peak_gpu_memory_bytes)
 
         # 글로벌 모델 업데이트 및 평가
         global_model.load_state_dict(global_w)

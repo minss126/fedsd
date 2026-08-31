@@ -1,0 +1,19 @@
+section,dataset,setting,partition,method,last_window_accuracy,source
+Model (IID),CIFAR-100,ResNet18,IID,Plain,70.33600000000001,logs/reliability/logs_iid_fedavg_compare/iid/fedavg/plain_baseline.pkl
+Model (IID),CIFAR-100,ResNet18,IID,Fixed \lambda=0.3,72.679,logs/lambda/analysis/logs_cifar100_fixed_lambda_t1_compact/iid/fedavg/fixed_lambda0p30_tkd1p00.pkl
+Model (IID),CIFAR-100,ResNet18,IID,Adaptive,72.21,logs/lambda/adaptive/logs_soft_adaptive_tuning_stage1/iid/fedavg/soft_b_tkd1p00_lmax1p00_warm250_tau0p85.pkl
+Model (IID),CIFAR-100,MobileNetV2,IID,Plain,60.698666666666654,logs/lambda/adaptive/logs_extension_completion/mobilenet/iid/fedavg/plain_r500.pkl
+Model (IID),CIFAR-100,MobileNetV2,IID,Fixed \lambda=0.3,61.72733333333333,logs/lambda/adaptive/logs_extension_fixed_lambda_competitors/mobilenet/iid/fedavg/fixed_lambda0p30_tkd1p00_r500.pkl
+Model (IID),CIFAR-100,MobileNetV2,IID,Adaptive,62.16466666666666,logs/lambda/adaptive/logs_extension_completion/mobilenet/iid/fedavg/soft_b_tkd1p00_lmax1p00_warm250_tau0p85_r500.pkl
+Model (IID),TinyImageNet,ResNet18,IID,Plain,41.297999999999995,logs/lambda/adaptive/logs_extension_completion/tinyimagenet/iid/fedavg/plain_r100.pkl
+Model (IID),TinyImageNet,ResNet18,IID,Fixed \lambda=0.3,45.582,logs/lambda/adaptive/logs_extension_fixed_lambda_competitors/tinyimagenet/iid/fedavg/fixed_lambda0p30_tkd1p00_r100.pkl
+Model (IID),TinyImageNet,ResNet18,IID,Adaptive,46.15066666666667,logs/lambda/adaptive/logs_extension_short_horizon_warmup50/tinyimagenet/iid/fedavg/soft_b_tkd1p00_lmax1p00_warm50_tau0p85_r100.pkl
+Model (IID),TinyImageNet,MobileNetV2,IID,Plain,31.30766666666667,logs/lambda/adaptive/logs_final_extension_matrix/model/mobilenet/tinyimagenet/iid/mobilenet/plain_r100.pkl
+Model (IID),TinyImageNet,MobileNetV2,IID,Fixed \lambda=0.3,29.56666666666667,logs/lambda/adaptive/logs_final_extension_matrix/model/mobilenet/tinyimagenet/iid/mobilenet/fixed_lambda0p30_tkd1p00_r100.pkl
+Model (IID),TinyImageNet,MobileNetV2,IID,Adaptive,30.279333333333334,logs/lambda/adaptive/logs_final_extension_matrix/model/mobilenet/tinyimagenet/iid/mobilenet/soft_b_tkd1p00_lmax1p00_warm50_tau0p85_r100.pkl
+Model (IID),ImageNet100-64,ResNet18,IID,Plain,56.794,logs/lambda/adaptive/logs_extension_completion/imagenet100_64/iid/fedavg/plain_r100.pkl
+Model (IID),ImageNet100-64,ResNet18,IID,Fixed \lambda=0.3,61.620000000000005,logs/lambda/adaptive/logs_extension_fixed_lambda_competitors/imagenet100_64/iid/fedavg/fixed_lambda0p30_tkd1p00_r100.pkl
+Model (IID),ImageNet100-64,ResNet18,IID,Adaptive,61.68733333333333,logs/lambda/adaptive/logs_extension_short_horizon_warmup50/imagenet100_64/iid/fedavg/soft_b_tkd1p00_lmax1p00_warm50_tau0p85_r100.pkl
+Model (IID),ImageNet100-64,MobileNetV2,IID,Plain,45.311333333333316,logs/lambda/adaptive/logs_final_extension_matrix/model/mobilenet/imagenet100_64/iid/mobilenet/plain_r100.pkl
+Model (IID),ImageNet100-64,MobileNetV2,IID,Fixed \lambda=0.3,43.69733333333334,logs/lambda/adaptive/logs_final_extension_matrix/model/mobilenet/imagenet100_64/iid/mobilenet/fixed_lambda0p30_tkd1p00_r100.pkl
+Model (IID),ImageNet100-64,MobileNetV2,IID,Adaptive,44.62466666666666,logs/lambda/adaptive/logs_final_extension_matrix/model/mobilenet/imagenet100_64/iid/mobilenet/soft_b_tkd1p00_lmax1p00_warm50_tau0p85_r100.pkl

@@ -20,8 +20,8 @@ import numpy as np
 
 
 PARTITIONS = (
-    ("iid", "IID", "#2563eb"),
-    ("beta_0.1", r"$\beta=0.1$", "#dc2626"),
+    ("iid", "IID", "#244A73"),
+    ("beta_0.1", r"$\beta=0.1$", "#9E3D46"),
 )
 
 
@@ -135,12 +135,13 @@ def main() -> None:
     plt.rcParams.update(
         {
             "font.family": "DejaVu Sans",
-            "font.size": 11,
-            "axes.titlesize": 16,
-            "axes.labelsize": 12,
+            "font.size": 10,
+            "axes.titlesize": 14,
+            "axes.labelsize": 11,
         }
     )
-    fig, ax = plt.subplots(figsize=(8.4, 6.2), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(7.6, 3.65))
+    fig.subplots_adjust(left=0.15, right=0.97, bottom=0.23, top=0.82)
 
     distributions = []
     labels = []
@@ -148,14 +149,15 @@ def main() -> None:
     rows_in_order = []
     for _, (label, color, rows) in partition_rows.items():
         distributions.append(np.asarray([row["mean_effective_lambda"] for row in rows]))
-        labels.append(f"{label}\n({len(rows)} observed clients)")
+        labels.append(f"{label}\n$n={len(rows)}$")
         colors.append(color)
         rows_in_order.append(rows)
 
     box = ax.boxplot(
         distributions,
-        positions=np.arange(1, len(distributions) + 1),
-        widths=0.46,
+        positions=np.arange(len(distributions), 0, -1),
+        widths=0.38,
+        vert=False,
         patch_artist=True,
         showfliers=False,
         medianprops={"color": "white", "linewidth": 2.0},
@@ -167,70 +169,76 @@ def main() -> None:
         patch.set_alpha(0.72)
         patch.set_edgecolor(color)
 
-    for position, (values, rows, color) in enumerate(
-        zip(distributions, rows_in_order, colors), start=1
+    positions = np.arange(len(distributions), 0, -1)
+    for position, values, rows, color in zip(
+        positions, distributions, rows_in_order, colors
     ):
         client_ids = np.asarray([row["client_id"] for row in rows], dtype=np.uint32)
         # Deterministic client-id jitter keeps the plot reproducible.
         jitter = ((client_ids * 2654435761 % 1009) / 1008.0 - 0.5) * 0.34
         ax.scatter(
-            position + jitter,
             values,
-            s=22,
+            position + jitter,
+            s=16,
             color=color,
-            alpha=0.48,
+            alpha=0.42,
             edgecolor="white",
             linewidth=0.35,
             zorder=3,
         )
         mean_value = float(np.mean(values))
         ax.scatter(
-            position,
             mean_value,
+            position,
             marker="D",
-            s=62,
+            s=48,
             color="#111827",
             edgecolor="white",
             linewidth=0.8,
             zorder=4,
         )
         ax.text(
-            position + 0.27,
             mean_value,
-            f"mean={mean_value:.3f}",
+            position + 0.18,
+            f"{mean_value:.3f}",
             va="center",
             ha="left",
-            fontsize=9.5,
+            fontsize=8.5,
             color="#111827",
         )
 
-    ax.set_title(f"CIFAR-100: Client-wise Effective $\lambda$ Distribution")
-    ax.set_ylabel(f"Per-client mean effective $\lambda$ over last {args.window} rounds")
-    ax.set_xticks(np.arange(1, len(labels) + 1), labels)
-    ax.set_xlim(0.45, len(labels) + 0.65)
-    ax.set_ylim(bottom=0)
-    ax.grid(axis="y", color="#cbd5e1", linewidth=0.8, alpha=0.7)
+    ax.set_title("CIFAR-100: Client-wise Effective $\lambda$ Distribution", pad=9)
+    ax.set_xlabel(f"Mean effective $\lambda$ over last {args.window} rounds")
+    ax.set_yticks(positions, labels)
+    combined = np.concatenate(distributions)
+    lower = float(np.min(combined))
+    upper = float(np.max(combined))
+    span = max(upper - lower, 0.05)
+    ax.set_xlim(max(0.0, lower - 0.07 * span), upper + 0.11 * span)
+    ax.set_ylim(0.55, len(labels) + 0.45)
+    ax.grid(axis="x", color="#cbd5e1", linewidth=0.8, alpha=0.7)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.text(
-        0.01,
-        0.015,
-        "Each point is one client; diamond denotes the client-macro mean.\n"
-        "Clients not selected during the window are omitted.",
-        transform=ax.transAxes,
-        ha="left",
+        0.5,
+        0.035,
+        "Points: observed clients; diamonds: client-macro means.",
+        transform=fig.transFigure,
+        ha="center",
         va="bottom",
-        fontsize=8.5,
-        color="#64748b",
+        fontsize=8,
+        color="#4B5563",
     )
 
     stem = args.output_dir / "cifar100_client_effective_lambda_last30"
     fig.savefig(stem.with_suffix(".png"), dpi=300, bbox_inches="tight")
     fig.savefig(stem.with_suffix(".pdf"), bbox_inches="tight")
+    fig.savefig(stem.with_suffix(".svg"), bbox_inches="tight")
     plt.close(fig)
 
     print(f"PNG: {stem.with_suffix('.png')}")
     print(f"PDF: {stem.with_suffix('.pdf')}")
+    print(f"SVG: {stem.with_suffix('.svg')}")
     print(f"CSV: {csv_path}")
     for partition, (label, _, rows) in partition_rows.items():
         values = [row["mean_effective_lambda"] for row in rows]
