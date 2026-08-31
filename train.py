@@ -1268,14 +1268,18 @@ def fedmlb(net, global_model, train_dataloader, optimizer, device, args):
             hybrid_ce = sum(criterion(logits, target) for logits in hybrid_logits)
             hybrid_ce = hybrid_ce / len(hybrid_logits)
 
-            # Match the official implementation: KL(hybrid || local), with
-            # both distributions left in the graph and without an extra T^2
-            # multiplier.
+            # Match the official objective: KL(hybrid || local), with both
+            # distributions left in the graph and without an extra T^2
+            # multiplier.  ``log_target=True`` is mathematically identical to
+            # passing softmax(hybrid) as the target, but avoids a non-finite
+            # target gradient when a low-probability class underflows to
+            # exactly zero in float32.
             hybrid_kd = sum(
                 F.kl_div(
                     F.log_softmax(local_logits / temperature, dim=1),
-                    F.softmax(logits / temperature, dim=1),
+                    F.log_softmax(logits / temperature, dim=1),
                     reduction="batchmean",
+                    log_target=True,
                 )
                 for logits in hybrid_logits
             ) / len(hybrid_logits)
@@ -1287,7 +1291,16 @@ def fedmlb(net, global_model, train_dataloader, optimizer, device, args):
             )
             loss.backward()
             if grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
+                torch.nn.utils.clip_grad_norm_(
+                    net.parameters(), grad_clip, error_if_nonfinite=True
+                )
+            elif not all(
+                parameter.grad is None or torch.isfinite(parameter.grad).all()
+                for parameter in net.parameters()
+            ):
+                raise FloatingPointError(
+                    "FedMLB produced a non-finite gradient with gradient clipping disabled."
+                )
             optimizer.step()
 
             total_loss += float(loss.item())

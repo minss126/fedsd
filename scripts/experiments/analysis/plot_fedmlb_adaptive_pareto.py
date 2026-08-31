@@ -53,6 +53,14 @@ def load_result(path):
         raise ValueError(
             f"{path}: acc_global has {len(accuracy)} rounds but round_time has {len(round_time)}."
         )
+    train_loss = np.asarray(result.get("avg_train_loss", []), dtype=np.float64)
+    if (
+        not np.isfinite(accuracy).all()
+        or not np.isfinite(round_time).all()
+        or len(train_loss) != len(accuracy)
+        or not np.isfinite(train_loss).all()
+    ):
+        raise ValueError(f"{path} contains a non-finite or incomplete training trajectory.")
     peak_memory = np.asarray(
         result.get("peak_gpu_memory_bytes", np.zeros_like(round_time)), dtype=np.float64
     )

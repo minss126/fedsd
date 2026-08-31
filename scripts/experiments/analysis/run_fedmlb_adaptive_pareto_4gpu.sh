@@ -111,7 +111,22 @@ target_accuracies() {
 has_completed_result() {
     local log_file="$1" result_file="$2"
     [[ -f "$log_file" && -f "$result_file" ]] \
-        && grep -q "Round $((ROUNDS - 1)) result" "$log_file"
+        && grep -q "Round $((ROUNDS - 1)) result" "$log_file" \
+        && "$PYTHON_BIN" -c '
+import math, pickle, sys
+with open(sys.argv[1], "rb") as handle:
+    result = pickle.load(handle)
+rounds = int(sys.argv[2])
+accuracy = result.get("acc_global", [])
+loss = result.get("avg_train_loss", [])
+valid = (
+    len(accuracy) == rounds
+    and len(loss) == rounds
+    and all(math.isfinite(float(value)) for value in accuracy)
+    and all(math.isfinite(float(value)) for value in loss)
+)
+raise SystemExit(0 if valid else 1)
+' "$result_file" "$ROUNDS"
 }
 
 run_job() {
