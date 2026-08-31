@@ -6,8 +6,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 GPUS=(${GPUS_OVERRIDE:-0 1 2 3})
-if [[ "${#GPUS[@]}" -ne 4 ]]; then
-    echo "This launcher expects exactly four GPUs; received: ${GPUS[*]}" >&2
+EXPECTED_GPU_COUNT="${EXPECTED_GPU_COUNT:-4}"
+NUM_GPUS="${#GPUS[@]}"
+if [[ "$NUM_GPUS" -ne "$EXPECTED_GPU_COUNT" ]]; then
+    echo "This launcher expects exactly ${EXPECTED_GPU_COUNT} GPUs; received: ${GPUS[*]}" >&2
     exit 1
 fi
 
@@ -68,7 +70,7 @@ if command -v nvidia-smi >/dev/null 2>&1; then
             break
         fi
     done
-    if [[ "${#gpu_names[@]}" -eq 4 ]]; then
+    if [[ "${#gpu_names[@]}" -eq "$NUM_GPUS" ]]; then
         unique_gpu_count="$(printf '%s\n' "${gpu_names[@]}" | sort -u | wc -l)"
     else
         unique_gpu_count=0
@@ -214,29 +216,36 @@ echo "paired initialization=identical shared stem/layer1-4/fc for each seed"
 echo "FedMLB=5 local-prefix/frozen-global-suffix paths, CE+KL weights=${FEDMLB_MAIN_CE}/${FEDMLB_HYBRID_CE}/${FEDMLB_HYBRID_KD}"
 echo "Adaptive=selected reliability-aware soft-b KD"
 echo "outputs=accuracy-vs-round, accuracy-vs-GPU-hours, accuracy-vs-communication"
-echo "estimated clean CIFAR-100 R=500 4-GPU wall time: about 18-36 hours"
+if [[ "$NUM_GPUS" -eq 2 ]]; then
+    echo "estimated clean CIFAR-100 R=500 2-GPU wall time: about 30-60 hours"
+else
+    echo "estimated clean CIFAR-100 R=500 4-GPU wall time: about 18-36 hours"
+fi
 
-# The three expensive FedMLB seeds occupy GPUs 0-2.  Adaptive jobs are
-# distributed so the extra queue length roughly balances FedMLB's heavier
-# hybrid-path computation.
-queues=("" "" "" "")
+# Place all expensive FedMLB jobs first, then continue the same round-robin
+# cursor for adaptive jobs.  With two GPUs and three seeds this yields
+# [F0,F2,A1] versus [F1,A0,A2], which is substantially better balanced than
+# assigning one method per GPU.
+queues=()
+for ((index = 0; index < NUM_GPUS; index++)); do
+    queues[$index]=""
+done
 job_index=0
 for dataset in "${DATASETS[@]}"; do
     for seed in "${SEEDS[@]}"; do
-        gpu_index=$((job_index % 3))
+        gpu_index=$((job_index % NUM_GPUS))
         queues[$gpu_index]+="${dataset}|fedmlb|${seed}"$'\n'
         job_index=$((job_index + 1))
     done
-    adaptive_index=0
     for seed in "${SEEDS[@]}"; do
-        gpu_index=$(((adaptive_index + 3) % 4))
+        gpu_index=$((job_index % NUM_GPUS))
         queues[$gpu_index]+="${dataset}|adaptive|${seed}"$'\n'
-        adaptive_index=$((adaptive_index + 1))
+        job_index=$((job_index + 1))
     done
 done
 
 pids=()
-for index in 0 1 2 3; do
+for ((index = 0; index < NUM_GPUS; index++)); do
     if [[ -n "${queues[$index]}" ]]; then
         run_queue "${GPUS[$index]}" "${queues[$index]}" &
         pids+=("$!")
