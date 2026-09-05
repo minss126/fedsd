@@ -1631,8 +1631,17 @@ def get_args():
     )
     parser.add_argument('--beta', type=float, default=0.3, help='The parameter for the dirichlet distribution for data partitioning')
     # noniid 조절, 작을수록 noniid
-    parser.add_argument('--min_require_size', type=int, default=64, help='the minimum number of data for each client')
-    # 클라이언트마다 최소 데이터 요구량. 데이터를 분배할때 noniid 세팅에선 클라이언트마다 데이터수가 다르기 때문에, 모든 클라이언트가 최소 사이즈를 가지도록 partition을 반복. 2000번 반복해보고 안되면 임의로 분배. partition_data 참조
+    parser.add_argument(
+        '--min_require_size', type=int, default=10,
+        help=(
+            'Minimum client sample count accepted by non-IID Dirichlet '
+            'partitioning. The partition is redrawn until every client meets '
+            'this value; failed draws are never repaired by redistribution.'
+        ),
+    )
+    # non-IID Dirichlet 분할에서 모든 클라이언트가 이 값 이상의 샘플을
+    # 가질 때까지 partition 전체를 다시 생성한다. 분포를 훼손하는 강제
+    # 재분배는 수행하지 않으며, retry 한도 초과 시 명시적으로 실패한다.
     parser.add_argument('--unavailability', default='stationary', help='stationary, non-stationary, non-stationary-failure')
     # 클라이언트의 FL참여를 조절. stationary가 일반적, non-stationary는 클라이언트들이 라운드마다 불규칙하게 참여
     parser.add_argument('--sample_fraction', type=float, default=0.1, help='how many clients are sampled in each round')

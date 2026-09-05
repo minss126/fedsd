@@ -451,12 +451,9 @@ def partition_data(global_train_dataset, args, logger):
                 proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
                 idx_batch = [idx_j + idx.tolist() for idx_j, idx in zip(idx_batch, np.split(idx_k, proportions))]
                 
-                # min_size 계산 전 idx_batch가 비어있는지 확인
-                current_sizes = [len(idx_j) for idx_j in idx_batch if len(idx_j) > 0]
-                if not current_sizes:
-                    min_size = 0
-                else:
-                    min_size = min(current_sizes)
+                # Empty clients must count as size zero.  Ignoring them here can
+                # incorrectly accept a partition that violates min_require_size.
+                min_size = min(len(idx_j) for idx_j in idx_batch)
 
             shuffle_counts += 1
             if shuffle_counts == 2000:
@@ -465,47 +462,14 @@ def partition_data(global_train_dataset, args, logger):
         print(f'shuffle_counts: {shuffle_counts}')
 
         if min_size < args.min_require_size:
-            print(f"Partitioning failed to meet min_require_size after {shuffle_counts} shuffles. "
-                           f"Redistributing data to enforce min_size of {args.min_require_size}.")
-
-            # 1. 부족한 클라이언트와 여유있는 클라이언트 목록 생성
-            underfunded_clients = [i for i, idx in enumerate(idx_batch) if len(idx) < args.min_require_size]
-            overfunded_clients = [i for i, idx in enumerate(idx_batch) if len(idx) > args.min_require_size]
-            
-            # 데이터를 재분배할 풀(pool) 생성 (여유 클라이언트가 최소 사이즈 초과분만큼 기부)
-            data_pool = []
-            for donor_id in overfunded_clients:
-                available = len(idx_batch[donor_id]) - args.min_require_size
-                if available > 0:
-                    donated_indices = idx_batch[donor_id][-available:]
-                    idx_batch[donor_id] = idx_batch[donor_id][:-available]
-                    data_pool.extend(donated_indices)
-            
-            np.random.shuffle(data_pool) # 풀을 섞음
-
-            # 2. 부족한 클라이언트에게 데이터를 채워줌
-            for client_id in underfunded_clients:
-                needed = args.min_require_size - len(idx_batch[client_id])
-                if needed > 0:
-                    if len(data_pool) >= needed:
-                        taken_indices = data_pool[:needed]
-                        data_pool = data_pool[needed:]
-                        idx_batch[client_id].extend(taken_indices)
-                    else:
-                        # 풀에 데이터가 부족한 경우, 남은거라도 줌
-                        idx_batch[client_id].extend(data_pool)
-                        data_pool = []
-                        print(f"Warning: Data pool empty, client {client_id} might still be under min_size.")
-                        break # 풀이 비었으므로 종료
-        
-            # 만약 풀에 데이터가 남았다면, 다시 여유있는 클라이언트들에게 무작위 분배 (선택적)
-            if data_pool:
-                 print(f"Redistributing {len(data_pool)} remaining indices to overfunded clients.")
-                 overfunded_clients = [i for i, idx in enumerate(idx_batch) if len(idx) >= args.min_require_size]
-                 if overfunded_clients:
-                     split_indices = np.array_split(data_pool, len(overfunded_clients))
-                     for i, client_id in enumerate(overfunded_clients):
-                         idx_batch[client_id].extend(split_indices[i])
+            raise RuntimeError(
+                "Non-IID Dirichlet partitioning failed after "
+                f"{shuffle_counts} attempts: minimum client size={min_size}, "
+                f"required={args.min_require_size}. No redistribution fallback "
+                "was applied because it would alter the requested label "
+                "distribution. Try a larger beta, fewer clients, or a smaller "
+                "--min_require_size."
+            )
 
 
         for j in range(args.n_clients):
