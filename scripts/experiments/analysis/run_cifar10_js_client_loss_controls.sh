@@ -2,7 +2,9 @@
 
 # Paired CIFAR-10 beta=0.1 controls for diagnosing the JS-client result:
 #   1) feature_only: main CE + feature imitation, with branch CE/KD removed
-#   2) js_client_no_feature: existing soft-b + JS-client KD, with feature loss removed
+#   2) js_client_no_feature: existing soft-b + JS-client KD, without feature loss
+#   3) js_branch_no_feature: existing soft-b + branch-wise JS KD, without feature loss
+#   4) current_adaptive_no_feature: existing soft-b KD, without JS or feature loss
 #
 # These settings intentionally match run_kd_need_proxy_seed0_4gpu.sh so the
 # existing paired Plain and JS-client runs can be reused for comparison.
@@ -12,7 +14,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-GPUS=(${GPUS_OVERRIDE:-0 1})
+GPUS=(${GPUS_OVERRIDE:-0 1 2 3})
 if (( ${#GPUS[@]} == 0 )); then
     echo "Set GPUS_OVERRIDE to at least one GPU id." >&2
     exit 1
@@ -49,7 +51,7 @@ NEED_MIN_GATE="${NEED_MIN_GATE:-0.0}"
 WARMUP_ROUNDS="$(awk -v rounds="$ROUNDS" -v ratio="$WARMUP_RATIO" \
     'BEGIN { printf "%d", int(rounds * ratio + 0.5) }')"
 
-CONTROLS=(${CONTROLS_OVERRIDE:-feature_only js_client_no_feature})
+CONTROLS=(${CONTROLS_OVERRIDE:-feature_only js_client_no_feature js_branch_no_feature current_adaptive_no_feature})
 LOG_ROOT="${LOG_ROOT:-logs/analysis/logs_cifar10_js_client_loss_controls_seed0}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -105,7 +107,7 @@ run_job() {
                 --byot_beta "$FEATURE_BETA"
             )
             ;;
-        js_client_no_feature)
+        js_client_no_feature|js_branch_no_feature|current_adaptive_no_feature)
             cmd+=(
                 --byot_branch_objective kd_only --byot_beta 0.0
                 --byot_alpha "$LAMBDA_MAX"
@@ -120,11 +122,22 @@ run_job() {
                 --byot_client_skew_correction_mode soft_relax
                 --byot_client_skew_soft_tau "$SOFT_TAU"
                 --byot_client_skew_soft_temperature "$SOFT_TEMPERATURE"
-                --byot_branch_need_proxy js_client
-                --byot_branch_need_gain "$JS_GAIN"
-                --byot_branch_need_min_gate "$NEED_MIN_GATE"
-                --byot_branch_need_temperature "$PROXY_TEMPERATURE"
             )
+            if [[ "$control" == "js_client_no_feature" ]]; then
+                cmd+=(
+                    --byot_branch_need_proxy js_client
+                    --byot_branch_need_gain "$JS_GAIN"
+                    --byot_branch_need_min_gate "$NEED_MIN_GATE"
+                    --byot_branch_need_temperature "$PROXY_TEMPERATURE"
+                )
+            elif [[ "$control" == "js_branch_no_feature" ]]; then
+                cmd+=(
+                    --byot_branch_need_proxy js
+                    --byot_branch_need_gain "$JS_GAIN"
+                    --byot_branch_need_min_gate "$NEED_MIN_GATE"
+                    --byot_branch_need_temperature "$PROXY_TEMPERATURE"
+                )
+            fi
             ;;
         *)
             echo "Unknown control: $control" >&2
