@@ -623,6 +623,136 @@ def get_client_skew_scale(net, train_dataloader, device, args):
     reliability = estimate_client_skew_reliability(net, train_dataloader, device, args)
     return get_client_skew_scale_from_reliability(reliability, args)
 
+
+def estimate_client_branch_need_gates(net, train_dataloader, device, args):
+    """Estimate pre-local KD-need gates for the BYOT branches.
+
+    This is deliberately separate from teacher reliability. ``js`` measures
+    branch-specific predictive mismatch, while ``js_client`` averages that
+    mismatch over B1/B2/B3 and applies one shared client-wise gate to all three
+    branches. ``advantage`` measures the teacher's positive true-label
+    probability advantage, and ``combined`` requires both JS and advantage.
+    A method-specific calibration gain is applied before clipping to [min, 1].
+    The caller owns RNG preservation so this pass cannot change training order.
+    """
+    proxy = str(getattr(args, "byot_branch_need_proxy", "none") or "none")
+    if proxy == "none":
+        args._last_client_branch_need_stats = None
+        return None
+    if proxy not in {"constant", "js", "js_client", "advantage", "combined"}:
+        raise ValueError(f"Unknown --byot_branch_need_proxy: {proxy}")
+
+    temperature = float(getattr(args, "byot_branch_need_temperature", 0.0))
+    if temperature <= 0.0:
+        temperature = _byot_proxy_temperature(args)
+    gain = max(float(getattr(args, "byot_branch_need_gain", 1.0)), 0.0)
+    min_gate = _clamp_unit(getattr(args, "byot_branch_need_min_gate", 0.0))
+    if proxy == "constant":
+        gate_value = min(max(gain, min_gate), 1.0)
+        gates = torch.full((3,), gate_value, dtype=torch.float32, device=device)
+        args._last_client_branch_need_stats = {
+            "proxy": proxy,
+            "temperature": float(temperature),
+            "gain": float(gain),
+            "min_gate": float(min_gate),
+            "sample_count": 0,
+            **{f"raw_B{index + 1}": 1.0 for index in range(3)},
+            **{f"gate_B{index + 1}": float(gate_value) for index in range(3)},
+        }
+        return gates
+    was_training = bool(net.training)
+    net.eval()
+    score_sums = torch.zeros(3, dtype=torch.float64, device=device)
+    total = 0
+
+    try:
+        with torch.no_grad():
+            for x, target in train_dataloader:
+                x = x.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True).long()
+                out = net(x)
+                if not (isinstance(out, tuple) and len(out) == 8):
+                    raise ValueError(
+                        "--byot_branch_need_proxy requires a BYOT model with "
+                        "final/B1/B2/B3 logits."
+                    )
+                teacher_prob = F.softmax(out[0].float() / temperature, dim=1)
+                teacher_log = teacher_prob.clamp_min(1e-12).log()
+                teacher_y = teacher_prob.gather(1, target[:, None]).squeeze(1)
+                branch_scores = []
+                for branch_logits in out[1:4]:
+                    branch_prob = F.softmax(
+                        branch_logits.float() / temperature, dim=1
+                    )
+                    if proxy in {"js", "js_client", "combined"}:
+                        branch_log = branch_prob.clamp_min(1e-12).log()
+                        midpoint = 0.5 * (teacher_prob + branch_prob)
+                        midpoint_log = midpoint.clamp_min(1e-12).log()
+                        js = 0.5 * (
+                            (teacher_prob * (teacher_log - midpoint_log)).sum(dim=1)
+                            + (branch_prob * (branch_log - midpoint_log)).sum(dim=1)
+                        ) / math.log(2.0)
+                        js = js.clamp(0.0, 1.0)
+                    if proxy in {"advantage", "combined"}:
+                        branch_y = branch_prob.gather(
+                            1, target[:, None]
+                        ).squeeze(1)
+                        advantage = (teacher_y - branch_y).clamp_min(0.0)
+
+                    if proxy in {"js", "js_client"}:
+                        score = js
+                    elif proxy == "advantage":
+                        score = advantage
+                    else:
+                        score = js * advantage
+                    branch_scores.append(score)
+
+                score_sums += torch.stack(
+                    [score.double().sum() for score in branch_scores]
+                )
+                total += int(target.numel())
+    finally:
+        net.train(was_training)
+
+    if total <= 0:
+        args._last_client_branch_need_stats = None
+        return None
+
+    raw_scores = (score_sums / float(total)).float()
+    if proxy == "js_client":
+        # A single client-wise signal is intentionally shared across all exits.
+        # Averaging the three raw JS scores before applying the same calibrated
+        # gain also mean-matches this control to branch-wise JS whenever clipping
+        # is inactive.
+        client_raw_score = raw_scores.mean()
+        client_gate = (gain * client_raw_score).clamp(min=min_gate, max=1.0)
+        gates = client_gate.expand_as(raw_scores).clone()
+    else:
+        client_raw_score = None
+        client_gate = None
+        gates = (gain * raw_scores).clamp(min=min_gate, max=1.0)
+    args._last_client_branch_need_stats = {
+        "proxy": proxy,
+        "temperature": float(temperature),
+        "gain": float(gain),
+        "min_gate": float(min_gate),
+        "sample_count": int(total),
+        **{
+            f"raw_B{index + 1}": float(raw_scores[index].item())
+            for index in range(3)
+        },
+        **{
+            f"gate_B{index + 1}": float(gates[index].item())
+            for index in range(3)
+        },
+    }
+    if client_raw_score is not None:
+        args._last_client_branch_need_stats.update({
+            "raw_client_mean": float(client_raw_score.item()),
+            "gate_client": float(client_gate.item()),
+        })
+    return gates.to(device)
+
 def get_byot_lambda_granularity_gate(skew_reliability, args):
     mode = getattr(args, "byot_lambda_gate_mode", "none")
     if mode == "none":
@@ -1779,6 +1909,15 @@ def _filtered_branch_kd_loss(student_logits, teacher_prob, keep_mask, student_te
 
 def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, args):
     temperature = args.temperature
+    branch_objective = getattr(args, "byot_branch_objective", "blend")
+    branch_need_proxy = str(
+        getattr(args, "byot_branch_need_proxy", "none") or "none"
+    )
+    if branch_need_proxy != "none" and branch_objective != "kd_only":
+        raise ValueError(
+            "--byot_branch_need_proxy currently requires "
+            "--byot_branch_objective kd_only."
+        )
     teacher_temperature = _branch_kd_temperature(args, "byot_branch_kd_teacher_temperature")
     student_temperature = _branch_kd_temperature(args, "byot_branch_kd_student_temperature")
     proxy_temperature = _byot_proxy_temperature(args)
@@ -1798,6 +1937,9 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
         alpha = estimate_client_byot_alpha(net, train_dataloader, device, args, base_alpha)
         skew_reliability = estimate_client_skew_reliability(net, train_dataloader, device, args)
         alpha *= get_client_skew_scale_from_reliability(skew_reliability, args)
+        branch_need_gates = estimate_client_branch_need_gates(
+            net, train_dataloader, device, args
+        )
         lambda_gate = get_byot_lambda_granularity_gate(skew_reliability, args)
         lambda_gate_enabled = getattr(args, "byot_lambda_gate_mode", "none") != "none"
         class_alpha = estimate_class_byot_alpha(net, train_dataloader, device, args, alpha)
@@ -1812,12 +1954,21 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state(cuda_rng_state, device)
 
-    branch_objective = getattr(args, "byot_branch_objective", "blend")
     branch_gradient_mode = getattr(args, "byot_branch_gradient_mode", "attached")
     branch_alphas = get_byot_branch_alphas(args, device)
-    if branch_objective == "kd_only" and branch_alphas is not None:
-        raise ValueError("--byot_branch_alphas is not supported with --byot_branch_objective kd_only.")
+    if branch_objective in {"ce_only", "kd_only"} and branch_alphas is not None:
+        raise ValueError(
+            "--byot_branch_alphas is not supported with "
+            f"--byot_branch_objective {branch_objective}."
+        )
     beta = args.byot_beta
+    branch_need_stats = getattr(args, "_last_client_branch_need_stats", None)
+    if branch_need_stats is not None:
+        branch_need_stats["base_effective_lambda"] = float(alpha)
+        for branch_index in range(3):
+            branch_need_stats[f"effective_lambda_B{branch_index + 1}"] = float(
+                alpha * branch_need_gates[branch_index].item()
+            )
     
     criterion_ce = nn.CrossEntropyLoss().to(device)
     branch_label_smoothing = float(getattr(args, "byot_branch_ce_label_smoothing", 0.0))
@@ -1954,6 +2105,29 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                     alpha_min = 0.0
                     alpha_max = 0.0
                     loss = loss_main + beta * loss_feat_students
+                elif branch_objective == "ce_only":
+                    if sample_alpha is not None:
+                        raise ValueError(
+                            "--byot_branch_objective ce_only currently supports "
+                            "a scalar or batch-wise coefficient, not sample/class-wise alpha proxies."
+                        )
+                    # Independent branch-CE coefficient sweep.  Unlike blend,
+                    # changing alpha here never introduces or removes KD.
+                    batch_alpha = get_batch_byot_alpha(
+                        alpha, output, [m1, m2, m3], target, args
+                    )
+                    alpha_mean = float(
+                        batch_alpha.detach().item()
+                        if torch.is_tensor(batch_alpha)
+                        else batch_alpha
+                    )
+                    alpha_min = alpha_mean
+                    alpha_max = alpha_mean
+                    loss = (
+                        loss_main
+                        + batch_alpha * loss_ce_students
+                        + beta * loss_feat_students
+                    )
                 elif sample_alpha is None:
                     kd_branch_losses = [
                         _filtered_branch_kd_loss(m1, kd_target_prob, kd_keep_mask, student_temperature, kd_loss_scale),
@@ -1966,10 +2140,25 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                     )
                     if branch_objective == "kd_only":
                         batch_alpha = get_batch_byot_alpha(alpha, output, [m1, m2, m3], target, args)
-                        alpha_mean = float(batch_alpha.detach().item() if torch.is_tensor(batch_alpha) else batch_alpha)
-                        alpha_min = alpha_mean
-                        alpha_max = alpha_mean
-                        loss = loss_main + batch_alpha * loss_kd_students + beta * loss_feat_students
+                        if branch_need_gates is None:
+                            alpha_mean = float(batch_alpha.detach().item() if torch.is_tensor(batch_alpha) else batch_alpha)
+                            alpha_min = alpha_mean
+                            alpha_max = alpha_mean
+                            weighted_kd_students = batch_alpha * loss_kd_students
+                        else:
+                            active_need_gates = branch_need_gates[active_branch_indices]
+                            active_alphas = batch_alpha * active_need_gates
+                            alpha_mean = float(active_alphas.mean().detach().item())
+                            alpha_min = float(active_alphas.min().detach().item())
+                            alpha_max = float(active_alphas.max().detach().item())
+                            weighted_kd_students = sum(
+                                active_alphas[position] * kd_branch_losses[branch_index]
+                                for position, branch_index in enumerate(active_branch_indices)
+                            )
+                            weighted_kd_students = reduce_active_branch_loss(
+                                weighted_kd_students, active_branch_indices, args
+                            )
+                        loss = loss_main + weighted_kd_students + beta * loss_feat_students
                     elif branch_alphas is not None:
                         active_alphas = branch_alphas[active_branch_indices]
                         alpha_mean = float(active_alphas.mean().detach().item())
@@ -1998,16 +2187,27 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                         )
                     branch_logits = [m1, m2, m3]
                     loss_kd_students = sum(
-                        weighted_byot_kd_loss(branch_logits[i], kd_target_prob, sample_alpha, student_temperature)
+                        weighted_byot_kd_loss(
+                            branch_logits[i],
+                            kd_target_prob,
+                            sample_alpha if branch_need_gates is None else sample_alpha * branch_need_gates[i],
+                            student_temperature,
+                        )
                         for i in active_branch_indices
                     ) * kd_loss_scale
                     loss_kd_students = reduce_active_branch_loss(
                         loss_kd_students, active_branch_indices, args
                     )
-                    mean_alpha = sample_alpha.mean()
+                    if branch_need_gates is None:
+                        effective_sample_alphas = sample_alpha.reshape(-1, 1)
+                    else:
+                        effective_sample_alphas = sample_alpha.reshape(-1, 1) * branch_need_gates[
+                            active_branch_indices
+                        ].reshape(1, -1)
+                    mean_alpha = effective_sample_alphas.mean()
                     alpha_mean = float(mean_alpha.detach().item())
-                    alpha_min = float(sample_alpha.min().detach().item())
-                    alpha_max = float(sample_alpha.max().detach().item())
+                    alpha_min = float(effective_sample_alphas.min().detach().item())
+                    alpha_max = float(effective_sample_alphas.max().detach().item())
                     if branch_objective == "kd_only":
                         loss = loss_main + loss_kd_students + beta * loss_feat_students
                     else:
@@ -4638,6 +4838,7 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     client_byot_alpha_stats = {}
     client_reliability_proxy_stats = {}
     client_skew_proxy_stats = {}
+    client_branch_need_stats = {}
     total_correct_conf = 0.0
     total_zero_kd = 0.0 
     total_kd_std = 0.0  
@@ -4663,6 +4864,7 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
         # state can never become a recursively nested round statistic.
         args._last_client_skew_proxy_stats = None
         args._last_client_reliability_proxy_stats = None
+        args._last_client_branch_need_stats = None
         start_time = time.time() # [NEW] 로컬 클라이언트 학습 시작 시간 기록
         net.train()
         
@@ -4862,6 +5064,9 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
         proxy_stats = getattr(args, "_last_client_skew_proxy_stats", None)
         if proxy_stats is not None:
             client_skew_proxy_stats[int(net_id)] = dict(proxy_stats)
+        branch_need_stats = getattr(args, "_last_client_branch_need_stats", None)
+        if branch_need_stats is not None:
+            client_branch_need_stats[int(net_id)] = dict(branch_need_stats)
         total_correct_conf += correct_conf
         total_zero_kd += zero_kd_classes 
         total_kd_std += kd_std           
@@ -4894,8 +5099,10 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     args._last_client_byot_alpha_stats = client_byot_alpha_stats
     args._last_round_client_reliability_proxy_stats = client_reliability_proxy_stats
     args._last_round_client_skew_proxy_stats = client_skew_proxy_stats
+    args._last_round_client_branch_need_stats = client_branch_need_stats
     args._last_client_reliability_proxy_stats = None
     args._last_client_skew_proxy_stats = None
+    args._last_client_branch_need_stats = None
     args._last_train_branch_frequency_stats = finalize_train_branch_freq_stats(total_branch_freq_stats)
     
     # [NEW] 시간 및 연산 효율 평균

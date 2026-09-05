@@ -25,7 +25,9 @@ from models.resnet_byot import multi_resnet18_kd
 from models.resnet_cifar import ResNet18_cifar10
 from models.mobilenet_v2 import MobileNetV2, MobileNetV2BYOT
 
-import fl_utils 
+import fl_utils
+from aggregation_damage import AggregationDamageAnalyzer
+from kd_necessity_diagnostic import KDNecessityDiagnostic
 
 # python main.py --seed 0 --model mobilenet --last_fc --alg fedavg
 
@@ -1722,8 +1724,9 @@ def get_args():
                         help='How active BYOT branch losses are reduced. '
                              'sum preserves the original behavior; mean divides by the number of active branches.')
     parser.add_argument('--byot_branch_objective', default='blend',
-                        choices=['blend', 'kd_only', 'feature_only'],
+                        choices=['blend', 'ce_only', 'kd_only', 'feature_only'],
                         help='BYOT branch objective. blend uses (1-alpha)*CE + alpha*KD; '
+                             'ce_only removes branch KD and uses alpha as an unrestricted branch-CE coefficient; '
                              'kd_only removes branch CE and uses alpha as an unrestricted KD coefficient; '
                              'feature_only removes both branch CE and KD while retaining feature imitation.')
     parser.add_argument('--byot_branch_ce_label_smoothing', type=float, default=0.0,
@@ -1803,6 +1806,32 @@ def get_args():
     parser.add_argument('--byot_proxy_temperature', type=float, default=1.0,
                         help='Temperature used only to measure BYOT reliability/skew proxies. '
                              'It is independent of branch-KD and MOON temperatures; 1.0 uses native logits.')
+    parser.add_argument(
+        '--byot_branch_need_proxy', default='none',
+        choices=['none', 'constant', 'js', 'js_client', 'advantage', 'combined'],
+        help=(
+            'Pre-local client-level, branch-specific KD-necessity gate. '
+            'constant is a strength-matched non-adaptive control; js uses '
+            'one normalized branch-teacher JS gate per branch; js_client '
+            'averages the three JS values into one shared client-wise gate; '
+            'advantage uses the '
+            'positive teacher true-label probability advantage; combined '
+            'multiplies both. The gate is applied on top of the existing '
+            'teacher-reliability and client-distribution adaptive lambda.'
+        ),
+    )
+    parser.add_argument(
+        '--byot_branch_need_gain', type=float, default=1.0,
+        help='Non-negative calibration gain applied to a branch-need score before clipping to one.',
+    )
+    parser.add_argument(
+        '--byot_branch_need_min_gate', type=float, default=0.0,
+        help='Lower bound in [0,1] for each calibrated branch-need gate.',
+    )
+    parser.add_argument(
+        '--byot_branch_need_temperature', type=float, default=0.0,
+        help='Temperature for branch-need measurement; <=0 reuses --byot_proxy_temperature.',
+    )
     parser.add_argument('--preserve_byot_proxy_rng', action='store_true',
                         help='Restore dataloader/augmentation RNG state after BYOT reliability proxy passes, '
                              'keeping the subsequent optimizer-batch stream paired with baselines.')
@@ -1955,6 +1984,91 @@ def get_args():
                         help='Round interval for --log_post_aggregation_representation.')
     parser.add_argument('--representation_probe_batches', type=int, default=8,
                         help='Fixed test batches used before and after aggregation for representation geometry.')
+    parser.add_argument(
+        '--analyze_aggregation_damage', action='store_true',
+        help=(
+            'At selected completed rounds, measure post-local versus actual '
+            'FedAvg functionality damage and B1/B2/B3 stage replacement damage.'
+        ),
+    )
+    parser.add_argument(
+        '--aggregation_damage_analysis_rounds',
+        default='50,100,250,300,400,500',
+        help=(
+            'Comma-separated one-based completed-round indices used by '
+            '--analyze_aggregation_damage.'
+        ),
+    )
+    parser.add_argument(
+        '--aggregation_damage_reference_per_class', type=int, default=10,
+        help=(
+            'Deterministic official-test samples per class in the fixed '
+            'aggregation-damage reference set; <=0 uses every sample from '
+            'the smallest class.'
+        ),
+    )
+    parser.add_argument(
+        '--aggregation_damage_reference_batch_size', type=int, default=512,
+        help='Evaluation batch size for aggregation-damage diagnostics.',
+    )
+    parser.add_argument(
+        '--aggregation_damage_reference_seed', type=int, default=1729,
+        help=(
+            'Private reference-subset seed. It never touches client-selection '
+            'or training RNG state.'
+        ),
+    )
+    parser.add_argument(
+        '--aggregation_damage_output_dir', default='',
+        help=(
+            'Directory for model_level.csv and block replacement CSVs. '
+            'Defaults to a run-specific directory under --logdir.'
+        ),
+    )
+    parser.add_argument(
+        '--aggregation_damage_method_label', default='',
+        help='Human-readable method label stored in aggregation-damage CSVs.',
+    )
+    parser.add_argument(
+        '--aggregation_damage_partition_label', default='',
+        help='Human-readable partition label stored in aggregation-damage CSVs.',
+    )
+    parser.add_argument(
+        '--aggregation_damage_overwrite', action='store_true',
+        help='Start the three run-local aggregation-damage CSVs from scratch.',
+    )
+    parser.add_argument(
+        '--analyze_kd_necessity', action='store_true',
+        help=(
+            'Stage-1 diagnostic only: record branch-wise KD-necessity signals '
+            'on selected clients before and after local training. This does '
+            'not change the adaptive rule or any loss weight.'
+        ),
+    )
+    parser.add_argument(
+        '--kd_necessity_analysis_rounds', default='50,100,250,500',
+        help='Comma-separated one-based communication rounds to diagnose.',
+    )
+    parser.add_argument(
+        '--kd_necessity_temperature', type=float, default=1.0,
+        help='Temperature used only for KD-necessity probability diagnostics.',
+    )
+    parser.add_argument(
+        '--kd_necessity_client_count', type=int, default=0,
+        help='Selected clients measured per target round; 0 uses all participants.',
+    )
+    parser.add_argument(
+        '--kd_necessity_max_batches', type=int, default=0,
+        help='Local batches measured per client and stage; 0 uses the full local set.',
+    )
+    parser.add_argument(
+        '--kd_necessity_output_dir', default='',
+        help='Run-local output directory for KD-necessity CSV and manifest.',
+    )
+    parser.add_argument(
+        '--kd_necessity_overwrite', action='store_true',
+        help='Replace an existing run-local KD-necessity CSV.',
+    )
     parser.add_argument('--log_postlocal_feature_geometry', action='store_true',
                         help='Measure client-internal raw-trunk W/B geometry after local training and before aggregation.')
     parser.add_argument('--postlocal_geometry_interval', type=int, default=5,
@@ -2167,6 +2281,30 @@ def main():
             torch.cuda.manual_seed_all(args.seed)
         logger.info("Reset execution RNGs after model construction for paired method comparison.")
 
+    aggregation_damage_analyzer = None
+    if getattr(args, 'analyze_aggregation_damage', False):
+        if args.model not in ('resnet18', 'resnet18_byot'):
+            raise ValueError(
+                '--analyze_aggregation_damage currently supports resnet18 and '
+                'resnet18_byot, whose B1/B2/B3 stages map to layer1/layer2/layer3.'
+            )
+        aggregation_damage_analyzer = AggregationDamageAnalyzer(
+            args=args,
+            log_file_name=log_file_name,
+            test_dataset=global_test_dataset,
+            device=device,
+            logger=logger,
+        )
+
+    kd_necessity_diagnostic = None
+    if getattr(args, 'analyze_kd_necessity', False):
+        kd_necessity_diagnostic = KDNecessityDiagnostic(
+            args=args,
+            log_file_name=log_file_name,
+            device=device,
+            logger=logger,
+        )
+
     checkpoint_rounds = set()
     raw_checkpoint_rounds = str(
         getattr(args, 'save_global_ckpt_rounds', '') or ''
@@ -2310,6 +2448,8 @@ def main():
         # Optional prediction-entropy decomposition diagnostics.  Each item
         # stores the selected clients' raw b/u/d values for one round.
         'byot_prediction_entropy_client_stats': [],
+        # Branch-wise pre-local need scores/gates and the resulting lambda.
+        'byot_branch_need_client_stats': [],
         'byot_prediction_entropy_mean': [],
         'byot_sample_entropy_mean': [],
         'byot_prediction_mutual_info_mean': [],
@@ -2384,6 +2524,21 @@ def main():
         # 클라이언트 모델 초기화 (글로벌 모델로 덮어쓰기)
         for client_idx, net in nets_this_round.items():
             net.load_state_dict(global_w)
+
+        communication_round = int(round) + 1
+        if (
+            kd_necessity_diagnostic is not None
+            and kd_necessity_diagnostic.should_analyze(communication_round)
+        ):
+            # Online-gate candidate: the shared round-start model is evaluated
+            # separately on each selected client's local distribution. RNGs
+            # are restored inside the diagnostic, preserving the train stream.
+            kd_necessity_diagnostic.measure_clients(
+                communication_round=communication_round,
+                stage='client_pre_local',
+                nets=nets_this_round,
+                dataloaders=dataloaders_this_round,
+            )
 
         # Gradient dissimilarity probe at the shared round-start model.
         total_batches = sum([len(dataloaders_this_round[j]) for j in dataloaders_this_round if dataloaders_this_round[j] is not None])
@@ -2572,6 +2727,41 @@ def main():
             avg_byot_alpha_min = avg_byot_alpha_mean
             avg_byot_alpha_max = avg_byot_alpha_mean
 
+        aggregation_damage_context = None
+        completed_round = int(round) + 1
+        if (
+            kd_necessity_diagnostic is not None
+            and kd_necessity_diagnostic.should_analyze(completed_round)
+        ):
+            # Mechanism check at the exact post-local/pre-aggregation point.
+            kd_necessity_diagnostic.measure_clients(
+                communication_round=completed_round,
+                stage='client_post_local_pre_aggregation',
+                nets=nets_this_round,
+                dataloaders=dataloaders_this_round,
+                client_alpha_stats=getattr(
+                    args, '_last_client_byot_alpha_stats', {}
+                ),
+                client_reliability_stats=getattr(
+                    args, '_last_round_client_reliability_proxy_stats', {}
+                ),
+            )
+        if (
+            aggregation_damage_analyzer is not None
+            and aggregation_damage_analyzer.should_analyze(completed_round)
+        ):
+            # This is the requested post-local/pre-aggregation measurement
+            # point.  The analyzer only evaluates models and restores every
+            # temporarily replaced stage before actual FedAvg runs below.
+            aggregation_damage_context = (
+                aggregation_damage_analyzer.measure_post_local(
+                    completed_round=completed_round,
+                    nets_this_round=nets_this_round,
+                    fed_avg_freqs=fed_avg_freqs,
+                    pre_round_global_state=old_w,
+                )
+            )
+
         if getattr(args, "log_update_step_size", False):
             step_record = summarize_update_step_records(
                 round,
@@ -2644,6 +2834,9 @@ def main():
         )
         client_proxy_stats = getattr(args, "_last_round_client_skew_proxy_stats", {})
         pkl_dict['byot_prediction_entropy_client_stats'].append(client_proxy_stats)
+        pkl_dict['byot_branch_need_client_stats'].append(
+            getattr(args, "_last_round_client_branch_need_stats", {})
+        )
         if client_proxy_stats:
             b_values = np.asarray([
                 stats['prediction_entropy'] for stats in client_proxy_stats.values()
@@ -2799,6 +2992,15 @@ def main():
 
         # 글로벌 모델 업데이트 및 평가
         global_model.load_state_dict(global_w)
+
+        if aggregation_damage_context is not None:
+            # Evaluate the exact state that the ordinary training path just
+            # installed after real FedAvg (including its averaged BN state).
+            aggregation_damage_analyzer.measure_post_aggregation(
+                context=aggregation_damage_context,
+                nets_this_round=nets_this_round,
+                aggregated_global_model=global_model,
+            )
 
         representation_metrics = {}
         if should_probe_representation:
