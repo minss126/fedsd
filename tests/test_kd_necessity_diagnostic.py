@@ -9,7 +9,7 @@ from kd_necessity_diagnostic import (
     evaluate_branch_teacher_metrics,
     preserve_evaluation_rng,
 )
-from train import estimate_client_branch_need_gates
+from train import estimate_client_branch_need_gates, estimate_client_byot_alpha
 
 
 class ToyBYOT(nn.Module):
@@ -25,6 +25,20 @@ class ToyBYOT(nn.Module):
         b3 = 0.5 * teacher
         feature = x[:, :, None, None]
         return teacher, b1, b2, b3, feature, feature, feature, feature
+
+
+class ToyGlobalTeacher(nn.Module):
+    """Round-start global teacher whose final prediction matches local B1."""
+
+    def __init__(self):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()))
+
+    def forward_teacher(self, x):
+        index = x[:, 0].long()
+        logits = torch.tensor([[0.0, 3.0], [3.0, 0.0]], device=x.device)[index]
+        feature = x[:, :, None, None]
+        return feature, logits
 
 
 def test_branch_metrics_distinguish_identical_and_wrong_branch():
@@ -159,3 +173,66 @@ def test_client_js_need_gate_uses_one_mean_gate_for_all_branches():
     assert torch.allclose(gates, torch.full((3,), expected))
     assert abs(stats["raw_client_mean"] - raw_mean) < 1e-6
     assert abs(stats["gate_client"] - expected) < 1e-6
+
+
+def test_global_teacher_changes_branch_js_gate_reference():
+    loader = DataLoader(
+        TensorDataset(torch.tensor([[0.0], [1.0]]), torch.tensor([0, 1])),
+        batch_size=2,
+        shuffle=False,
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "byot_branch_need_proxy": "js",
+            "byot_branch_need_temperature": 1.0,
+            "byot_branch_need_gain": 1.0,
+            "byot_branch_need_min_gate": 0.0,
+            "byot_proxy_temperature": 1.0,
+        },
+    )()
+    gates = estimate_client_branch_need_gates(
+        ToyBYOT(),
+        loader,
+        torch.device("cpu"),
+        args,
+        teacher_net=ToyGlobalTeacher(),
+    )
+    # The global final classifier matches local B1 and opposes local B2.
+    assert gates[0] < 1e-7
+    assert gates[1] > 0.7
+
+
+def test_global_teacher_is_used_for_true_label_reliability():
+    loader = DataLoader(
+        TensorDataset(torch.tensor([[0.0], [1.0]]), torch.tensor([0, 1])),
+        batch_size=2,
+        shuffle=False,
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "byot_client_proxy": "teacher_label_prob",
+            "byot_client_alpha_min": 0.0,
+            "byot_client_alpha_max": 1.0,
+            "byot_client_alpha_mode": "multiply",
+            "byot_client_reliability_power": 1.0,
+            "byot_proxy_temperature": 1.0,
+            "alpha_min_scale": 0.0,
+        },
+    )()
+    local_alpha = estimate_client_byot_alpha(
+        ToyBYOT(), loader, torch.device("cpu"), args, fallback_alpha=1.0
+    )
+    global_alpha = estimate_client_byot_alpha(
+        ToyBYOT(),
+        loader,
+        torch.device("cpu"),
+        args,
+        fallback_alpha=1.0,
+        teacher_net=ToyGlobalTeacher(),
+    )
+    assert local_alpha > 0.9
+    assert global_alpha < 0.1

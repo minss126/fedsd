@@ -1738,6 +1738,15 @@ def get_args():
                              'ce_only removes branch KD and uses alpha as an unrestricted branch-CE coefficient; '
                              'kd_only removes branch CE and uses alpha as an unrestricted KD coefficient; '
                              'feature_only removes both branch CE and KD while retaining feature imitation.')
+    parser.add_argument(
+        '--byot_teacher_source', default='local', choices=['local', 'global'],
+        help=(
+            'Teacher used by BYOT branch KD and its reliability/skew/branch-need '
+            'proxies. local uses the concurrently trained local final classifier; '
+            'global uses the frozen round-start global final classifier. Feature '
+            'imitation remains local-final-to-local-branch in both modes.'
+        ),
+    )
     parser.add_argument('--byot_branch_ce_label_smoothing', type=float, default=0.0,
                         help='Label-smoothing epsilon applied only to branch CE; the final teacher CE remains hard-label CE.')
     parser.add_argument('--byot_branch_ce_weight', type=float, default=1.0,

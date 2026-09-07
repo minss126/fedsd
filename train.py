@@ -492,32 +492,40 @@ def get_effective_byot_alpha(train_dataloader, args):
 
     return alpha
 
-def estimate_client_skew_reliability(net, train_dataloader, device, args):
+def _forward_teacher_logits(model, x):
+    """Return only a model's final-classifier logits when possible."""
+    if hasattr(model, "forward_teacher"):
+        out = model.forward_teacher(x)
+        return out[-1] if isinstance(out, tuple) else out
+    out = model(x)
+    if isinstance(out, tuple) and len(out) == 8:
+        return out[0]
+    if isinstance(out, tuple):
+        return out[-1]
+    return out
+
+
+def estimate_client_skew_reliability(net, train_dataloader, device, args, teacher_net=None):
     proxy = getattr(args, "byot_client_skew_proxy", "none")
     if proxy == "none":
         return 1.0
 
     if proxy in {"prediction_entropy", "prediction_mutual_info", "prediction_js_global"}:
+        source_net = teacher_net if teacher_net is not None else net
         temperature = _byot_proxy_temperature(args)
         log_entropy_components = bool(
             getattr(args, "byot_log_prediction_entropy_components", False)
         )
         need_entropy_components = log_entropy_components or proxy == "prediction_mutual_info"
-        was_training = net.training
-        net.eval()
+        was_training = source_net.training
+        source_net.eval()
         prob_sum = None
         total = 0
         sample_entropy_sum = 0.0
         with torch.no_grad():
             for x, _ in train_dataloader:
                 x = x.to(device, non_blocking=True)
-                out = net(x)
-                if isinstance(out, tuple) and len(out) == 8:
-                    logits = out[0]
-                elif isinstance(out, tuple):
-                    logits = out[-1]
-                else:
-                    logits = out
+                logits = _forward_teacher_logits(source_net, x)
                 probs = F.softmax(logits / temperature, dim=1)
                 batch_sum = probs.sum(dim=0)
                 prob_sum = batch_sum if prob_sum is None else prob_sum + batch_sum
@@ -527,7 +535,7 @@ def estimate_client_skew_reliability(net, train_dataloader, device, args):
                         (-(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=1)).sum().item()
                     )
         if was_training:
-            net.train()
+            source_net.train()
         if prob_sum is None or total <= 0:
             return 1.0
 
@@ -624,7 +632,9 @@ def get_client_skew_scale(net, train_dataloader, device, args):
     return get_client_skew_scale_from_reliability(reliability, args)
 
 
-def estimate_client_branch_need_gates(net, train_dataloader, device, args):
+def estimate_client_branch_need_gates(
+    net, train_dataloader, device, args, teacher_net=None
+):
     """Estimate pre-local KD-need gates for the BYOT branches.
 
     This is deliberately separate from teacher reliability. ``js`` measures
@@ -660,8 +670,11 @@ def estimate_client_branch_need_gates(net, train_dataloader, device, args):
             **{f"gate_B{index + 1}": float(gate_value) for index in range(3)},
         }
         return gates
+    teacher_net = teacher_net if teacher_net is not None else net
     was_training = bool(net.training)
+    teacher_was_training = bool(teacher_net.training)
     net.eval()
+    teacher_net.eval()
     score_sums = torch.zeros(3, dtype=torch.float64, device=device)
     total = 0
 
@@ -676,7 +689,12 @@ def estimate_client_branch_need_gates(net, train_dataloader, device, args):
                         "--byot_branch_need_proxy requires a BYOT model with "
                         "final/B1/B2/B3 logits."
                     )
-                teacher_prob = F.softmax(out[0].float() / temperature, dim=1)
+                teacher_logits = (
+                    out[0]
+                    if teacher_net is net
+                    else _forward_teacher_logits(teacher_net, x)
+                )
+                teacher_prob = F.softmax(teacher_logits.float() / temperature, dim=1)
                 teacher_log = teacher_prob.clamp_min(1e-12).log()
                 teacher_y = teacher_prob.gather(1, target[:, None]).squeeze(1)
                 branch_scores = []
@@ -713,6 +731,8 @@ def estimate_client_branch_need_gates(net, train_dataloader, device, args):
                 total += int(target.numel())
     finally:
         net.train(was_training)
+        if teacher_net is not net:
+            teacher_net.train(teacher_was_training)
 
     if total <= 0:
         args._last_client_branch_need_stats = None
@@ -1160,7 +1180,9 @@ def weighted_byot_kd_loss(student_logits, teacher_prob, sample_alpha, temperatur
     kl_per_sample = F.kl_div(logp, teacher_prob, reduction="none").sum(dim=1)
     return (sample_alpha * kl_per_sample).mean()
 
-def estimate_client_byot_alpha(net, train_dataloader, device, args, fallback_alpha):
+def estimate_client_byot_alpha(
+    net, train_dataloader, device, args, fallback_alpha, teacher_net=None
+):
     proxy = getattr(args, "byot_client_proxy", "none")
     if proxy == "none":
         args._last_client_reliability_proxy_stats = None
@@ -1172,8 +1194,11 @@ def estimate_client_byot_alpha(net, train_dataloader, device, args, fallback_alp
         alpha_min, alpha_max = alpha_max, alpha_min
 
     temperature = _byot_proxy_temperature(args)
+    teacher_net = teacher_net if teacher_net is not None else net
     was_training = net.training
+    teacher_was_training = teacher_net.training
     net.eval()
+    teacher_net.eval()
 
     total_score = 0.0
     total_count = 0
@@ -1185,8 +1210,13 @@ def estimate_client_byot_alpha(net, train_dataloader, device, args, fallback_alp
             if not (isinstance(out, tuple) and len(out) == 8):
                 continue
 
-            output, m1, m2, m3 = out[0], out[1], out[2], out[3]
-            teacher_prob = F.softmax(output / temperature, dim=1)
+            m1, m2, m3 = out[1], out[2], out[3]
+            teacher_logits = (
+                out[0]
+                if teacher_net is net
+                else _forward_teacher_logits(teacher_net, x)
+            )
+            teacher_prob = F.softmax(teacher_logits / temperature, dim=1)
             sample_alpha = get_sample_byot_alpha(1.0, teacher_prob, [m1, m2, m3], target, args, proxy_override=proxy)
             if sample_alpha is None:
                 continue
@@ -1196,6 +1226,8 @@ def estimate_client_byot_alpha(net, train_dataloader, device, args, fallback_alp
 
     if was_training:
         net.train()
+    if teacher_net is not net:
+        teacher_net.train(teacher_was_training)
 
     if total_count == 0:
         args._last_client_reliability_proxy_stats = None
@@ -1909,6 +1941,12 @@ def _filtered_branch_kd_loss(student_logits, teacher_prob, keep_mask, student_te
 
 def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, args):
     temperature = args.temperature
+    teacher_source = str(getattr(args, "byot_teacher_source", "local") or "local")
+    if teacher_source not in {"local", "global"}:
+        raise ValueError(f"Unknown --byot_teacher_source: {teacher_source}")
+    if teacher_source == "global" and global_model is None:
+        raise ValueError("--byot_teacher_source global requires a round-start global model.")
+    kd_teacher_net = global_model if teacher_source == "global" else net
     branch_objective = getattr(args, "byot_branch_objective", "blend")
     branch_need_proxy = str(
         getattr(args, "byot_branch_need_proxy", "none") or "none"
@@ -1934,11 +1972,16 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
         )
     try:
         base_alpha = get_effective_byot_alpha(train_dataloader, args)
-        alpha = estimate_client_byot_alpha(net, train_dataloader, device, args, base_alpha)
-        skew_reliability = estimate_client_skew_reliability(net, train_dataloader, device, args)
+        alpha = estimate_client_byot_alpha(
+            net, train_dataloader, device, args, base_alpha,
+            teacher_net=kd_teacher_net,
+        )
+        skew_reliability = estimate_client_skew_reliability(
+            net, train_dataloader, device, args, teacher_net=kd_teacher_net
+        )
         alpha *= get_client_skew_scale_from_reliability(skew_reliability, args)
         branch_need_gates = estimate_client_branch_need_gates(
-            net, train_dataloader, device, args
+            net, train_dataloader, device, args, teacher_net=kd_teacher_net
         )
         lambda_gate = get_byot_lambda_granularity_gate(skew_reliability, args)
         lambda_gate_enabled = getattr(args, "byot_lambda_gate_mode", "none") != "none"
@@ -1964,6 +2007,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
     beta = args.byot_beta
     branch_need_stats = getattr(args, "_last_client_branch_need_stats", None)
     if branch_need_stats is not None:
+        branch_need_stats["teacher_source"] = teacher_source
         branch_need_stats["base_effective_lambda"] = float(alpha)
         for branch_index in range(3):
             branch_need_stats[f"effective_lambda_B{branch_index + 1}"] = float(
@@ -2038,13 +2082,18 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                 
                 # 3. KL Divergence
                 with torch.no_grad():
-                    teacher_prob = F.softmax(output / teacher_temperature, dim=1)
+                    teacher_logits = (
+                        output
+                        if teacher_source == "local"
+                        else _forward_teacher_logits(kd_teacher_net, x)
+                    )
+                    teacher_prob = F.softmax(teacher_logits / teacher_temperature, dim=1)
                     # Reliability/sample-selection proxies deliberately use a
                     # separate native-logit temperature, rather than the KD
                     # target temperature.
                     proxy_teacher_prob = (
                         teacher_prob if abs(proxy_temperature - teacher_temperature) < 1e-12
-                        else F.softmax(output / proxy_temperature, dim=1)
+                        else F.softmax(teacher_logits / proxy_temperature, dim=1)
                     )
                     kd_target_prob = _branch_kd_target_distribution(teacher_prob, target, args)
                     
