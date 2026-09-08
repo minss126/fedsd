@@ -398,9 +398,30 @@ run_job() {
     echo "[GPU ${gpu}] complete: ${scope} | ${dataset} | ${axis}=${value} | ${partition} | ${method}"
 }
 
+job_is_complete() {
+    local job="$1" scope dataset axis value partition method name rel_dir
+    IFS='|' read -r scope dataset axis value partition method <<< "$job"
+    configure_job "$scope" "$dataset" "$axis" "$value" "$method"
+    name="$(job_name "$scope" "$dataset" "$axis" "$value" "$partition" "$method")"
+    rel_dir="${scope}/${dataset}/${axis}/${value}/${partition}/seed${SEED}"
+    has_completed_run \
+        "${LOG_ROOT}/${rel_dir}/${name}.log" \
+        "${LOG_ROOT}/${rel_dir}/${name}.pkl" \
+        "$ROUNDS"
+}
+
+PENDING_JOBS=()
+for job in "${JOBS[@]}"; do
+    if [[ "$SKIP_EXISTING" == 1 ]] && job_is_complete "$job"; then
+        echo "[pre-skip] $job"
+    else
+        PENDING_JOBS+=("$job")
+    fi
+done
+
 declare -a QUEUES LOADS
 for ((i=0; i<NUM_GPUS; i++)); do QUEUES[$i]=''; LOADS[$i]=0; done
-for job in "${JOBS[@]}"; do
+for job in "${PENDING_JOBS[@]}"; do
     target=0
     for ((i=1; i<NUM_GPUS; i++)); do
         (( LOADS[i] < LOADS[target] )) && target=$i
@@ -411,10 +432,14 @@ for job in "${JOBS[@]}"; do
 done
 
 echo "========== Final JS-branch reruns: ${RUN_SET} =========="
-echo "GPUs=${GPUS[*]} | jobs=${#JOBS[@]} | seed=${SEED}"
+echo "GPUs=${GPUS[*]} | pending=${#PENDING_JOBS[@]}/${#JOBS[@]} jobs | seed=${SEED}"
 echo "protocol=min${MIN_REQUIRE_SIZE}, keep_last=0, lambda_max=${LAMBDA_MAX}, tau=${SOFT_TAU}, JS gain=${JS_GAIN}"
 echo "Only final adaptive/ablation rows are run; Plain and fixed lambda=0.3 are reused."
 echo "logs=${LOG_ROOT}"
+if (( ${#PENDING_JOBS[@]} == 0 )); then
+    echo "All jobs in this run set are already complete."
+    exit 0
+fi
 for ((i=0; i<NUM_GPUS; i++)); do
     count=$(printf '%s' "${QUEUES[$i]}" | sed '/^$/d' | wc -l)
     echo "GPU ${GPUS[$i]}: ${count} jobs (relative load ${LOADS[$i]})"
@@ -430,12 +455,39 @@ run_queue() {
 }
 
 pids=()
+
+stop_workers() {
+    local exit_code="$1" reason="$2" worker child
+    trap - INT TERM
+    set +e
+    echo
+    echo "[interrupt] ${reason}; stopping active GPU workers..." >&2
+    for worker in "${pids[@]:-}"; do
+        [[ -n "$worker" ]] || continue
+        # The active main.py process is a direct child of its queue worker.
+        # Terminate it first so killing the shell does not orphan GPU work.
+        while IFS= read -r child; do
+            [[ -n "$child" ]] && kill -TERM "$child" 2>/dev/null
+        done < <(pgrep -P "$worker" 2>/dev/null || true)
+        kill -TERM "$worker" 2>/dev/null
+    done
+    for worker in "${pids[@]:-}"; do
+        [[ -n "$worker" ]] && wait "$worker" 2>/dev/null
+    done
+    echo "[interrupt] Completed runs were kept. Re-run the same command; incomplete runs restart from round 0." >&2
+    exit "$exit_code"
+}
+
+trap 'stop_workers 130 SIGINT' INT
+trap 'stop_workers 143 SIGTERM' TERM
+
 for ((i=0; i<NUM_GPUS; i++)); do
     run_queue "$i" &
     pids+=("$!")
 done
 status=0
 for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+trap - INT TERM
 (( status == 0 )) || exit "$status"
 
 if [[ "$DRY_RUN" == 1 ]]; then
