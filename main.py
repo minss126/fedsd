@@ -28,6 +28,10 @@ from models.mobilenet_v2 import MobileNetV2, MobileNetV2BYOT
 import fl_utils
 from aggregation_damage import AggregationDamageAnalyzer
 from kd_necessity_diagnostic import KDNecessityDiagnostic
+from scripts.experiments.analysis.gradient_route_probe_dxfl import (
+    run_dxfl_gradient_route_probe,
+    should_run_gradient_route_probe,
+)
 
 # python main.py --seed 0 --model mobilenet --last_fc --alg fedavg
 
@@ -1996,6 +2000,53 @@ def get_args():
                         help='Round interval for --log_branch_shared_gradient_dispersion.')
     parser.add_argument('--branch_shared_gradient_probe_batches', type=int, default=1,
                         help='Local batches per selected client for shared-trunk branch-gradient dispersion.')
+    parser.add_argument(
+        '--log_gradient_routes', action='store_true',
+        help=(
+            'At post-aggregation checkpoints, measure independent B1/B2/B3/All '
+            'local/global auxiliary CE and KD gradient routes versus final CE.'
+        ),
+    )
+    parser.add_argument(
+        '--gradient_route_probe_interval', type=int, default=50,
+        help='Measure gradient routes every N completed aggregation rounds.',
+    )
+    parser.add_argument(
+        '--gradient_route_probe_rounds', default='',
+        help='Optional comma-separated completed rounds; overrides the interval.',
+    )
+    parser.add_argument(
+        '--gradient_route_probe_batch_size', type=int, default=64,
+        help='Analysis-only batch size for local and global gradient routes.',
+    )
+    parser.add_argument(
+        '--gradient_route_probe_client_count', type=int, default=0,
+        help='Participating clients to diagnose; 0 uses all participants.',
+    )
+    parser.add_argument(
+        '--gradient_route_local_max_batches', type=int, default=0,
+        help='Batches per diagnosed client; 0 uses its full local subset.',
+    )
+    parser.add_argument(
+        '--gradient_route_global_max_batches', type=int, default=0,
+        help='Official-test batches used as global reference; 0 uses all.',
+    )
+    parser.add_argument(
+        '--gradient_route_temperature', type=float, default=0.0,
+        help='Analysis KD temperature; <=0 inherits --temperature.',
+    )
+    parser.add_argument(
+        '--gradient_route_branch_reduction', choices=('sum', 'mean'), default='sum',
+        help='Definition of the derived All-branch CE/KD route.',
+    )
+    parser.add_argument(
+        '--gradient_route_output_dir', default='',
+        help='Optional root for round-wise gradient-route JSON files.',
+    )
+    parser.add_argument(
+        '--gradient_route_overwrite', action='store_true',
+        help='Overwrite existing round-wise gradient-route JSON files.',
+    )
     parser.add_argument('--log_post_aggregation_representation', action='store_true',
                         help='Log common-reference representation change caused by each sampled FedAvg aggregation.')
     parser.add_argument('--representation_probe_interval', type=int, default=50,
@@ -3010,6 +3061,20 @@ def main():
 
         # 글로벌 모델 업데이트 및 평가
         global_model.load_state_dict(global_w)
+
+        completed_rounds = int(round) + 1
+        if should_run_gradient_route_probe(args, completed_rounds):
+            run_dxfl_gradient_route_probe(
+                args=args,
+                logger=logger,
+                log_file_name=log_file_name,
+                completed_round=completed_rounds,
+                checkpoint_model=global_model,
+                selected_client_loaders=dataloaders_this_round,
+                fedavg_weights=fed_avg_freqs,
+                global_test_loader=global_test_dataloader,
+                device=device,
+            )
 
         if aggregation_damage_context is not None:
             # Evaluate the exact state that the ordinary training path just
