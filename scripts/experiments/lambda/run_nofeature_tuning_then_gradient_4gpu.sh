@@ -12,7 +12,8 @@ export GPUS_OVERRIDE="${GPUS_OVERRIDE:-0 1 2 3}"
 echo "[1/2] No-feature JS-branch adaptive parameter revalidation"
 bash scripts/experiments/lambda/run_js_branch_nofeature_tuning_4gpu.sh
 
-echo "[2/2] No-feature CE/KD gradient-route analysis"
-bash scripts/experiments/analysis/run_gradient_route_probe_nofeature_4gpu.sh
+echo "[2/2] No-feature CE/KD gradient-route analysis (CIFAR-100)"
+DATASETS_OVERRIDE=cifar100 \
+    bash scripts/experiments/analysis/run_gradient_route_probe_nofeature_4gpu.sh
 
 echo "No-feature tuning and gradient analysis complete."
