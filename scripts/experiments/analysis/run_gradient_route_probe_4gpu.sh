@@ -38,12 +38,18 @@ LOCAL_MAX_BATCHES="${LOCAL_MAX_BATCHES:-0}"
 GLOBAL_MAX_BATCHES="${GLOBAL_MAX_BATCHES:-0}"
 LOG_ROOT="${LOG_ROOT:-logs/analysis/logs_gradient_route_probe_t1_r500}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
+DRY_RUN="${DRY_RUN:-0}"
 
 variant_args() {
     case "$1" in
         feature_only) echo "feature_only|0.00" ;;
         ce_feature)   echo "blend|0.00" ;;
         kd_feature)   echo "blend|1.00" ;;
+        # Clearer aliases for runs whose FEATURE_BETA is zero.  They use the
+        # same branch objectives as the historical *_feature variants but do
+        # not imply that feature imitation is active.
+        ce_only)      echo "blend|0.00" ;;
+        kd_only)      echo "blend|1.00" ;;
         *) echo "Unknown variant: $1" >&2; return 1 ;;
     esac
 }
@@ -82,7 +88,8 @@ run_job() {
     fi
 
     echo "[GPU ${gpu_id}] start: ${setting} | ${variant} | T=${TEMPERATURE}"
-    "$PYTHON_BIN" main.py \
+    command=(
+        "$PYTHON_BIN" main.py
         --dataset "$dataset" --datadir ./data \
         --n_clients 100 --sample_fraction 0.1 \
         --epochs "$LOCAL_EPOCHS" --lr "$LR" --batch_size "$BATCH_SIZE" \
@@ -106,8 +113,15 @@ run_job() {
         --gradient_route_global_max_batches "$GLOBAL_MAX_BATCHES" \
         --gradient_route_temperature "$TEMPERATURE" \
         --gradient_route_branch_reduction sum \
-        --gradient_route_output_dir "$route_dir" \
-        > "${log_dir}/${variant}_terminal.log" 2>&1
+        --gradient_route_output_dir "$route_dir"
+    )
+    if [ "$DRY_RUN" = "1" ]; then
+        printf '[dry-run][GPU %s] ' "$gpu_id"
+        printf '%q ' "${command[@]}"
+        printf '\n'
+        return 0
+    fi
+    "${command[@]}" > "${log_dir}/${variant}_terminal.log" 2>&1
     echo "[GPU ${gpu_id}] complete: ${setting} | ${variant}"
 }
 
@@ -135,7 +149,7 @@ fi
 echo "probe data=all participating clients/full local sets/full official test set"
 echo "probe caps: clients=${PROBE_CLIENTS}(0=all), local_batches=${LOCAL_MAX_BATCHES}(0=all), global_batches=${GLOBAL_MAX_BATCHES}(0=all)"
 echo "outputs=B1/B2/B3/All; aggregate + per-client + client summaries + full pairwise stats"
-echo "estimated 4-GPU wall time=about 12-24 hours for the default 8 jobs"
+echo "estimated 4-GPU wall time=about 6-8 hours for the default 8 jobs"
 echo "log_root=${LOG_ROOT}, jobs=${#JOBS[@]}, skip_existing=${SKIP_EXISTING}"
 
 run_queue() {
