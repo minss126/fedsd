@@ -2120,16 +2120,24 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                         args,
                     )
                 
-                # 4. Feature Imitation
-                feat_branch_losses = [
-                    criterion_mse(f1, final_fea.detach()),
-                    criterion_mse(f2, final_fea.detach()),
-                    criterion_mse(f3, final_fea.detach()),
-                ]
-                loss_feat_students = sum(feat_branch_losses[i] for i in active_branch_indices)
-                loss_feat_students = reduce_active_branch_loss(
-                    loss_feat_students, active_branch_indices, args
-                )
+                # 4. Feature Imitation. A zero feature coefficient is the
+                # final no-feature protocol, so avoid constructing the MSE
+                # graph altogether instead of computing it and multiplying by
+                # zero later.
+                if beta != 0.0 and active_branch_indices:
+                    feat_branch_losses = [
+                        criterion_mse(f1, final_fea.detach()),
+                        criterion_mse(f2, final_fea.detach()),
+                        criterion_mse(f3, final_fea.detach()),
+                    ]
+                    loss_feat_students = sum(
+                        feat_branch_losses[i] for i in active_branch_indices
+                    )
+                    loss_feat_students = reduce_active_branch_loss(
+                        loss_feat_students, active_branch_indices, args
+                    )
+                else:
+                    loss_feat_students = output.new_zeros(())
 
                 if branch_alphas is not None:
                     sample_alpha = None

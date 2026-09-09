@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
 # Shared worker for the final local-teacher JS-branch rerun matrix.
-# Invoke through run_js_branch_final_reruns_{4gpu,2gpu}.sh unless a custom
-# DATASETS/GROUPS split is needed.
+# Invoke through one of the small wrapper scripts unless a custom split is
+# needed.  The tune_* run sets perform the no-feature parameter revalidation
+# that must precede the full final matrix.
 
 set -euo pipefail
 
@@ -21,7 +22,7 @@ else
     PYTHON_BIN="python3"
 fi
 
-RUN_SET="${RUN_SET:?Set RUN_SET to cifar_tiny_4gpu or image_2gpu}"
+RUN_SET="${RUN_SET:?Set RUN_SET to tune_4gpu, tune_2gpu, cifar_tiny_4gpu, or image_2gpu}"
 SEED="${SEED:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -32,7 +33,10 @@ MIN_REQUIRE_SIZE="${MIN_REQUIRE_SIZE:-64}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-512}"
 
-FEATURE_BETA="${FEATURE_BETA:-0.01}"
+# Final no-feature protocol. An explicit override remains available for
+# diagnostics, but performance launchers use the zero default.
+FEATURE_BETA="${FEATURE_BETA_OVERRIDE:-0.0}"
+FIXED_LAMBDA="${FIXED_LAMBDA:-0.3}"
 KD_TEMPERATURE="${KD_TEMPERATURE:-1.0}"
 PROXY_TEMPERATURE="${PROXY_TEMPERATURE:-1.0}"
 LAMBDA_MAX="${LAMBDA_MAX:-1.0}"
@@ -54,7 +58,7 @@ else
     IMAGENET100_DATADIR="${HOME}/data/imagenet100_resized_64_png"
 fi
 
-LOG_ROOT="${LOG_ROOT:-logs/lambda/adaptive/logs_js_branch_final_reruns}"
+LOG_ROOT="${LOG_ROOT:-logs/lambda/adaptive/logs_js_branch_final_reruns_no_feature}"
 mkdir -p "$LOG_ROOT"
 
 configure_dataset() {
@@ -130,6 +134,9 @@ append_branch_gate() {
 append_method_components() {
     local method="$1"
     case "$method" in
+        fixed)
+            # Constant lambda from round 0: no warm-up or adaptive proxies.
+            ;;
         full)
             append_warmup; append_reliability; append_bias; append_branch_gate ;;
         wo_warmup)
@@ -166,36 +173,64 @@ add_protocol_jobs() {
         e10_only) epoch_values=(e10) ;;
         *) echo "Unknown protocol subset: $mode" >&2; return 1 ;;
     esac
+    local method
     for value in "${epoch_values[@]}"; do
-        add_partitions protocol "$dataset" local_epochs "$value" full \
-            iid beta_0.5 beta_0.3 beta_0.1
+        for method in fixed full; do
+            add_partitions protocol "$dataset" local_epochs "$value" "$method" \
+                iid beta_0.5 beta_0.3 beta_0.1
+        done
     done
     if [[ "$mode" != e10_only ]]; then
         for value in c0p05 c0p20; do
-            add_partitions protocol "$dataset" participation "$value" full \
-                iid beta_0.5 beta_0.3 beta_0.1
+            for method in fixed full; do
+                add_partitions protocol "$dataset" participation "$value" "$method" \
+                    iid beta_0.5 beta_0.3 beta_0.1
+            done
         done
     fi
 }
 
 add_default_model_mechanism_jobs() {
-    local dataset="$1"
-    add_partitions dataset "$dataset" default default full \
-        iid beta_0.5 beta_0.3 beta_0.1
-    add_partitions model "$dataset" model mobilenetv2 full \
-        iid beta_0.5 beta_0.3 beta_0.1
-    add_partitions mechanism "$dataset" mechanism fedprox full beta_0.5 beta_0.3
-    add_partitions mechanism "$dataset" mechanism moon full beta_0.5 beta_0.3
+    local dataset="$1" method
+    for method in fixed full; do
+        add_partitions dataset "$dataset" default default "$method" \
+            iid beta_0.5 beta_0.3 beta_0.1
+        add_partitions model "$dataset" model mobilenetv2 "$method" \
+            iid beta_0.5 beta_0.3 beta_0.1
+        add_partitions mechanism "$dataset" mechanism fedprox "$method" beta_0.5 beta_0.3
+        add_partitions mechanism "$dataset" mechanism moon "$method" beta_0.5 beta_0.3
+    done
+}
+
+add_tuning_jobs() {
+    # One-factor revalidation around the feature-free final candidate:
+    #   lambda_max=1, soft_tau=.85, JS_gain=1.
+    # Every supplied partition receives the same seven configurations so that
+    # comparisons within a partition never cross machines.
+    local partition value
+    for partition in "$@"; do
+        for value in final lmax0p5 lmax2p0 tau0p80 tau0p90 gain0p5 gain2p0; do
+            add_job sensitivity cifar100 sensitivity "$value" "$partition" full
+        done
+    done
 }
 
 case "$RUN_SET" in
+    tune_4gpu)
+        add_tuning_jobs iid beta_0.5
+        ;;
+    tune_2gpu)
+        add_tuning_jobs beta_0.1
+        ;;
     cifar_tiny_4gpu)
         # Rebuild the complete basic adaptive rows under the same legacy
         # execution protocol as the reusable Plain/fixed-lambda baselines.
-        add_partitions base cifar10 default default full \
-            iid beta_0.5 beta_0.3 beta_0.1
-        add_partitions base cifar100 default default full \
-            iid beta_0.5 beta_0.3 beta_0.1
+        for method in fixed full; do
+            add_partitions base cifar10 default default "$method" \
+                iid beta_0.5 beta_0.3 beta_0.1
+            add_partitions base cifar100 default default "$method" \
+                iid beta_0.5 beta_0.3 beta_0.1
+        done
 
         # Core one-factor sensitivity around the fixed final point (1,1).
         # The already completed (lmax=1, gain=1) rows are the references.
@@ -217,10 +252,12 @@ case "$RUN_SET" in
         add_job ablation cifar100 default default beta_0.3 full
 
         # CIFAR-100: all previously reported OFAT axes, adaptive row only.
-        add_partitions model cifar100 model mobilenetv2 full \
-            iid beta_0.5 beta_0.3 beta_0.1
-        add_partitions mechanism cifar100 mechanism fedprox full beta_0.5 beta_0.3
-        add_partitions mechanism cifar100 mechanism moon full beta_0.5 beta_0.3
+        for method in fixed full; do
+            add_partitions model cifar100 model mobilenetv2 "$method" \
+                iid beta_0.5 beta_0.3 beta_0.1
+            add_partitions mechanism cifar100 mechanism fedprox "$method" beta_0.5 beta_0.3
+            add_partitions mechanism cifar100 mechanism moon "$method" beta_0.5 beta_0.3
+        done
         add_protocol_jobs cifar100
 
         # Most TinyImageNet protocol jobs stay here; E=10 is moved to the
@@ -283,8 +320,11 @@ configure_job() {
             ;;
         sensitivity\|lmax0p5) JOB_LAMBDA_MAX=0.5 ;;
         sensitivity\|lmax2p0) JOB_LAMBDA_MAX=2.0 ;;
+        sensitivity\|tau0p80) JOB_SOFT_TAU=0.80 ;;
+        sensitivity\|tau0p90) JOB_SOFT_TAU=0.90 ;;
         sensitivity\|gain0p5) JOB_JS_GAIN=0.5 ;;
         sensitivity\|gain2p0) JOB_JS_GAIN=2.0 ;;
+        sensitivity\|final) ;;
         default\|default) ;;
         *) echo "Unknown axis/value: $axis/$value" >&2; return 1 ;;
     esac
@@ -296,16 +336,12 @@ configure_job() {
         WARMUP_ROUNDS=100
     fi
 
-    if [[ "$scope" == ablation ]]; then
-        METHOD="$method"
-    else
-        METHOD=full
-    fi
+    METHOD="$method"
 }
 
 job_name() {
     local scope="$1" dataset="$2" axis="$3" value="$4" partition="$5" method="$6"
-    printf '%s_%s_%s_%s_%s_seed%s_r%s' \
+    printf '%s_%s_%s_%s_%s_nofeat_seed%s_r%s' \
         "$dataset" "$partition" "$scope" "$value" "$method" "$SEED" "$ROUNDS"
 }
 
@@ -324,15 +360,18 @@ job_weight() {
     [[ "$axis" == local_epochs && "$value" == e10 ]] && weight=$((weight * 2))
     [[ "$axis" == participation && "$value" == c0p05 ]] && weight=$((weight / 2))
     [[ "$axis" == participation && "$value" == c0p20 ]] && weight=$((weight * 2))
+    [[ "$method" == fixed ]] && weight=$((weight * 4 / 5))
     printf '%d' "$weight"
 }
 
 run_job() {
     local gpu="$1" job="$2"
-    local scope dataset axis value partition method name rel_dir log_file pkl_file
+    local scope dataset axis value partition method name rel_dir log_file pkl_file job_alpha
     local -a partition_flags CMD paired_flags
     IFS='|' read -r scope dataset axis value partition method <<< "$job"
     configure_job "$scope" "$dataset" "$axis" "$value" "$method"
+    job_alpha="$JOB_LAMBDA_MAX"
+    [[ "$METHOD" == fixed ]] && job_alpha="$FIXED_LAMBDA"
     name="$(job_name "$scope" "$dataset" "$axis" "$value" "$partition" "$method")"
     rel_dir="${scope}/${dataset}/${axis}/${value}/${partition}/seed${SEED}"
     log_file="${LOG_ROOT}/${rel_dir}/${name}.log"
@@ -374,7 +413,7 @@ run_job() {
         --byot_branch_kd_teacher_temperature "$KD_TEMPERATURE"
         --byot_branch_kd_student_temperature "$KD_TEMPERATURE"
         --byot_proxy_temperature "$PROXY_TEMPERATURE"
-        --byot_alpha "$JOB_LAMBDA_MAX" --alpha_min_scale 0.0
+        --byot_alpha "$job_alpha" --alpha_min_scale 0.0
     )
     append_method_components "$METHOD"
 
@@ -433,8 +472,9 @@ done
 
 echo "========== Final JS-branch reruns: ${RUN_SET} =========="
 echo "GPUs=${GPUS[*]} | pending=${#PENDING_JOBS[@]}/${#JOBS[@]} jobs | seed=${SEED}"
-echo "protocol=min${MIN_REQUIRE_SIZE}, keep_last=0, lambda_max=${LAMBDA_MAX}, tau=${SOFT_TAU}, JS gain=${JS_GAIN}"
-echo "Only final adaptive/ablation rows are run; Plain and fixed lambda=0.3 are reused."
+echo "protocol=min${MIN_REQUIRE_SIZE}, keep_last=0, feature_beta=${FEATURE_BETA}"
+echo "adaptive: lambda_max=${LAMBDA_MAX}, tau=${SOFT_TAU}, JS gain=${JS_GAIN}; fixed lambda=${FIXED_LAMBDA}"
+echo "Plain is reused; no-feature fixed/adaptive/ablation rows are run."
 echo "logs=${LOG_ROOT}"
 if (( ${#PENDING_JOBS[@]} == 0 )); then
     echo "All jobs in this run set are already complete."
