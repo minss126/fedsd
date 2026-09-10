@@ -28,6 +28,7 @@ LOCAL_EPOCHS="${LOCAL_EPOCHS:-5}"
 LR="${LR:-0.1}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
+MIN_REQUIRE_SIZE="${MIN_REQUIRE_SIZE:-64}"
 FEATURE_BETA="${FEATURE_BETA:-0.01}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 PROBE_INTERVAL="${PROBE_INTERVAL:-50}"
@@ -36,7 +37,7 @@ PROBE_BATCH_SIZE="${PROBE_BATCH_SIZE:-64}"
 PROBE_CLIENTS="${PROBE_CLIENTS:-0}"
 LOCAL_MAX_BATCHES="${LOCAL_MAX_BATCHES:-0}"
 GLOBAL_MAX_BATCHES="${GLOBAL_MAX_BATCHES:-0}"
-LOG_ROOT="${LOG_ROOT:-logs/analysis/logs_gradient_route_probe_t1_r500}"
+LOG_ROOT="${LOG_ROOT:-logs/analysis/logs_gradient_route_probe_t1_r500_min64}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -98,6 +99,7 @@ run_job() {
         --logdir "$LOG_ROOT" --log_file_name "${setting}/${variant}" \
         --model resnet18_byot --alg fedbyot \
         --partition "$partition_mode" --beta "$beta" \
+        --min_require_size "$MIN_REQUIRE_SIZE" \
         --byot_active_branches 1,2,3 \
         --byot_branch_loss_reduction sum \
         --byot_branch_objective "$objective" --byot_alpha "$alpha" \
@@ -141,6 +143,7 @@ echo "gpus=${GPUS[*]}"
 echo "datasets=${DATASETS[*]}, partitions=${PARTITIONS[*]}"
 echo "variants=${VARIANTS[*]}, seeds=${SEEDS[*]}"
 echo "rounds=${ROUNDS}, local_epochs=${LOCAL_EPOCHS}, temperature=${TEMPERATURE}"
+echo "partition min_require_size=${MIN_REQUIRE_SIZE}"
 if [ -n "$PROBE_ROUNDS" ]; then
     echo "probe completed rounds=${PROBE_ROUNDS}"
 else

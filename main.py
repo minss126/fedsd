@@ -1636,7 +1636,7 @@ def get_args():
     parser.add_argument('--beta', type=float, default=0.3, help='The parameter for the dirichlet distribution for data partitioning')
     # noniid 조절, 작을수록 noniid
     parser.add_argument(
-        '--min_require_size', type=int, default=10,
+        '--min_require_size', type=int, default=64,
         help=(
             'Minimum client sample count accepted by non-IID Dirichlet '
             'partitioning. The partition is redrawn until every client meets '

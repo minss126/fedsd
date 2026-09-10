@@ -22,7 +22,7 @@ else
     PYTHON_BIN="python3"
 fi
 
-RUN_SET="${RUN_SET:?Set RUN_SET to tune_4gpu, tune_2gpu, cifar_tiny_4gpu, or image_2gpu}"
+RUN_SET="${RUN_SET:?Set RUN_SET to tune_4gpu, tune_2gpu, temperature_t0p5, cifar_tiny_4gpu, or image_2gpu}"
 SEED="${SEED:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -222,6 +222,13 @@ case "$RUN_SET" in
     tune_2gpu)
         add_tuning_jobs beta_0.1
         ;;
+    temperature_t0p5)
+        # Final JS-branch + no-feature method with only the KD temperature
+        # changed from 1.0 to 0.5. Existing T=1 sensitivity/final rows are
+        # the references, so no baselines or additional hyperparameters run.
+        add_partitions sensitivity cifar100 sensitivity tkd0p5 full \
+            iid beta_0.5 beta_0.3 beta_0.1
+        ;;
     cifar_tiny_4gpu)
         # Rebuild the complete basic adaptive rows under the same legacy
         # execution protocol as the reusable Plain/fixed-lambda baselines.
@@ -324,6 +331,7 @@ configure_job() {
         sensitivity\|tau0p90) JOB_SOFT_TAU=0.90 ;;
         sensitivity\|gain0p5) JOB_JS_GAIN=0.5 ;;
         sensitivity\|gain2p0) JOB_JS_GAIN=2.0 ;;
+        sensitivity\|tkd0p5) ;;
         sensitivity\|final) ;;
         default\|default) ;;
         *) echo "Unknown axis/value: $axis/$value" >&2; return 1 ;;

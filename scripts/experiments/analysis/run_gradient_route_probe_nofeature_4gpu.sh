@@ -12,6 +12,6 @@ export PARTITIONS_OVERRIDE="${PARTITIONS_OVERRIDE:-iid beta_0.1}"
 export VARIANTS_OVERRIDE="${VARIANTS_OVERRIDE:-ce_only kd_only}"
 export FEATURE_BETA=0.0
 export TEMPERATURE="${TEMPERATURE:-1.0}"
-export LOG_ROOT="${LOG_ROOT:-logs/analysis/logs_gradient_route_probe_no_feature_t1_r500}"
+export LOG_ROOT="${LOG_ROOT:-logs/analysis/logs_gradient_route_probe_no_feature_t1_r500_min64}"
 
 exec bash scripts/experiments/analysis/run_gradient_route_probe_4gpu.sh
