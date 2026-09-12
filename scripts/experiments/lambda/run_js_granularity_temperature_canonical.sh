@@ -34,6 +34,22 @@ PARTITIONS=(${PARTITIONS_OVERRIDE:-iid beta_0.1})
 METHODS=(${METHODS_OVERRIDE:-adaptive_no_js js_client js_branch})
 KD_TEMPERATURES=(${KD_TEMPERATURES_OVERRIDE:-0.5 1.0})
 
+DATASET="${DATASET:-cifar100}"
+case "$DATASET" in
+    cifar10)
+        NUM_CLASSES=10
+        DATASET_LABEL="CIFAR-10"
+        ;;
+    cifar100)
+        NUM_CLASSES=100
+        DATASET_LABEL="CIFAR-100"
+        ;;
+    *)
+        echo "Unsupported DATASET=${DATASET}; expected cifar10 or cifar100." >&2
+        exit 1
+        ;;
+esac
+
 SEED="${SEED:-0}"
 ROUNDS="${ROUNDS:-500}"
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-5}"
@@ -53,7 +69,13 @@ SOFT_TAU="${SOFT_TAU:-0.85}"
 SOFT_TEMPERATURE="${SOFT_TEMPERATURE:-0.05}"
 JS_GAIN="${JS_GAIN:-1.0}"
 
-LOG_ROOT="${LOG_ROOT:-logs/lambda/adaptive/logs_js_granularity_temperature_canonical_no_feature}"
+if [[ -z "${LOG_ROOT:-}" ]]; then
+    if [[ "$DATASET" == cifar100 ]]; then
+        LOG_ROOT="logs/lambda/adaptive/logs_js_granularity_temperature_canonical_no_feature"
+    else
+        LOG_ROOT="logs/lambda/adaptive/logs_js_granularity_temperature_canonical_no_feature_${DATASET}"
+    fi
+fi
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -110,7 +132,7 @@ run_job() {
 
     need_proxy="$(need_proxy_for_method "$method")"
     tag="tkd$(value_tag "$temperature")"
-    name="cifar100_${partition}_${method}_${tag}_canonical_nofeat_seed${SEED}_r${ROUNDS}"
+    name="${DATASET}_${partition}_${method}_${tag}_canonical_nofeat_seed${SEED}_r${ROUNDS}"
     rel_dir="${partition}/seed${SEED}/${method}"
     log_file="${LOG_ROOT}/${rel_dir}/${name}.log"
     pkl_file="${LOG_ROOT}/${rel_dir}/${name}.pkl"
@@ -124,7 +146,7 @@ run_job() {
     mapfile -t part_flags < <(partition_args "$partition")
     cmd=(
         "$PYTHON_BIN" main.py
-        --dataset cifar100 --datadir ./data --in_channels 3 --num_classes 100
+        --dataset "$DATASET" --datadir ./data --in_channels 3 --num_classes "$NUM_CLASSES"
         "${part_flags[@]}" --min_require_size "$MIN_REQUIRE_SIZE"
         --n_clients "$NUM_CLIENTS" --sample_fraction "$SAMPLE_FRACTION"
         --round "$ROUNDS" --epochs "$LOCAL_EPOCHS"
@@ -180,7 +202,7 @@ run_job() {
 
 echo "========== JS granularity x KD-temperature pilot =========="
 echo "GPUs=${GPUS[*]} | jobs=${#JOBS[@]} | seed=${SEED}"
-echo "CIFAR-100 / ResNet18-BYOT / FedAvg / R=${ROUNDS} / E=${LOCAL_EPOCHS}"
+echo "${DATASET_LABEL} / ResNet18-BYOT / FedAvg / R=${ROUNDS} / E=${LOCAL_EPOCHS}"
 echo "partitions=${PARTITIONS[*]} | methods=${METHODS[*]} | T_KD=${KD_TEMPERATURES[*]}"
 echo "feature_beta=0 | min_require_size=${MIN_REQUIRE_SIZE} | warm-up=${WARMUP_ROUNDS}"
 echo "lambda_max=${LAMBDA_MAX} | tau=${SOFT_TAU} | JS_gain=${JS_GAIN}"
