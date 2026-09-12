@@ -8,9 +8,11 @@
 #   js_client      : adaptive_no_js x one client-level JS need gate
 #   js_branch      : adaptive_no_js x a separate JS need gate per branch
 #
-# This runner deliberately DOES NOT pass --paired_resnet_init.  All methods
-# use the same ResNet18-BYOT architecture and seed, so the ordinary model
-# construction already gives them the same complete canonical initial state.
+# This runner deliberately uses the original execution protocol: it passes
+# none of --paired_resnet_init, --paired_execution_rng, or
+# --preserve_byot_proxy_rng.  All methods use the same ResNet18-BYOT
+# architecture and seed, so ordinary model construction gives them the same
+# complete canonical initial state without extra RNG intervention.
 
 set -euo pipefail
 
@@ -130,7 +132,7 @@ run_job() {
         --scheduler round --schedule_round 1 --lr_gamma 0.998
         --batch_size "$BATCH_SIZE" --test_batch_size "$TEST_BATCH_SIZE"
         --num_workers "$NUM_WORKERS" --seed "$SEED" --device "cuda:${gpu}"
-        --sequential_client_execution --paired_execution_rng --preserve_byot_proxy_rng
+        --sequential_client_execution
         --model resnet18_byot --alg fedbyot
         --byot_active_branches 1,2,3 --byot_branch_loss_reduction sum
         --byot_branch_objective kd_only --byot_beta 0.0
@@ -182,7 +184,7 @@ echo "CIFAR-100 / ResNet18-BYOT / FedAvg / R=${ROUNDS} / E=${LOCAL_EPOCHS}"
 echo "partitions=${PARTITIONS[*]} | methods=${METHODS[*]} | T_KD=${KD_TEMPERATURES[*]}"
 echo "feature_beta=0 | min_require_size=${MIN_REQUIRE_SIZE} | warm-up=${WARMUP_ROUNDS}"
 echo "lambda_max=${LAMBDA_MAX} | tau=${SOFT_TAU} | JS_gain=${JS_GAIN}"
-echo "initialization=canonical BYOT (--paired_resnet_init is intentionally absent)"
+echo "initialization=canonical BYOT; paired/preserved RNG controls are intentionally absent"
 echo "log_root=${LOG_ROOT}"
 
 if [[ "$DRY_RUN" == 1 ]]; then
