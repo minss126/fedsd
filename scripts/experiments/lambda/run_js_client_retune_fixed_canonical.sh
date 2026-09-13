@@ -285,25 +285,32 @@ for job in "${JOBS[@]}"; do
 done
 echo "estimated_queue_minutes=${LOADS[*]}"
 
-if [[ "$DRY_RUN" == 1 ]]; then
-    for ((i=0; i<${#GPUS[@]}; i++)); do
-        while IFS= read -r job; do
-            [[ -n "$job" ]] || continue
-            run_job "${GPUS[$i]}" "$job"
-        done <<< "${QUEUES[$i]}"
-    done
-    echo "Dry run complete."
-    exit 0
-fi
-
 run_queue() {
-    local gpu_index="$1" failed=0 gpu="${GPUS[$gpu_index]}" job
+    local gpu_index="$1"
+    local failed=0
+    local gpu="${GPUS[$gpu_index]}"
+    local job
     while IFS= read -r job; do
         [[ -n "$job" ]] || continue
         run_job "$gpu" "$job" || failed=1
     done <<< "${QUEUES[$gpu_index]}"
     return "$failed"
 }
+
+if [[ "$DRY_RUN" == 1 ]]; then
+    # Exercise the same run_queue/run_job path as a real launch, but do it
+    # serially so concurrent dry-run output cannot interleave and hide jobs.
+    status=0
+    for ((i=0; i<${#GPUS[@]} && i<${#JOBS[@]}; i++)); do
+        run_queue "$i" || status=1
+    done
+    if (( status != 0 )); then
+        echo "Dry run failed while validating the real queue path." >&2
+        exit "$status"
+    fi
+    echo "Dry run complete (${#JOBS[@]} jobs through the real queue path)."
+    exit 0
+fi
 
 pids=()
 for ((i=0; i<${#GPUS[@]} && i<${#JOBS[@]}; i++)); do
