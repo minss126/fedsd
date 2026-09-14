@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# 4-GPU side: TinyImageNet seed-0 fixed completion only.
+# 4-GPU side: all four missing seed-0 fixed runs, one job per GPU.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

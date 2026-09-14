@@ -14,8 +14,10 @@
 #   paired/preserved RNG-control flags are deliberately absent.
 #
 # Work split, based on measured runtime:
-#   server4: seed-0 missing TinyImageNet fixed runs (2 jobs by default)
-#   server2: seed-0 missing CIFAR-10 fixed runs (2 jobs by default)
+#   server4: all four missing seed-0 fixed runs, one per GPU
+#            (CIFAR-10 IID/beta=.1 + TinyImageNet IID/beta=.1)
+#   server2: optional fallback for the two CIFAR-10 runs; do not launch it
+#            together with server4 under the default seed-0 plan.
 #
 # Seed 1/2 validation remains available as an explicit opt-in by setting
 # INCLUDE_VALIDATION=1, but it is disabled for the current seed-0 comparison.
@@ -175,6 +177,7 @@ case "$RUN_SET" in
     server4)
         if [[ "$INCLUDE_SEED0_FIXED" == 1 ]]; then
             add_seed0_fixed_jobs tinyimagenet
+            add_seed0_fixed_jobs cifar10
         fi
         add_validation_jobs tinyimagenet
         add_validation_jobs cifar100
