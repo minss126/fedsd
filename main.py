@@ -7,7 +7,9 @@ import random
 import os
 import json
 import hashlib
+import math
 import numpy as np
+from contextlib import contextmanager
 
 import sys
 sys.path.append('./models')
@@ -46,6 +48,44 @@ LAYERWISE_UPDATE_GROUPS = (
     "other",
 )
 
+POSTLOCAL_REF_GROUPS = ("low", "mid", "high")
+POSTLOCAL_REF_HEADS = ("teacher", "b1", "b2", "b3")
+POSTLOCAL_REF_METRICS = (
+    "sample_count",
+    "divergence_sample_count",
+    "client_count_mean",
+    "entropy_norm",
+    "true_label_prob",
+    "confidence",
+    "acc",
+    "js_to_mean",
+    "prob_l2_var",
+)
+POSTLOCAL_REF_KEYS = [
+    f"postlocal_ref_{group}_{head}_{metric}"
+    for group in POSTLOCAL_REF_GROUPS
+    for head in POSTLOCAL_REF_HEADS
+    for metric in POSTLOCAL_REF_METRICS
+]
+
+
+@contextmanager
+def _preserve_analysis_rng():
+    """Keep an evaluation-only diagnostic from changing the train RNG stream."""
+
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
 
 def _args_snapshot(args):
     """Return a stable, serialization-safe snapshot of CLI arguments.
@@ -61,6 +101,260 @@ def _args_snapshot(args):
         for key, value in vars(args).items()
         if not key.startswith("_")
     }
+
+
+def _should_probe_postlocal_reference(args, completed_round):
+    if not getattr(args, "log_postlocal_branch_distribution_stats", False):
+        return False
+    raw_rounds = str(getattr(args, "postlocal_ref_probe_rounds", "") or "").strip()
+    if raw_rounds:
+        requested = {
+            int(token.strip()) for token in raw_rounds.split(",") if token.strip()
+        }
+        return int(completed_round) in requested
+    interval = int(getattr(args, "postlocal_ref_probe_interval", 0))
+    return interval > 0 and int(completed_round) % interval == 0
+
+
+def _compute_postlocal_reference_distribution_stats(
+    nets_this_round,
+    dataloaders_this_round,
+    reference_dataloader,
+    device,
+    args,
+    train_module,
+    capture_full_logits=False,
+):
+    """Evaluate post-local client heads on one fixed, class-balanced test set.
+
+    For each client, a reference label is categorized as low/mid/high frequency
+    using that client's local class count.  All client models see the exact same
+    reference examples.  The routine is evaluation-only and restores both model
+    modes and all process RNG states before returning.
+    """
+
+    max_per_class = int(getattr(args, "postlocal_ref_samples_per_class", 8))
+    client_ids = list(nets_this_round)
+    num_classes = int(getattr(args, "num_classes", 0))
+    if (
+        reference_dataloader is None
+        or max_per_class <= 0
+        or len(client_ids) < 2
+        or num_classes <= 1
+    ):
+        return {}, None
+
+    low_ratio = float(getattr(args, "train_branch_freq_low_ratio", 0.5))
+    high_ratio = float(getattr(args, "train_branch_freq_high_ratio", 1.5))
+    temperature = float(getattr(args, "temperature", 1.0))
+    client_groups = {}
+    for client_id in client_ids:
+        class_counts, _, expected = train_module.get_local_class_counts(
+            dataloaders_this_round.get(client_id), args, device
+        )
+        if class_counts is None or expected is None or expected <= 0.0:
+            continue
+        ratios = (class_counts / max(float(expected), 1e-12)).detach().cpu().numpy()
+        groups = np.full(num_classes, 1, dtype=np.int8)
+        groups[ratios < low_ratio] = 0
+        groups[ratios > high_ratio] = 2
+        client_groups[client_id] = groups
+    client_ids = [client_id for client_id in client_ids if client_id in client_groups]
+    if len(client_ids) < 2:
+        return {}, None
+
+    accum = {
+        group: {
+            head: {metric: 0.0 for metric in POSTLOCAL_REF_METRICS}
+            for head in POSTLOCAL_REF_HEADS
+        }
+        for group in POSTLOCAL_REF_GROUPS
+    }
+    per_class_seen = np.zeros(num_classes, dtype=np.int64)
+    raw_logits = None
+    raw_labels = []
+    raw_reference_positions = []
+    if capture_full_logits:
+        raw_logits = {
+            client_id: {head: [] for head in POSTLOCAL_REF_HEADS}
+            for client_id in client_ids
+        }
+    reference_position = 0
+    was_training = {
+        client_id: nets_this_round[client_id].training for client_id in client_ids
+    }
+    for client_id in client_ids:
+        nets_this_round[client_id].eval()
+
+    try:
+        with _preserve_analysis_rng(), torch.no_grad():
+            for x, target in reference_dataloader:
+                batch_positions = torch.arange(
+                    reference_position,
+                    reference_position + x.size(0),
+                    dtype=torch.long,
+                )
+                reference_position += x.size(0)
+                selected = []
+                for sample_idx, label in enumerate(target.detach().cpu().long().tolist()):
+                    if 0 <= label < num_classes and per_class_seen[label] < max_per_class:
+                        selected.append(sample_idx)
+                        per_class_seen[label] += 1
+                if not selected:
+                    if np.all(per_class_seen >= max_per_class):
+                        break
+                    continue
+
+                index = torch.tensor(selected, dtype=torch.long)
+                x_selected = x.index_select(0, index).to(device, non_blocking=True)
+                target_selected = target.index_select(0, index).to(
+                    device, non_blocking=True
+                ).long()
+                probs_by_head = {head: [] for head in POSTLOCAL_REF_HEADS}
+                for client_id in client_ids:
+                    outputs = nets_this_round[client_id](x_selected)
+                    if not (isinstance(outputs, tuple) and len(outputs) == 8):
+                        raise ValueError(
+                            "Post-local branch analysis requires the ResNet18-BYOT "
+                            "8-tuple output."
+                        )
+                    final_logits, b1_logits, b2_logits, b3_logits = outputs[:4]
+                    for head, logits in zip(
+                        POSTLOCAL_REF_HEADS,
+                        (final_logits, b1_logits, b2_logits, b3_logits),
+                    ):
+                        probs_by_head[head].append(F.softmax(logits / temperature, dim=1))
+                        if capture_full_logits:
+                            raw_logits[client_id][head].append(
+                                logits.detach().cpu().to(torch.float16)
+                            )
+
+                if capture_full_logits:
+                    raw_labels.append(target_selected.detach().cpu())
+                    raw_reference_positions.append(batch_positions.index_select(0, index))
+
+                for head in POSTLOCAL_REF_HEADS:
+                    probs_by_head[head] = torch.stack(probs_by_head[head], dim=0)
+                for sample_idx, label in enumerate(target_selected.tolist()):
+                    for group_idx, group in enumerate(POSTLOCAL_REF_GROUPS):
+                        model_indices = [
+                            idx
+                            for idx, client_id in enumerate(client_ids)
+                            if client_groups[client_id][label] == group_idx
+                        ]
+                        if not model_indices:
+                            continue
+                        model_index = torch.tensor(
+                            model_indices, device=device, dtype=torch.long
+                        )
+                        for head in POSTLOCAL_REF_HEADS:
+                            probs = probs_by_head[head].index_select(0, model_index)[
+                                :, sample_idx, :
+                            ]
+                            mean_prob = probs.mean(dim=0, keepdim=True)
+                            entropy = -(
+                                probs * torch.log(probs.clamp_min(1e-8))
+                            ).sum(dim=1) / math.log(num_classes)
+                            true_prob = probs[:, label]
+                            confidence, prediction = probs.max(dim=1)
+                            metric = accum[group][head]
+                            metric["entropy_norm"] += float(entropy.sum().item())
+                            metric["true_label_prob"] += float(true_prob.sum().item())
+                            metric["confidence"] += float(confidence.sum().item())
+                            metric["acc"] += float(
+                                (prediction == label).float().sum().item()
+                            )
+                            metric["client_count_mean"] += float(len(model_indices))
+                            metric["sample_count"] += 1.0
+                            if len(model_indices) >= 2:
+                                js = (
+                                    probs
+                                    * (
+                                        torch.log(probs.clamp_min(1e-8))
+                                        - torch.log(mean_prob.clamp_min(1e-8))
+                                    )
+                                ).sum(dim=1)
+                                metric["js_to_mean"] += float(
+                                    (js / math.log(num_classes)).mean().item()
+                                )
+                                metric["prob_l2_var"] += float(
+                                    ((probs - mean_prob) ** 2)
+                                    .sum(dim=1)
+                                    .mean()
+                                    .item()
+                                )
+                                metric["divergence_sample_count"] += 1.0
+                if np.all(per_class_seen >= max_per_class):
+                    break
+    finally:
+        for client_id in client_ids:
+            nets_this_round[client_id].train(was_training[client_id])
+
+    result = {}
+    for group in POSTLOCAL_REF_GROUPS:
+        for head in POSTLOCAL_REF_HEADS:
+            metric = accum[group][head]
+            sample_count = metric["sample_count"]
+            client_count = metric["client_count_mean"]
+            divergence_count = metric["divergence_sample_count"]
+            prefix = f"postlocal_ref_{group}_{head}"
+            result[f"{prefix}_sample_count"] = int(sample_count)
+            result[f"{prefix}_divergence_sample_count"] = int(divergence_count)
+            result[f"{prefix}_client_count_mean"] = (
+                client_count / sample_count if sample_count else None
+            )
+            for name in ("entropy_norm", "true_label_prob", "confidence", "acc"):
+                result[f"{prefix}_{name}"] = (
+                    metric[name] / client_count if client_count else None
+                )
+            for name in ("js_to_mean", "prob_l2_var"):
+                result[f"{prefix}_{name}"] = (
+                    metric[name] / divergence_count if divergence_count else None
+                )
+
+    raw_snapshot = None
+    if capture_full_logits and raw_labels:
+        head_logits = []
+        for client_id in client_ids:
+            head_logits.append(
+                torch.stack(
+                    [
+                        torch.cat(raw_logits[client_id][head], dim=0)
+                        for head in POSTLOCAL_REF_HEADS
+                    ],
+                    dim=0,
+                )
+            )
+        raw_snapshot = {
+            "format": "postlocal_full_logits_v2_completed_round",
+            "head_order": list(POSTLOCAL_REF_HEADS),
+            "client_ids": torch.tensor(client_ids, dtype=torch.long),
+            "reference_positions": torch.cat(raw_reference_positions, dim=0),
+            "reference_labels": torch.cat(raw_labels, dim=0),
+            "local_frequency_groups": torch.tensor(
+                np.stack([client_groups[client_id] for client_id in client_ids]),
+                dtype=torch.int8,
+            ),
+            "group_order": list(POSTLOCAL_REF_GROUPS),
+            "logits": torch.stack(head_logits, dim=0),
+        }
+    return result, raw_snapshot
+
+
+def _save_postlocal_full_logits(raw_snapshot, args, completed_round):
+    if raw_snapshot is None:
+        return None
+    output_dir = os.path.join(args.logdir, f"{args.log_file_name}_full_logits")
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"round_{int(completed_round):04d}.pt")
+    temp_path = f"{output_path}.tmp.{os.getpid()}"
+    try:
+        torch.save(raw_snapshot, temp_path)
+        os.replace(temp_path, output_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    return output_path
 
 
 def _initialize_paired_resnet_shared_path(model, seed):
@@ -2047,6 +2341,40 @@ def get_args():
         '--gradient_route_overwrite', action='store_true',
         help='Overwrite existing round-wise gradient-route JSON files.',
     )
+    parser.add_argument(
+        '--log_postlocal_branch_distribution_stats', action='store_true',
+        help=(
+            'After local training and before aggregation, evaluate every selected '
+            'BYOT client model on a shared class-balanced official-test reference set.'
+        ),
+    )
+    parser.add_argument(
+        '--postlocal_ref_probe_rounds', default='',
+        help=(
+            'Optional comma-separated one-based completed rounds for the post-local '
+            'reference probe; overrides --postlocal_ref_probe_interval.'
+        ),
+    )
+    parser.add_argument(
+        '--postlocal_ref_probe_interval', type=int, default=0,
+        help='Fallback completed-round interval for the post-local reference probe.',
+    )
+    parser.add_argument(
+        '--postlocal_ref_samples_per_class', type=int, default=8,
+        help='Fixed official-test reference samples retained per class.',
+    )
+    parser.add_argument(
+        '--save_postlocal_full_logits', action='store_true',
+        help='Save float16 logits for every selected client/head/reference sample.',
+    )
+    parser.add_argument(
+        '--train_branch_freq_low_ratio', type=float, default=0.5,
+        help='A local class-count/expected-count ratio below this is rare (low).',
+    )
+    parser.add_argument(
+        '--train_branch_freq_high_ratio', type=float, default=1.5,
+        help='A local class-count/expected-count ratio above this is frequent (high).',
+    )
     parser.add_argument('--log_post_aggregation_representation', action='store_true',
                         help='Log common-reference representation change caused by each sampled FedAvg aggregation.')
     parser.add_argument('--representation_probe_interval', type=int, default=50,
@@ -2545,6 +2873,9 @@ def main():
             "pre_fisher", "post_fisher", "fisher_delta",
         ):
             pkl_dict[f"representation_{feature_name}_{stat_name}"] = []
+    if getattr(args, "log_postlocal_branch_distribution_stats", False):
+        for postlocal_key in POSTLOCAL_REF_KEYS:
+            pkl_dict[postlocal_key] = []
     last_10 = []
     lr = args.lr
 
@@ -2831,6 +3162,35 @@ def main():
                 )
             )
 
+        postlocal_reference_stats = {}
+        if _should_probe_postlocal_reference(args, completed_round):
+            postlocal_reference_stats, postlocal_raw_logits = (
+                _compute_postlocal_reference_distribution_stats(
+                    nets_this_round=nets_this_round,
+                    dataloaders_this_round=dataloaders_this_round,
+                    reference_dataloader=global_test_dataloader,
+                    device=device,
+                    args=args,
+                    train_module=train_module,
+                    capture_full_logits=getattr(
+                        args, "save_postlocal_full_logits", False
+                    ),
+                )
+            )
+            postlocal_path = None
+            if getattr(args, "save_postlocal_full_logits", False):
+                postlocal_path = _save_postlocal_full_logits(
+                    postlocal_raw_logits, args, completed_round
+                )
+            logger.info(
+                "Post-local common-reference probe: "
+                f"completed_round={completed_round}, "
+                "rare/B3 client-JS="
+                f"{postlocal_reference_stats.get('postlocal_ref_low_b3_js_to_mean')}"
+            )
+            if postlocal_path:
+                logger.info(f"Saved full post-local logits: {postlocal_path}")
+
         if getattr(args, "log_update_step_size", False):
             step_record = summarize_update_step_records(
                 round,
@@ -2994,6 +3354,11 @@ def main():
             'branch_shared_gradient_kd_cosine',
         ]:
             pkl_dict[gradient_key].append(branch_shared_gradient_metrics.get(gradient_key))
+        if getattr(args, "log_postlocal_branch_distribution_stats", False):
+            for postlocal_key in POSTLOCAL_REF_KEYS:
+                pkl_dict[postlocal_key].append(
+                    postlocal_reference_stats.get(postlocal_key)
+                )
 
         # 모델 집계 (Aggregation)
         drift_metrics = {}

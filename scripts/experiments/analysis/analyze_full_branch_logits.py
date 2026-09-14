@@ -195,6 +195,46 @@ def make_summary(rows):
     return summary
 
 
+def make_rare_frequent_gaps(summary):
+    """Pair low/high rows and report rare minus frequent for every metric."""
+
+    group_keys = ("dataset", "partition", "alpha", "head", "metric_scope")
+    grouped = defaultdict(dict)
+    for row in summary:
+        grouped[tuple(row[key] for key in group_keys)][row["frequency_group"]] = row
+
+    output = []
+    identifiers = set(group_keys) | {"frequency_group", "n_checkpoints"}
+    for key, by_frequency in sorted(grouped.items()):
+        rare = by_frequency.get("low")
+        frequent = by_frequency.get("high")
+        if rare is None or frequent is None:
+            continue
+        row = dict(zip(group_keys, key))
+        row["rare_group"] = "low"
+        row["frequent_group"] = "high"
+        row["rare_checkpoints"] = rare.get("n_checkpoints", 0)
+        row["frequent_checkpoints"] = frequent.get("n_checkpoints", 0)
+        metric_names = (set(rare) & set(frequent)) - identifiers
+        for metric in sorted(metric_names):
+            rare_value = rare.get(metric)
+            frequent_value = frequent.get(metric)
+            if not isinstance(rare_value, (int, float)) or not isinstance(
+                frequent_value, (int, float)
+            ):
+                continue
+            if not (
+                math.isfinite(float(rare_value))
+                and math.isfinite(float(frequent_value))
+            ):
+                continue
+            row[f"rare_{metric}"] = rare_value
+            row[f"frequent_{metric}"] = frequent_value
+            row[f"rare_minus_frequent_{metric}"] = rare_value - frequent_value
+        output.append(row)
+    return output
+
+
 def main():
     args = parse_args()
     root = Path(args.log_root)
@@ -267,14 +307,18 @@ def main():
     json_path = Path(f"{output_prefix}_rows.json")
     csv_path = Path(f"{output_prefix}_rows.csv")
     summary_path = Path(f"{output_prefix}_summary.csv")
+    gap_path = Path(f"{output_prefix}_rare_frequent_gap.csv")
     with json_path.open("w", encoding="utf-8") as file:
         json.dump({"rows": rows, "missing": missing}, file, indent=2)
     write_csv(csv_path, rows)
-    write_csv(summary_path, make_summary(rows))
+    summary = make_summary(rows)
+    write_csv(summary_path, summary)
+    write_csv(gap_path, make_rare_frequent_gaps(summary))
     print(f"rows={len(rows)}")
     print(f"json={json_path}")
     print(f"csv={csv_path}")
     print(f"summary={summary_path}")
+    print(f"rare_frequent_gap={gap_path}")
     if missing:
         print(f"missing_checkpoints={len(missing)}")
 
