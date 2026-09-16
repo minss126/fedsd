@@ -4914,8 +4914,18 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
         sequential_client_execution = bool(
             getattr(args, "sequential_client_execution", False)
         )
+        prev_net = None
+        if prev_nets is not None and net_id in prev_nets:
+            prev_net = prev_nets[net_id]
+
         if sequential_client_execution:
             net.to(device)
+            # MOON (and BYOT+MOON) evaluates the previous local model on the
+            # same GPU batch as the current/global models.  The sequential
+            # execution path keeps client snapshots on CPU, so move only the
+            # matching snapshot to the training device for this client.
+            if prev_net is not None:
+                prev_net.to(device)
         # `args` is shared while clients train sequentially.  Always clear the
         # scratch value, even when diagnostics are disabled, so stale runtime
         # state can never become a recursively nested round statistic.
@@ -4947,10 +4957,6 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
         correct_conf, zero_kd_classes, kd_std = 0.0, 0, 0.0
         wall_clock_time = 0.0
         compute_efficiency = 1.0 # 기본 알고리즘들은 매 에폭 모든 데이터를 연산함 (100%)
-
-        prev_net = None
-        if prev_nets is not None and net_id in prev_nets:
-            prev_net = prev_nets[net_id]
 
         # --- 알고리즘 분기 ---
         
@@ -5134,9 +5140,12 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
 
         if sequential_client_execution:
             # The optimizer is local to this loop iteration, so moving the
-            # completed model back to CPU is safe and bounds GPU memory by one
-            # client model even under 100-client full participation.
+            # completed/current and previous models back to CPU is safe and
+            # bounds GPU memory by one client pair even under high
+            # participation.
             net.to('cpu')
+            if prev_net is not None:
+                prev_net.to('cpu')
 
         if update_step_records is not None:
             args._last_round_update_step_records.extend(update_step_records)
