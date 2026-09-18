@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
-# Memory smoke test for the reduced ResNet50 publication scope.
+# Extended memory smoke test for the reduced ResNet50 publication scope.
 # GPU 0: TinyImageNet IID adaptive; GPU 1: ImageNet100-64 IID adaptive.
+# The default 10 rounds are long enough to expose unintended round-wise
+# memory growth while remaining much shorter than the 100-round full runs.
 # Try batch 64 first and retry batch 32 only when CUDA OOM is detected.
 set -euo pipefail
 
@@ -41,10 +43,15 @@ IMAGE_DIR="${IMAGE_DIR:-${DATA_ROOT}/imagenet100_resized_64_png}"
 
 LOG_ROOT="${LOG_ROOT:-logs/lambda/smoke/resnet50_adaptive_memory}"
 DRY_RUN="${DRY_RUN:-0}"
+SMOKE_ROUNDS="${SMOKE_ROUNDS:-10}"
+[[ "$SMOKE_ROUNDS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "SMOKE_ROUNDS must be a positive integer." >&2; exit 2;
+}
+WARMUP_ROUNDS=$(( (SMOKE_ROUNDS + 1) / 2 ))
 
 run_attempt() {
     local gpu="$1" dataset="$2" datadir="$3" classes="$4" batch="$5"
-    local stem="${dataset}_resnet50_adaptive_iid_seed0_r2_b${batch}"
+    local stem="${dataset}_resnet50_adaptive_iid_seed0_r${SMOKE_ROUNDS}_b${batch}"
     local dir="${LOG_ROOT}/${dataset}/batch${batch}"
     local terminal="${dir}/${stem}_terminal.log"
     mkdir -p "$dir"
@@ -56,7 +63,7 @@ run_attempt() {
         --model resnet50_byot --alg fedbyot
         --partition iid --min_require_size 64
         --n_clients 100 --sample_fraction 0.1
-        --round 2 --epochs 5
+        --round "$SMOKE_ROUNDS" --epochs 5
         --optimizer sgd --lr 0.01 --momentum 0.9 --reg 0.001
         --scheduler round --schedule_round 1 --lr_gamma 0.998
         --batch_size "$batch" --test_batch_size 256
@@ -71,7 +78,7 @@ run_attempt() {
         --byot_branch_kd_loss_scale_mode native_t2
         --byot_proxy_temperature 1.0 --byot_alpha 1.0
         --byot_round_lambda_schedule linear --byot_round_lambda_min 0.0
-        --byot_round_lambda_warmup 1
+        --byot_round_lambda_warmup "$WARMUP_ROUNDS"
         --byot_client_proxy teacher_label_prob
         --byot_client_alpha_min 0.0 --byot_client_alpha_max 1.0
         --byot_client_alpha_mode multiply --byot_client_reliability_power 1.0
@@ -84,7 +91,7 @@ run_attempt() {
         --byot_branch_need_min_gate 0.0 --byot_branch_need_temperature 1.0
     )
 
-    echo "[GPU $gpu] smoke start: $dataset | batch=$batch"
+    echo "[GPU $gpu] smoke start: $dataset | batch=$batch | rounds=$SMOKE_ROUNDS | warmup=$WARMUP_ROUNDS"
     if [[ "$DRY_RUN" == 1 ]]; then
         printf '[dry-run] '; printf '%q ' "${cmd[@]}"; printf '\n'
         return 0
@@ -98,7 +105,7 @@ run_dataset() {
         echo "[GPU $gpu] PASS: $dataset batch=64"
         return 0
     fi
-    local log64="${LOG_ROOT}/${dataset}/batch64/${dataset}_resnet50_adaptive_iid_seed0_r2_b64_terminal.log"
+    local log64="${LOG_ROOT}/${dataset}/batch64/${dataset}_resnet50_adaptive_iid_seed0_r${SMOKE_ROUNDS}_b64_terminal.log"
     if ! grep -Eqi 'out of memory|torch\.OutOfMemoryError|CUDA error: out of memory' "$log64"; then
         echo "[GPU $gpu] non-OOM failure: $dataset batch=64; inspect $log64" >&2
         return 1
