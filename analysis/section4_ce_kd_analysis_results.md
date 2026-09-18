@@ -59,6 +59,11 @@
 
 각 셀은 동일 objective에 대해 `CE local↔test cosine / KD local↔test cosine` 순서이다. Local gradient는 selected clients의 gradient를 실제 FedAvg weight로 합친 값이다.
 
+> 아래 본문 표는 `min_require_size=64`인 canonical run의 **round 500** 결과이다. 이는
+> `cos(Σ_k w_k g_k^local, g^test)`이며, client별 cosine을 평균한 값과는 다르다.
+> `min_require_size=10`으로 수행된 `logs_gradient_route_probe_no_feature_t1_r500`의
+> β=0.1 결과는 이 표에 사용하지 않는다.
+
 | Partition | Training trajectory | B1 | B2 | B3 | Combined |
 |---|---|---:|---:|---:|---:|
 | IID | CE-trained | 0.568 / 0.701 | 0.379 / 0.459 | 0.536 / 0.509 | 0.461 / 0.534 |
@@ -67,6 +72,44 @@
 | β=0.3 | KD-trained | 0.699 / 0.784 | 0.444 / 0.616 | 0.628 / 0.831 | 0.493 / 0.636 |
 | β=0.1 | CE-trained | 0.729 / 0.786 | 0.634 / 0.612 | 0.740 / 0.866 | 0.671 / 0.733 |
 | β=0.1 | KD-trained | 0.880 / 0.929 | 0.738 / 0.803 | 0.799 / 0.888 | 0.823 / 0.901 |
+
+#### Round 500 client-wise cosine 평균 (canonical min-64)
+
+각 셀은 각 client에서 cosine을 먼저 계산한 뒤 실제 FedAvg weight로 평균한
+`CE local↔test cosine / KD local↔test cosine`이다. 따라서 바로 위 표보다 낮을 수 있으며,
+이는 client gradient들이 서로 상쇄된 후의 aggregate cosine이 높아지는 효과를 구분해서 보여준다.
+
+| Partition | Training trajectory | B1 | B2 | B3 | Combined |
+|---|---|---:|---:|---:|---:|
+| IID | CE-trained | 0.496 / 0.611 | 0.285 / 0.343 | 0.367 / 0.332 | 0.375 / 0.443 |
+| IID | KD-trained | 0.707 / 0.805 | 0.356 / 0.428 | 0.430 / 0.425 | 0.467 / 0.633 |
+| β=0.1 | CE-trained | 0.447 / 0.600 | 0.344 / 0.424 | 0.396 / 0.649 | 0.360 / 0.536 |
+| β=0.1 | KD-trained | 0.642 / 0.795 | 0.485 / 0.629 | 0.471 / 0.683 | 0.554 / 0.743 |
+
+#### Rounds 50–500 checkpoint 평균 (canonical min-64)
+
+아래는 저장된 10개 checkpoint(`50, 100, ..., 500`)에서 얻은 값을 다시 평균한 결과이다.
+각 셀은 `aggregate-gradient cosine / client-wise cosine 평균` 순서이며, CE와 KD objective는
+별도 열로 분리했다.
+
+| Partition | Training trajectory | Route | CE | KD |
+|---|---|---|---:|---:|
+| IID | CE-trained | B1 | 0.697 / 0.609 | 0.822 / 0.732 |
+| IID | CE-trained | B2 | 0.529 / 0.434 | 0.573 / 0.464 |
+| IID | CE-trained | B3 | 0.667 / 0.513 | 0.668 / 0.488 |
+| IID | CE-trained | Combined | 0.618 / 0.523 | 0.685 / 0.587 |
+| IID | KD-trained | B1 | 0.839 / 0.774 | 0.895 / 0.841 |
+| IID | KD-trained | B2 | 0.676 / 0.570 | 0.699 / 0.607 |
+| IID | KD-trained | B3 | 0.762 / 0.580 | 0.806 / 0.629 |
+| IID | KD-trained | Combined | 0.755 / 0.651 | 0.814 / 0.738 |
+| β=0.1 | CE-trained | B1 | 0.770 / 0.510 | 0.887 / 0.692 |
+| β=0.1 | CE-trained | B2 | 0.721 / 0.463 | 0.813 / 0.647 |
+| β=0.1 | CE-trained | B3 | 0.738 / 0.450 | 0.842 / 0.653 |
+| β=0.1 | CE-trained | Combined | 0.741 / 0.471 | 0.838 / 0.652 |
+| β=0.1 | KD-trained | B1 | 0.814 / 0.550 | 0.916 / 0.765 |
+| β=0.1 | KD-trained | B2 | 0.761 / 0.500 | 0.893 / 0.726 |
+| β=0.1 | KD-trained | B3 | 0.811 / 0.503 | 0.921 / 0.735 |
+| β=0.1 | KD-trained | Combined | 0.797 / 0.515 | 0.912 / 0.739 |
 
 해석:
 

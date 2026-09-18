@@ -4,7 +4,10 @@
 #
 #   resnet4 : ResNet18, all seeds (0,1,2)
 #   mobile_a: MobileNetV2, seed 0 + half of seed 2
-#   mobile_b: MobileNetV2, seed 1 + the other half of seed 2
+#   mobile_b: MobileNetV2, seed 1 + the other half of seed 2 (legacy full matrix)
+#   mobile_seed0_fedavg: MobileNetV2, seed 0, FedAvg only. This completion role
+#                        reuses/skips prior and mobile_a outputs and runs only
+#                        genuinely missing cells.
 #
 # Matrix per model:
 #   dataset   = CIFAR-100, TinyImageNet, ImageNet100-64
@@ -71,8 +74,8 @@ MOON_TEMPERATURE=0.5
 
 case "$ROLE" in
     resnet4) MODEL_TAG=resnet18; PLAIN_MODEL=resnet18; BYOT_MODEL=resnet18_byot ;;
-    mobile_a|mobile_b) MODEL_TAG=mobilenetv2; PLAIN_MODEL=mobilenet; BYOT_MODEL=mobilenet_byot ;;
-    *) echo "Unknown ROLE=$ROLE (expected resnet4, mobile_a, mobile_b)." >&2; exit 2 ;;
+    mobile_a|mobile_b|mobile_seed0_fedavg) MODEL_TAG=mobilenetv2; PLAIN_MODEL=mobilenet; BYOT_MODEL=mobilenet_byot ;;
+    *) echo "Unknown ROLE=$ROLE (expected resnet4, mobile_a, mobile_b, or mobile_seed0_fedavg)." >&2; exit 2 ;;
 esac
 
 configure_dataset() {
@@ -134,7 +137,13 @@ prior_reusable() {
         return
     fi
     if [[ "$dataset" == tinyimagenet || "$dataset" == imagenet100_64 ]]; then
-        [[ "$method" == plain ]]
+        # Plain seed-0 cells predate this matrix and are configuration-matched.
+        [[ "$method" == plain ]] && return 0
+        # The two TinyImageNet adaptive seed-0 cells were completed by
+        # mobile_a and have already been merged into the primary repository.
+        # Let the B-only reduced completion queue account for them even when
+        # the A log directory is not physically copied onto server B.
+        [[ "$ROLE" == mobile_seed0_fedavg && "$dataset" == tinyimagenet && "$method" == adaptive ]]
         return
     fi
     return 1
@@ -162,11 +171,39 @@ for dataset in cifar100 tinyimagenet imagenet100_64; do
                         (( seed2_index % 2 == 1 )) && JOBS+=("$dataset|$mechanism|$partition|$method|2")
                         seed2_index=$((seed2_index + 1))
                         ;;
+                    mobile_seed0_fedavg)
+                        # The final MobileNet table uses seed 0 and FedAvg only.
+                        # Existing publication-root outputs are skipped by
+                        # pkl_complete; exact older seed-0 cells are handled by
+                        # prior_reusable below.
+                        [[ "$mechanism" == fedavg ]] && \
+                            JOBS+=("$dataset|$mechanism|$partition|$method|0")
+                        ;;
                 esac
             done
         done
     done
 done
+
+# In the reduced completion role, put the two expected missing ImageNet
+# adaptive cells on opposite queue parities. All preceding cells are retained
+# so that their exact reuse/skip decisions remain visible in the terminal log.
+if [[ "$ROLE" == mobile_seed0_fedavg ]]; then
+    JOBS=(
+        "cifar100|fedavg|iid|plain|0"
+        "cifar100|fedavg|iid|adaptive|0"
+        "cifar100|fedavg|beta_0.1|plain|0"
+        "cifar100|fedavg|beta_0.1|adaptive|0"
+        "tinyimagenet|fedavg|iid|plain|0"
+        "tinyimagenet|fedavg|iid|adaptive|0"
+        "tinyimagenet|fedavg|beta_0.1|plain|0"
+        "tinyimagenet|fedavg|beta_0.1|adaptive|0"
+        "imagenet100_64|fedavg|iid|plain|0"
+        "imagenet100_64|fedavg|beta_0.1|plain|0"
+        "imagenet100_64|fedavg|iid|adaptive|0"
+        "imagenet100_64|fedavg|beta_0.1|adaptive|0"
+    )
+fi
 
 run_job() {
     local gpu="$1" job="$2"
