@@ -56,7 +56,7 @@ USE_WANDB="${USE_WANDB:-0}"
 
 NUM_CLIENTS=100
 SAMPLE_FRACTION=0.1
-LOCAL_EPOCHS=5
+LOCAL_EPOCHS="${LOCAL_EPOCHS_OVERRIDE:-5}"
 MIN_REQUIRE_SIZE=64
 BATCH_SIZE=64
 TEST_BATCH_SIZE=512
@@ -71,6 +71,12 @@ JS_GAIN=1.0
 FEDPROX_MU=0.01
 MOON_MU=0.01
 MOON_TEMPERATURE=0.5
+FEDLC_TAU="${FEDLC_TAU:-1.0}"
+
+DATASETS=(${DATASETS_OVERRIDE:-cifar100 tinyimagenet imagenet100_64})
+MECHANISMS=(${MECHANISMS_OVERRIDE:-fedavg fedprox moon})
+PARTITIONS=(${PARTITIONS_OVERRIDE:-iid beta_0.1})
+RESNET_SEEDS=(${SEEDS_OVERRIDE:-0 1 2})
 
 case "$ROLE" in
     resnet4) MODEL_TAG=resnet18; PLAIN_MODEL=resnet18; BYOT_MODEL=resnet18_byot ;;
@@ -88,10 +94,17 @@ configure_dataset() {
             DATA_DIR="$IMAGENET100_DATADIR"; NUM_CLASSES=100; ROUNDS=100; LR=0.01; NUM_WORKERS=2 ;;
         *) echo "Unknown dataset: $1" >&2; return 1 ;;
     esac
+    if [[ -n "${ROUNDS_OVERRIDE:-}" ]]; then
+        ROUNDS="$ROUNDS_OVERRIDE"
+    fi
+    [[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]] || {
+        echo "ROUNDS_OVERRIDE must be a positive integer." >&2; return 1;
+    }
     WARMUP_ROUNDS=$((ROUNDS / 2))
 }
 
-for dataset in tinyimagenet imagenet100_64; do
+for dataset in "${DATASETS[@]}"; do
+    [[ "$dataset" == "cifar100" ]] && continue
     configure_dataset "$dataset"
     [[ -d "$DATA_DIR/train" && -d "$DATA_DIR/val" ]] || {
         echo "Missing $dataset directories: $DATA_DIR/{train,val}" >&2
@@ -151,13 +164,13 @@ prior_reusable() {
 
 declare -a JOBS=()
 seed2_index=0
-for dataset in cifar100 tinyimagenet imagenet100_64; do
-    for mechanism in fedavg fedprox moon; do
-        for partition in iid beta_0.1; do
+for dataset in "${DATASETS[@]}"; do
+    for mechanism in "${MECHANISMS[@]}"; do
+        for partition in "${PARTITIONS[@]}"; do
             for method in plain adaptive; do
                 case "$ROLE" in
                     resnet4)
-                        for seed in 0 1 2; do
+                        for seed in "${RESNET_SEEDS[@]}"; do
                             JOBS+=("$dataset|$mechanism|$partition|$method|$seed")
                         done
                         ;;
@@ -251,6 +264,8 @@ run_job() {
             fedavg) CMD+=(--alg fedavg) ;;
             fedprox) CMD+=(--alg fedprox --mu "$FEDPROX_MU") ;;
             moon) CMD+=(--alg moon --mu "$MOON_MU" --temperature "$MOON_TEMPERATURE") ;;
+            fedlc) CMD+=(--alg fedlc --calibration_temp "$FEDLC_TAU") ;;
+            *) echo "Unknown mechanism: $mechanism" >&2; return 1 ;;
         esac
     else
         CMD+=(
@@ -280,6 +295,8 @@ run_job() {
             fedavg) ;;
             fedprox) CMD+=(--use_fedprox --mu "$FEDPROX_MU") ;;
             moon) CMD+=(--use_moon --mu "$MOON_MU" --temperature "$MOON_TEMPERATURE") ;;
+            fedlc) CMD+=(--use_fedlc --calibration_temp "$FEDLC_TAU") ;;
+            *) echo "Unknown mechanism: $mechanism" >&2; return 1 ;;
         esac
     fi
 
@@ -301,6 +318,7 @@ run_job() {
 
 echo "========== Publication core matrix =========="
 echo "role=$ROLE | model=$MODEL_TAG | GPUs=${GPUS[*]} | jobs=${#JOBS[@]}"
+echo "datasets=${DATASETS[*]} | mechanisms=${MECHANISMS[*]} | partitions=${PARTITIONS[*]}"
 echo "short-to-long queue: CIFAR-100 -> TinyImageNet -> ImageNet100-64"
 echo "completed PKLs are skipped; interrupted runs restart"
 echo "reuse_prior=$REUSE_PRIOR (exact matched MobileNet seed-0 cells only)"

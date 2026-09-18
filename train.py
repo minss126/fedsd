@@ -1524,23 +1524,7 @@ def fedlc(net, train_dataloader, optimizer, device, args):
     from algs.decorr import FedDecorrLoss
     feddecorr = FedDecorrLoss()
 
-    # 1. 안전한 데이터 분포 추출 (에러 방지)
-    subset_dataset = train_dataloader.dataset
-    if hasattr(subset_dataset, 'dataset'):
-        num_classes = subset_dataset.dataset.num_classes
-        subset_targets = np.array(subset_dataset.dataset.target)[subset_dataset.indices] if hasattr(subset_dataset, 'indices') else np.array(subset_dataset.dataset.target)
-    else:
-        num_classes = 100 
-        subset_targets = np.array(subset_dataset.target)
-
-    class_counts = torch.zeros(num_classes).to(device)
-    uniq_val, uniq_count = np.unique(subset_targets, return_counts=True)
-    for i, c in enumerate(uniq_val.tolist()): class_counts[c] = uniq_count[i]
-    
-    # 2. NaN 방지 마진 계산
-    tau = float(getattr(args, "calibration_temp", 1.0))
-    margin = tau * (class_counts ** -0.25).unsqueeze(dim=0).to(device)
-    margin[margin == float('inf')] = 0 
+    margin = _fedlc_client_margin(train_dataloader, args, device, force=True)
 
     total_loss = 0.0
     for epoch in range(args.epochs):
@@ -1939,6 +1923,28 @@ def _filtered_branch_kd_loss(student_logits, teacher_prob, keep_mask, student_te
     ) * loss_scale
 
 
+def _fedlc_client_margin(train_dataloader, args, device, force=False):
+    """Return the legacy FedLC margin for one client's local label counts.
+
+    This intentionally matches ``fedlc``: present classes receive
+    ``tau * n_c**(-1/4)`` and absent classes receive zero instead of infinity.
+    Keeping one definition for Plain FedLC and FedBYOT+FedLC prevents the
+    mechanism comparison from silently changing the calibration rule.
+    """
+    if not force and not bool(getattr(args, "use_fedlc", False)):
+        return None
+    tau = float(getattr(args, "calibration_temp", 1.0))
+    if tau < 0.0:
+        raise ValueError("--calibration_temp must be non-negative.")
+    class_counts, _, _ = get_local_class_counts(train_dataloader, args, device)
+    if class_counts is None:
+        raise ValueError("FedLC requires local class counts for every client.")
+    margin = torch.zeros_like(class_counts)
+    present = class_counts > 0
+    margin[present] = tau * class_counts[present].pow(-0.25)
+    return margin.unsqueeze(0)
+
+
 def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, args):
     temperature = args.temperature
     teacher_source = str(getattr(args, "byot_teacher_source", "local") or "local")
@@ -1960,6 +1966,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
     student_temperature = _branch_kd_temperature(args, "byot_branch_kd_student_temperature")
     proxy_temperature = _byot_proxy_temperature(args)
     kd_loss_scale = _branch_kd_loss_scale(student_temperature, args)
+    fedlc_margin = _fedlc_client_margin(train_dataloader, args, device)
     preserve_proxy_rng = bool(getattr(args, "preserve_byot_proxy_rng", False))
     if preserve_proxy_rng:
         python_rng_state = random.getstate()
@@ -2064,16 +2071,26 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
             if isinstance(out, tuple) and len(out) == 8:
                 (output, m1, m2, m3, final_fea, f1, f2, f3) = out
                 final_features = final_fea
-                
+                if fedlc_margin is None:
+                    calibrated_output = output
+                    calibrated_branches = [m1, m2, m3]
+                else:
+                    calibrated_output = output - fedlc_margin
+                    calibrated_branches = [
+                        m1 - fedlc_margin,
+                        m2 - fedlc_margin,
+                        m3 - fedlc_margin,
+                    ]
+
                 # 1. Main Loss (Teacher)
-                loss_main = criterion_ce(output, target)
+                loss_main = criterion_ce(calibrated_output, target)
                 _stage_update_step_common_ce(optimizer, loss_main)
                 
                 # 2. Student CE Loss
                 ce_branch_losses = [
-                    branch_ce_weight * criterion_branch_ce(m1, target),
-                    branch_ce_weight * criterion_branch_ce(m2, target),
-                    branch_ce_weight * criterion_branch_ce(m3, target),
+                    branch_ce_weight * criterion_branch_ce(calibrated_branches[0], target),
+                    branch_ce_weight * criterion_branch_ce(calibrated_branches[1], target),
+                    branch_ce_weight * criterion_branch_ce(calibrated_branches[2], target),
                 ]
                 loss_ce_students = sum(ce_branch_losses[i] for i in active_branch_indices)
                 loss_ce_students = reduce_active_branch_loss(
@@ -2082,18 +2099,24 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                 
                 # 3. KL Divergence
                 with torch.no_grad():
-                    teacher_logits = (
+                    raw_teacher_logits = (
                         output
                         if teacher_source == "local"
                         else _forward_teacher_logits(kd_teacher_net, x)
+                    )
+                    teacher_logits = (
+                        raw_teacher_logits
+                        if fedlc_margin is None
+                        else raw_teacher_logits - fedlc_margin
                     )
                     teacher_prob = F.softmax(teacher_logits / teacher_temperature, dim=1)
                     # Reliability/sample-selection proxies deliberately use a
                     # separate native-logit temperature, rather than the KD
                     # target temperature.
-                    proxy_teacher_prob = (
-                        teacher_prob if abs(proxy_temperature - teacher_temperature) < 1e-12
-                        else F.softmax(teacher_logits / proxy_temperature, dim=1)
+                    # FedLC changes the supervised/KD objective, not the
+                    # definition of the adaptive reliability proxy.
+                    proxy_teacher_prob = F.softmax(
+                        raw_teacher_logits / proxy_temperature, dim=1
                     )
                     kd_target_prob = _branch_kd_target_distribution(teacher_prob, target, args)
                     
@@ -2112,7 +2135,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                 if branch_freq_stats is not None:
                     update_train_branch_freq_stats(
                         branch_freq_stats,
-                        [m1, m2, m3],
+                        calibrated_branches,
                         teacher_prob,
                         target,
                         class_counts,
@@ -2171,7 +2194,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                     # Independent branch-CE coefficient sweep.  Unlike blend,
                     # changing alpha here never introduces or removes KD.
                     batch_alpha = get_batch_byot_alpha(
-                        alpha, output, [m1, m2, m3], target, args
+                        alpha, calibrated_output, calibrated_branches, target, args
                     )
                     alpha_mean = float(
                         batch_alpha.detach().item()
@@ -2187,16 +2210,16 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                     )
                 elif sample_alpha is None:
                     kd_branch_losses = [
-                        _filtered_branch_kd_loss(m1, kd_target_prob, kd_keep_mask, student_temperature, kd_loss_scale),
-                        _filtered_branch_kd_loss(m2, kd_target_prob, kd_keep_mask, student_temperature, kd_loss_scale),
-                        _filtered_branch_kd_loss(m3, kd_target_prob, kd_keep_mask, student_temperature, kd_loss_scale),
+                        _filtered_branch_kd_loss(calibrated_branches[0], kd_target_prob, kd_keep_mask, student_temperature, kd_loss_scale),
+                        _filtered_branch_kd_loss(calibrated_branches[1], kd_target_prob, kd_keep_mask, student_temperature, kd_loss_scale),
+                        _filtered_branch_kd_loss(calibrated_branches[2], kd_target_prob, kd_keep_mask, student_temperature, kd_loss_scale),
                     ]
                     loss_kd_students = sum(kd_branch_losses[i] for i in active_branch_indices)
                     loss_kd_students = reduce_active_branch_loss(
                         loss_kd_students, active_branch_indices, args
                     )
                     if branch_objective == "kd_only":
-                        batch_alpha = get_batch_byot_alpha(alpha, output, [m1, m2, m3], target, args)
+                        batch_alpha = get_batch_byot_alpha(alpha, calibrated_output, calibrated_branches, target, args)
                         if branch_need_gates is None:
                             alpha_mean = float(batch_alpha.detach().item() if torch.is_tensor(batch_alpha) else batch_alpha)
                             alpha_min = alpha_mean
@@ -2231,7 +2254,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                         )
                         loss = loss_main + loss_students + beta * loss_feat_students
                     else:
-                        batch_alpha = get_batch_byot_alpha(alpha, output, [m1, m2, m3], target, args)
+                        batch_alpha = get_batch_byot_alpha(alpha, calibrated_output, calibrated_branches, target, args)
                         alpha_mean = float(batch_alpha.detach().item() if torch.is_tensor(batch_alpha) else batch_alpha)
                         alpha_min = alpha_mean
                         alpha_max = alpha_mean
@@ -2242,7 +2265,7 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
                             "--byot_branch_kd_filter is an unweighted target ablation and cannot be combined "
                             "with sample-wise BYOT alpha proxies."
                         )
-                    branch_logits = [m1, m2, m3]
+                    branch_logits = calibrated_branches
                     loss_kd_students = sum(
                         weighted_byot_kd_loss(
                             branch_logits[i],
@@ -2278,7 +2301,10 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
             else:
                 if isinstance(out, tuple): _, output = out
                 else: output = out
-                loss = criterion_ce(output, target)
+                loss = criterion_ce(
+                    output if fedlc_margin is None else output - fedlc_margin,
+                    target,
+                )
             
             loss += compute_fl_regularization(net, global_model, prev_net, x, final_features, device, args)
             

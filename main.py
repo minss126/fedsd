@@ -1978,6 +1978,14 @@ def get_args():
     parser.add_argument('--fedrs_alpha', type=float, default=0.5, help='FedRS scaling alpha for missing classes')
     ## Fedlogtical
     parser.add_argument('--calibration_temp', type=float, default=1.0, help='FedLC margin calibration temperature')
+    parser.add_argument(
+        '--use_fedlc', action='store_true',
+        help=(
+            'Apply the FedLC client-frequency logit margin inside the canonical '
+            'FedBYOT objective. The adaptive reliability/JS proxies continue to '
+            'use native logits; the margin is applied to final CE and KD logits.'
+        ),
+    )
     ## Fedprox or MOON
     parser.add_argument('--mu', type=float, default=1.0, help='the mu parameter for fedprox, moon, or fedrcl')
     parser.add_argument('--temperature', type=float, default=0.5, help='the temperature parameter for contrastive loss')
