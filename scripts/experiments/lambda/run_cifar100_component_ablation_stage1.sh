@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 
-# Leave-one-component-out ablation of the final soft-b adaptive lambda.
+# Leave-one-component-out ablation for the final canonical adaptive method.
 #
-# Default stage:
-#   dataset    = CIFAR-100
-#   partition  = IID, beta=0.3
-#   methods    = full, w/o warm-up, w/o reliability, w/o bias correction
+# Final method:
+#   CIFAR-100 / ResNet18-BYOT / FedAvg / KD-only / no feature loss
+#   T_KD=1 / T_proxy=1 / lambda_max=1 / tau=.85 / JS-client
+#   canonical execution (no paired/preserved RNG controls)
 #
-# The already completed seed-0 full method is reused by default. Set
-# REUSE_PRIOR_FULL=0 to run it again under LOG_ROOT.
+# Default new jobs (8):
+#   partitions = IID, beta=.1
+#   ablations  = w/o warm-up, reliability, bias correction, JS-client
+#
+# The full adaptive result is already produced by the publication core matrix
+# and is therefore not rerun by default. Include `full` in METHODS_OVERRIDE if
+# a local full run/reference check is desired. Completed PKLs are skipped, so
+# interrupted queues can be relaunched safely (the interrupted cell restarts).
 
 set -euo pipefail
 
@@ -17,41 +23,36 @@ cd "$REPO_ROOT"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     cat <<'EOF'
-Usage:
-  GPUS_OVERRIDE="0 1 2 3" \
+Usage (recommended after the ResNet50 queue on the 2-GPU server):
+  GPUS_OVERRIDE="0 1" \
     bash scripts/experiments/lambda/run_cifar100_component_ablation_stage1.sh
 
 Defaults:
-  PARTITIONS_OVERRIDE="iid beta_0.3"
-  METHODS_OVERRIDE="wo_warmup wo_reliability wo_bias full"
+  PARTITIONS_OVERRIDE="iid beta_0.1"
+  METHODS_OVERRIDE="wo_warmup wo_reliability wo_bias wo_js_client"
+  SEEDS_OVERRIDE="0"
 
-Examples:
-  PARTITIONS_OVERRIDE="beta_0.5 beta_0.1" GPUS_OVERRIDE="0 1 2 3" bash $0
-  REUSE_PRIOR_FULL=0 GPUS_OVERRIDE="0 1 2 3" bash $0
-  DRY_RUN=1 GPUS_OVERRIDE="0 1 2 3" bash $0
+Optional:
+  METHODS_OVERRIDE="wo_warmup wo_reliability wo_bias wo_js_client full"
+  SEEDS_OVERRIDE="0 1 2"
+  DRY_RUN=1 GPUS_OVERRIDE="0 1" bash scripts/experiments/lambda/run_cifar100_component_ablation_stage1.sh
 EOF
     exit 0
 fi
 
-GPUS=(${GPUS_OVERRIDE:-0 1 2 3})
-if (( ${#GPUS[@]} == 0 )); then
-    echo "Set GPUS_OVERRIDE to one or more GPU ids." >&2
-    exit 1
-fi
+read -r -a GPUS <<< "${GPUS_OVERRIDE:-0 1}"
+(( ${#GPUS[@]} > 0 )) || { echo "GPUS_OVERRIDE is empty." >&2; exit 2; }
 NUM_GPUS=${#GPUS[@]}
 
-if [[ -n "${PYTHON_BIN:-}" ]]; then
-    :
-elif [[ -x venv/bin/python ]]; then
-    PYTHON_BIN="venv/bin/python"
-else
-    PYTHON_BIN="python3"
+if [[ -n "${PYTHON_BIN:-}" ]]; then :
+elif [[ -x venv/bin/python ]]; then PYTHON_BIN=venv/bin/python
+else PYTHON_BIN=python3
 fi
 
-PARTITIONS=(${PARTITIONS_OVERRIDE:-iid beta_0.3})
-METHODS=(${METHODS_OVERRIDE:-wo_warmup wo_reliability wo_bias full})
+read -r -a PARTITIONS <<< "${PARTITIONS_OVERRIDE:-iid beta_0.1}"
+read -r -a METHODS <<< "${METHODS_OVERRIDE:-wo_warmup wo_reliability wo_bias wo_js_client}"
+read -r -a SEEDS <<< "${SEEDS_OVERRIDE:-0}"
 
-SEED="${SEED:-0}"
 ROUNDS="${ROUNDS:-500}"
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-5}"
 LR="${LR:-0.1}"
@@ -60,268 +61,244 @@ TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-512}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 NUM_CLIENTS="${NUM_CLIENTS:-100}"
 SAMPLE_FRACTION="${SAMPLE_FRACTION:-0.1}"
-FEATURE_BETA="${FEATURE_BETA:-0.01}"
-KD_TEMPERATURE="${KD_TEMPERATURE:-1.0}"
-PROXY_TEMPERATURE="${PROXY_TEMPERATURE:-1.0}"
-LAMBDA_MAX="${LAMBDA_MAX:-1.0}"
-LAMBDA_WARMUP="${LAMBDA_WARMUP:-250}"
-SKEW_POWER="${SKEW_POWER:-2.0}"
-SOFT_TAU="${SOFT_TAU:-0.85}"
-SOFT_TEMPERATURE="${SOFT_TEMPERATURE:-0.05}"
+MIN_REQUIRE_SIZE="${MIN_REQUIRE_SIZE:-64}"
 
-LOG_ROOT="${LOG_ROOT:-logs/lambda/adaptive/logs_cifar100_component_ablation}"
-PRIOR_FULL_ROOT="${PRIOR_FULL_ROOT:-logs/lambda/adaptive/logs_soft_adaptive_tuning_stage1}"
-REUSE_PRIOR_FULL="${REUSE_PRIOR_FULL:-1}"
+FEATURE_BETA=0.0
+KD_TEMPERATURE=1.0
+PROXY_TEMPERATURE=1.0
+LAMBDA_MAX=1.0
+LAMBDA_WARMUP="${LAMBDA_WARMUP:-$((ROUNDS / 2))}"
+SKEW_POWER=2.0
+SOFT_TAU=0.85
+SOFT_TEMPERATURE=0.05
+JS_GAIN=1.0
+
+LOG_ROOT="${LOG_ROOT:-logs/lambda/final/logs_cifar100_js_client_component_ablation}"
+FULL_REFERENCE_ROOT="${FULL_REFERENCE_ROOT:-logs/lambda/final/logs_publication_core_matrix}"
+REUSE_FULL_REFERENCE="${REUSE_FULL_REFERENCE:-1}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 DRY_RUN="${DRY_RUN:-0}"
+USE_WANDB="${USE_WANDB:-0}"
 
-WANDB_FLAGS=()
-if [[ "${USE_WANDB:-1}" == "1" ]]; then
-    WANDB_FLAGS=(--use_wandb --wandb_project "${WANDB_PROJECT:-dxfl}")
-    [[ -n "${WANDB_ENTITY:-}" ]] && WANDB_FLAGS+=(--wandb_entity "$WANDB_ENTITY")
-fi
-
-value_tag() {
-    local formatted
-    printf -v formatted '%.2f' "$1"
-    printf '%s' "${formatted/./p}"
-}
+[[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]] || { echo "ROUNDS must be positive." >&2; exit 2; }
+[[ "$LAMBDA_WARMUP" =~ ^[0-9]+$ ]] || { echo "LAMBDA_WARMUP must be non-negative." >&2; exit 2; }
 
 partition_flags() {
     case "$1" in
         iid) printf '%s\n' --partition iid ;;
-        beta_0.5) printf '%s\n' --partition noniid --beta 0.5 ;;
         beta_0.3) printf '%s\n' --partition noniid --beta 0.3 ;;
         beta_0.1) printf '%s\n' --partition noniid --beta 0.1 ;;
         *) echo "Unknown partition: $1" >&2; return 1 ;;
     esac
 }
 
-method_name() {
-    local method="$1"
-    case "$method" in
-        wo_warmup)
-            printf 'wo_warmup_r1_bsoft_tau%s' "$(value_tag "$SOFT_TAU")"
-            ;;
-        wo_reliability)
-            printf 'wo_reliability_warm%s_bsoft_tau%s' "$LAMBDA_WARMUP" "$(value_tag "$SOFT_TAU")"
-            ;;
-        wo_bias)
-            printf 'wo_bias_warm%s_r1' "$LAMBDA_WARMUP"
-            ;;
-        full)
-            printf 'full_soft_b_warm%s_tau%s' "$LAMBDA_WARMUP" "$(value_tag "$SOFT_TAU")"
-            ;;
-        *) echo "Unknown method: $method" >&2; return 1 ;;
+validate_method() {
+    case "$1" in
+        wo_warmup|wo_reliability|wo_bias|wo_js_client|full) ;;
+        *) echo "Unknown method: $1" >&2; return 1 ;;
     esac
 }
 
 pkl_complete() {
-    local path="$1"
+    local path="$1" expected="$2"
     [[ -s "$path" ]] || return 1
     "$PYTHON_BIN" -c '
 import pickle, sys
 try:
     with open(sys.argv[1], "rb") as handle:
         payload = pickle.load(handle)
-    values = payload.get("acc_global", [])
-    complete = isinstance(values, (list, tuple)) and len(values) >= int(sys.argv[2])
+    expected = int(sys.argv[2])
+    complete = any(
+        isinstance(payload.get(key), (list, tuple)) and len(payload[key]) >= expected
+        for key in ("acc_global", "branch_acc", "test_loss")
+    )
 except Exception:
     complete = False
 raise SystemExit(0 if complete else 1)
-' "$path" "$ROUNDS"
+' "$path" "$expected"
 }
 
-prior_full_path() {
-    local partition="$1"
-    printf '%s/%s/fedavg/soft_b_tkd%s_lmax%s_warm%s_tau%s.pkl' \
-        "$PRIOR_FULL_ROOT" "$partition" \
-        "$(value_tag "$KD_TEMPERATURE")" "$(value_tag "$LAMBDA_MAX")" \
-        "$LAMBDA_WARMUP" "$(value_tag "$SOFT_TAU")"
+run_name() {
+    local partition="$1" method="$2" seed="$3"
+    printf 'cifar100_resnet18_fedavg_%s_ablation_%s_tkd1p00_nofeat_canonical_seed%s_r%s' \
+        "$partition" "$method" "$seed" "$ROUNDS"
 }
 
 current_path() {
-    local partition="$1" method="$2" name
-    name="$(method_name "$method")"
-    printf '%s/%s/fedavg/%s.pkl' "$LOG_ROOT" "$partition" "$name"
+    local partition="$1" method="$2" seed="$3"
+    printf '%s/%s/seed%s/%s/%s.pkl' \
+        "$LOG_ROOT" "$partition" "$seed" "$method" \
+        "$(run_name "$partition" "$method" "$seed")"
 }
 
-job_is_needed() {
-    local partition="$1" method="$2" output prior
-    output="$(current_path "$partition" "$method")"
-    if [[ "$SKIP_EXISTING" == "1" ]] && pkl_complete "$output"; then
-        echo "[skip-current] ${partition} | ${method}: ${output}" >&2
-        return 1
-    fi
-    if [[ "$method" == "full" && "$REUSE_PRIOR_FULL" == "1" ]]; then
-        prior="$(prior_full_path "$partition")"
-        if pkl_complete "$prior"; then
-            echo "[reuse-prior] ${partition} | full: ${prior}" >&2
-            return 1
-        fi
-    fi
-    return 0
+full_reference_path() {
+    local partition="$1" seed="$2"
+    local name="cifar100_resnet18_fedavg_${partition}_js_client_lmax1p00_tau0p85_tkd1p00_nofeat_canonical_seed${seed}_r${ROUNDS}"
+    printf '%s/resnet18/cifar100/fedavg/%s/seed%s/adaptive/%s.pkl' \
+        "$FULL_REFERENCE_ROOT" "$partition" "$seed" "$name"
 }
 
-append_warmup_flags() {
+append_warmup() {
     CMD+=(
         --byot_round_lambda_schedule linear
-        --byot_round_lambda_min 0.00
+        --byot_round_lambda_min 0.0
         --byot_round_lambda_warmup "$LAMBDA_WARMUP"
     )
 }
 
-append_reliability_flags() {
+append_reliability() {
     CMD+=(
         --byot_client_proxy teacher_label_prob
-        --byot_client_alpha_min 0.00
-        --byot_client_alpha_max 1.00
+        --byot_client_alpha_min 0.0 --byot_client_alpha_max 1.0
         --byot_client_alpha_mode multiply
         --byot_client_reliability_power 1.0
     )
 }
 
-append_bias_flags() {
+append_bias_correction() {
     CMD+=(
         --byot_client_skew_proxy prediction_entropy
         --byot_client_skew_power "$SKEW_POWER"
-        --byot_client_skew_min_scale 0.00
+        --byot_client_skew_min_scale 0.0
         --byot_client_skew_correction_mode soft_relax
         --byot_client_skew_soft_tau "$SOFT_TAU"
         --byot_client_skew_soft_temperature "$SOFT_TEMPERATURE"
     )
 }
 
-run_job() {
-    local gpu_id="$1" partition="$2" method="$3" name log_dir output
-    local -a PARTITION_FLAGS CMD
+append_js_client() {
+    CMD+=(
+        --byot_branch_need_proxy js_client
+        --byot_branch_need_gain "$JS_GAIN"
+        --byot_branch_need_min_gate 0.0
+        --byot_branch_need_temperature "$PROXY_TEMPERATURE"
+    )
+}
 
-    name="$(method_name "$method")"
-    log_dir="${LOG_ROOT}/${partition}/fedavg"
-    output="${log_dir}/${name}.pkl"
-    mkdir -p "$log_dir"
-    mapfile -t PARTITION_FLAGS < <(partition_flags "$partition")
+job_needed() {
+    local partition="$1" method="$2" seed="$3" output reference
+    output="$(current_path "$partition" "$method" "$seed")"
+    if [[ "$SKIP_EXISTING" == 1 ]] && pkl_complete "$output" "$ROUNDS"; then
+        echo "[skip-current] $partition | $method | seed$seed" >&2
+        return 1
+    fi
+    if [[ "$method" == full && "$REUSE_FULL_REFERENCE" == 1 ]]; then
+        reference="$(full_reference_path "$partition" "$seed")"
+        if pkl_complete "$reference" "$ROUNDS"; then
+            echo "[reuse-full] $partition | seed$seed: $reference" >&2
+            return 1
+        fi
+    fi
+    return 0
+}
+
+run_job() {
+    local gpu="$1" partition="$2" method="$3" seed="$4"
+    local name rel output terminal
+    local -a PARTITION_ARGS CMD
+
+    validate_method "$method"
+    mapfile -t PARTITION_ARGS < <(partition_flags "$partition")
+    name="$(run_name "$partition" "$method" "$seed")"
+    rel="${partition}/seed${seed}/${method}"
+    output="${LOG_ROOT}/${rel}/${name}.pkl"
+    terminal="${LOG_ROOT}/${rel}/${name}_terminal.log"
+    mkdir -p "${LOG_ROOT}/${rel}"
 
     CMD=(
         "$PYTHON_BIN" main.py
-        --dataset cifar100 --datadir ./data
+        --dataset cifar100 --datadir ./data --in_channels 3 --num_classes 100
+        "${PARTITION_ARGS[@]}" --min_require_size "$MIN_REQUIRE_SIZE"
         --n_clients "$NUM_CLIENTS" --sample_fraction "$SAMPLE_FRACTION"
-        --epochs "$LOCAL_EPOCHS" --lr "$LR"
+        --round "$ROUNDS" --epochs "$LOCAL_EPOCHS"
+        --optimizer sgd --lr "$LR" --momentum 0.9 --reg 0.001
+        --scheduler round --schedule_round 1 --lr_gamma 0.998
         --batch_size "$BATCH_SIZE" --test_batch_size "$TEST_BATCH_SIZE"
-        --num_workers "$NUM_WORKERS" --round "$ROUNDS" --seed "$SEED"
-        --device "cuda:${gpu_id}" --logdir "$LOG_ROOT"
-        --log_file_name "${partition}/fedavg/${name}"
+        --num_workers "$NUM_WORKERS" --seed "$seed"
+        --device "cuda:${gpu}" --sequential_client_execution
+        --logdir "$LOG_ROOT" --log_file_name "${rel}/${name}"
         --model resnet18_byot --alg fedbyot
-        --byot_active_branches "1,2,3"
-        --byot_branch_loss_reduction sum
-        --byot_branch_objective kd_only
-        --byot_beta "$FEATURE_BETA"
-        --byot_alpha "$LAMBDA_MAX"
-        --temperature "$KD_TEMPERATURE"
+        --byot_active_branches 1,2,3
+        --byot_branch_loss_reduction sum --byot_branch_objective kd_only
+        --byot_beta "$FEATURE_BETA" --byot_teacher_source local
         --byot_branch_kd_teacher_temperature "$KD_TEMPERATURE"
         --byot_branch_kd_student_temperature "$KD_TEMPERATURE"
+        --byot_branch_kd_loss_scale_mode native_t2
         --byot_proxy_temperature "$PROXY_TEMPERATURE"
-        --alpha_min_scale 0.0
+        --byot_alpha "$LAMBDA_MAX" --alpha_min_scale 0.0
     )
 
-    case "$method" in
-        wo_warmup)
-            append_reliability_flags
-            append_bias_flags
-            ;;
-        wo_reliability)
-            append_warmup_flags
-            append_bias_flags
-            ;;
-        wo_bias)
-            append_warmup_flags
-            append_reliability_flags
-            ;;
-        full)
-            append_warmup_flags
-            append_reliability_flags
-            append_bias_flags
-            ;;
-        *) echo "Unknown method: $method" >&2; return 1 ;;
-    esac
+    [[ "$method" == wo_warmup ]] || append_warmup
+    [[ "$method" == wo_reliability ]] || append_reliability
+    [[ "$method" == wo_bias ]] || append_bias_correction
+    [[ "$method" == wo_js_client ]] || append_js_client
 
-    CMD+=("${PARTITION_FLAGS[@]}" "${WANDB_FLAGS[@]}")
+    if [[ "$USE_WANDB" == 1 ]]; then
+        CMD+=(--use_wandb --wandb_project "${WANDB_PROJECT:-dxfl}")
+        [[ -n "${WANDB_ENTITY:-}" ]] && CMD+=(--wandb_entity "$WANDB_ENTITY")
+    fi
 
-    echo "[GPU ${gpu_id}] start: ${partition} | ${method}"
-    if [[ "$DRY_RUN" == "1" ]]; then
-        printf '  command:'
-        printf ' %q' "${CMD[@]}"
-        printf '\n'
+    echo "[GPU $gpu] start: $partition | $method | seed$seed | R=$ROUNDS warm=$LAMBDA_WARMUP"
+    if [[ "$DRY_RUN" == 1 ]]; then
+        printf '[dry-run] '; printf '%q ' "${CMD[@]}"; printf '\n'
         return 0
     fi
-
-    if ! "${CMD[@]}" > "${log_dir}/${name}_terminal.log" 2>&1; then
-        echo "[GPU ${gpu_id}] failed: ${partition} | ${method}" >&2
-        tail -30 "${log_dir}/${name}_terminal.log" >&2 || true
+    if ! "${CMD[@]}" > "$terminal" 2>&1; then
+        echo "[GPU $gpu] failed: $partition | $method | seed$seed; see $terminal" >&2
+        tail -40 "$terminal" >&2 || true
         return 1
     fi
-    if ! pkl_complete "$output"; then
-        echo "[GPU ${gpu_id}] incomplete result: ${output}" >&2
+    if ! pkl_complete "$output" "$ROUNDS"; then
+        echo "[GPU $gpu] incomplete output: $output" >&2
         return 1
     fi
-    echo "[GPU ${gpu_id}] complete: ${partition} | ${method}"
+    echo "[GPU $gpu] complete: $partition | $method | seed$seed"
 }
 
-run_queue() {
-    local gpu_id="$1"
-    shift
-    local job partition method
-    for job in "$@"; do
-        [[ -n "$job" ]] || continue
-        IFS='|' read -r partition method <<< "$job"
-        run_job "$gpu_id" "$partition" "$method"
-    done
-}
+for partition in "${PARTITIONS[@]}"; do partition_flags "$partition" >/dev/null; done
+for method in "${METHODS[@]}"; do validate_method "$method"; done
 
-JOBS=()
+declare -a JOBS=()
 for partition in "${PARTITIONS[@]}"; do
-    for method in "${METHODS[@]}"; do
-        if job_is_needed "$partition" "$method"; then
-            JOBS+=("${partition}|${method}")
-        fi
+    for seed in "${SEEDS[@]}"; do
+        for method in "${METHODS[@]}"; do
+            if job_needed "$partition" "$method" "$seed"; then
+                JOBS+=("$partition|$method|$seed")
+            fi
+        done
     done
 done
 
-declare -a QUEUES
-for ((i = 0; i < NUM_GPUS; i++)); do QUEUES[$i]=""; done
-for ((i = 0; i < ${#JOBS[@]}; i++)); do
-    gpu_idx=$((i % NUM_GPUS))
-    QUEUES[$gpu_idx]+="${JOBS[$i]}"$'\n'
-done
-
-echo "========== CIFAR-100 Component Ablation: Stage 1 =========="
-echo "gpus=${GPUS[*]}"
-echo "partitions=${PARTITIONS[*]}"
-echo "methods=${METHODS[*]}"
-echo "new_jobs=${#JOBS[@]}, rounds=${ROUNDS}, local_epochs=${LOCAL_EPOCHS}, seed=${SEED}"
-echo "full=lambda_round * reliability * soft_bias"
-echo "fixed_params=lambda_max=${LAMBDA_MAX}, T_kd=${KD_TEMPERATURE}, T_proxy=${PROXY_TEMPERATURE}, tau=${SOFT_TAU}, T_soft=${SOFT_TEMPERATURE}, p=${SKEW_POWER}"
-echo "log_root=${LOG_ROOT}, reuse_prior_full=${REUSE_PRIOR_FULL}, dry_run=${DRY_RUN}"
+echo "========== Final JS-client component ablation =========="
+echo "GPUs=${GPUS[*]} | jobs=${#JOBS[@]}"
+echo "CIFAR-100 / ResNet18-BYOT / FedAvg / R=$ROUNDS / E=$LOCAL_EPOCHS / C=$SAMPLE_FRACTION"
+echo "partitions=${PARTITIONS[*]} | methods=${METHODS[*]} | seeds=${SEEDS[*]}"
+echo "KD-only | T_KD=1 | T_proxy=1 | feature_beta=0 | min_require_size=$MIN_REQUIRE_SIZE"
+echo "lambda_max=1 | warm=$LAMBDA_WARMUP | tau=.85 | skew_power=2 | JS-client gain=1"
+echo "canonical execution: paired/preserved RNG controls are absent"
+echo "log_root=$LOG_ROOT | completed PKLs are skipped"
 
 if (( ${#JOBS[@]} == 0 )); then
     echo "No new jobs are required."
     exit 0
 fi
 
-pids=()
-for ((i = 0; i < NUM_GPUS; i++)); do
-    mapfile -t queue_jobs <<< "${QUEUES[$i]}"
-    run_queue "${GPUS[$i]}" "${queue_jobs[@]}" &
-    pids+=("$!")
+worker() {
+    local gpu="$1" slot="$2" i partition method seed failed=0
+    for ((i=slot; i<${#JOBS[@]}; i+=NUM_GPUS)); do
+        IFS='|' read -r partition method seed <<< "${JOBS[$i]}"
+        run_job "$gpu" "$partition" "$method" "$seed" || failed=1
+    done
+    return "$failed"
+}
+
+declare -a PIDS=()
+for i in "${!GPUS[@]}"; do
+    worker "${GPUS[$i]}" "$i" &
+    PIDS+=("$!")
 done
 
 status=0
-for pid in "${pids[@]}"; do
-    wait "$pid" || status=1
-done
-if (( status != 0 )); then
-    echo "One or more component-ablation jobs failed." >&2
-    exit "$status"
-fi
-
-echo "CIFAR-100 component ablation stage 1 complete (${#JOBS[@]} new jobs)."
+for pid in "${PIDS[@]}"; do wait "$pid" || status=1; done
+(( status == 0 )) || { echo "At least one ablation run failed." >&2; exit 1; }
+echo "Final JS-client component ablation complete."
