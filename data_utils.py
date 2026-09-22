@@ -427,6 +427,10 @@ def partition_data(global_train_dataset, args, logger):
 
         net_dataidx_map = {}
 
+        max_attempts = int(getattr(args, 'partition_max_attempts', 2000))
+        if max_attempts <= 0:
+            raise ValueError('--partition_max_attempts must be a positive integer.')
+
         shuffle_counts = 0
         while min_size < args.min_require_size:
             idx_batch = [[] for _ in range(args.n_clients)]
@@ -456,8 +460,11 @@ def partition_data(global_train_dataset, args, logger):
                 min_size = min(len(idx_j) for idx_j in idx_batch)
 
             shuffle_counts += 1
-            if shuffle_counts == 2000:
-                print(f'Shuffle limit (2000) reached, min_size: {min_size}')
+            if shuffle_counts >= max_attempts:
+                print(
+                    f'Shuffle limit ({max_attempts}) reached, '
+                    f'min_size: {min_size}'
+                )
                 break
         print(f'shuffle_counts: {shuffle_counts}')
 

@@ -1937,6 +1937,14 @@ def get_args():
             'this value; failed draws are never repaired by redistribution.'
         ),
     )
+    parser.add_argument(
+        '--partition_max_attempts', type=int, default=2000,
+        help=(
+            'Maximum redraw attempts for non-IID Dirichlet partitioning. '
+            'Increase only for unusually restrictive combinations such as '
+            'CIFAR-10 beta=0.1 with --min_require_size 64.'
+        ),
+    )
     # non-IID Dirichlet 분할에서 모든 클라이언트가 이 값 이상의 샘플을
     # 가질 때까지 partition 전체를 다시 생성한다. 분포를 훼손하는 강제
     # 재분배는 수행하지 않으며, retry 한도 초과 시 명시적으로 실패한다.
@@ -1948,6 +1956,15 @@ def get_args():
         '--sequential_client_execution', action='store_true',
         help='Keep selected client models on CPU and move them to the training device one at a time. '
              'This is required for memory-safe full participation with many clients.',
+    )
+    parser.add_argument(
+        '--transient_client_models', action='store_true',
+        help=(
+            'Allocate local models only for clients selected in the current round, '
+            'then release them after aggregation. This is mathematically equivalent '
+            'for FedAvg/FedBYOT runs that reset every selected client from the global '
+            'model, but is incompatible with MOON and final local-client checkpoints.'
+        ),
     )
     parser.add_argument(
         '--client_keep_last_batch', action='store_true',
@@ -2260,6 +2277,8 @@ def get_args():
     
     parser.add_argument('--use_fedprox', action='store_true', help='BYOT 학습 시 FedProx 근접항 추가')
     parser.add_argument('--use_moon', action='store_true', help='BYOT 학습 시 MOON 대조 학습 추가')
+    parser.add_argument('--use_scaffold', action='store_true', help='BYOT 학습 시 SCAFFOLD 추가'
+)
     parser.add_argument('--use_fedrcl', action='store_true', help='BYOT 학습 시 FedRCL 추가')
     parser.add_argument('--log_client_drift', action='store_true',
                         help='Log client update drift before aggregation.')
@@ -2514,6 +2533,39 @@ def main():
     # --- 1. 초기 설정 (Initialization) ---
     args = get_args()
     
+    use_scaffold = (
+        args.alg == 'scaffold'
+        or getattr(args, 'use_scaffold', False)
+    )
+
+    # --use_scaffold is only for Adaptive + SCAFFOLD.
+    # Plain SCAFFOLD uses --alg scaffold without this flag.
+    if getattr(args, 'use_scaffold', False) and args.alg != 'fedbyot':
+        raise ValueError(
+            "--use_scaffold is only supported with --alg fedbyot. "
+            "For plain SCAFFOLD, use --alg scaffold."
+        )
+
+    if use_scaffold and getattr(args, 'use_norm_agg', False):
+        raise ValueError(
+            "SCAFFOLD cannot be combined with --use_norm_agg."
+        )
+
+    if use_scaffold and args.optimizer.lower() != 'sgd':
+        raise ValueError(
+            "SCAFFOLD requires --optimizer sgd."
+        )
+
+    if use_scaffold and float(getattr(args, 'server_momentum', 0.0)) != 0.0:
+        raise ValueError(
+            "SCAFFOLD requires --server_momentum 0."
+        )
+        
+    if use_scaffold and float(getattr(args, 'momentum', 0.0)) != 0.0:
+        raise ValueError(
+            "SCAFFOLD requires --momentum 0."
+        )
+    
     if args.time > 0:
         time.sleep(args.time)
     device = torch.device(args.device)
@@ -2756,9 +2808,64 @@ def main():
         for p in ema_model.parameters():
             p.requires_grad = False
 
-    client_nets = {i: copy.deepcopy(global_model).to('cpu') for i in range(args.n_clients)}
+    transient_client_models = bool(getattr(args, 'transient_client_models', False))
+    if transient_client_models:
+        if args.alg not in {'fedavg', 'fedbyot', 'scaffold'}:
+            raise ValueError(
+                '--transient_client_models is restricted to alg=fedavg, '
+                'alg=fedbyot, or alg=scaffold.'
+            )
+        if getattr(args, 'use_moon', False):
+            raise ValueError(
+                '--transient_client_models cannot be combined with --use_moon: '
+                'MOON requires each client previous local model.'
+            )
+        if getattr(args, 'save_final_client_ckpts', False):
+            raise ValueError(
+                '--transient_client_models cannot be combined with '
+                '--save_final_client_ckpts.'
+            )
+        client_nets = {}
+        logger.info(
+            'Transient client models enabled: only clients selected in the '
+            'current round are materialized.'
+        )
+    else:
+        client_nets = {
+            i: copy.deepcopy(global_model).to('cpu')
+            for i in range(args.n_clients)
+        }
 
     moment_first, moment_second = fl_utils.init_server_optimizers(global_model)
+
+    global_control = None
+    client_controls = None
+
+    if use_scaffold:
+        control_template = {
+            name: torch.zeros_like(param.detach(), device='cpu')
+            for name, param in global_model.named_parameters()
+            if param.requires_grad
+        }
+
+        global_control = {
+            name: value.clone()
+            for name, value in control_template.items()
+        }
+
+        client_controls = {
+            client_id: {
+                name: value.clone()
+                for name, value in control_template.items()
+            }
+            for client_id in range(args.n_clients)
+        }
+
+    # =========================================
+
+    model_parameter_count = int(
+        sum(parameter.numel() for parameter in global_model.parameters())
+    )
 
     model_parameter_count = int(sum(parameter.numel() for parameter in global_model.parameters()))
     model_trainable_parameter_count = int(
@@ -2901,7 +3008,26 @@ def main():
         clients_this_round = np.random.choice(range(args.n_clients), m, replace=False)
         
         # 2. 선택된 클라이언트의 모델과 데이터로더 가져오기
-        if getattr(args, 'sequential_client_execution', False):
+        if transient_client_models:
+            # FedAvg/FedBYOT recreates every selected client from the current
+            # global state before local optimization. Keeping the other
+            # (unselected) client containers has no algorithmic effect unless
+            # a method such as MOON explicitly consumes previous local models.
+            # deepcopy does not advance any RNG stream, so client selection,
+            # data order, augmentation and optimization remain unchanged.
+            round_template = copy.deepcopy(global_model).to('cpu')
+            for parameter in round_template.parameters():
+                parameter.requires_grad = True
+            nets_this_round = {
+                int(i): copy.deepcopy(round_template)
+                for i in clients_this_round
+            }
+            del round_template
+            if not getattr(args, 'sequential_client_execution', False):
+                nets_this_round = {
+                    i: net.to(device) for i, net in nets_this_round.items()
+                }
+        elif getattr(args, 'sequential_client_execution', False):
             # Full participation with 100 ResNet clients cannot safely place
             # every local model on one GPU at once.  train_local_net moves one
             # model at a time and returns it to CPU after its local update.
@@ -3102,14 +3228,48 @@ def main():
                 )
 
         old_w = copy.deepcopy(global_model.state_dict())
-        
+
         args.current_round = round + 1
-        
+
+        scaffold_results = {}
+
         local_results = train_module.train_local_net(
-            dataloaders=dataloaders_this_round, nets=nets_this_round, 
-            global_model=global_model, prev_nets=prev_nets, prev_global_model=prev_global_model, 
-            device=device, round=round, lr=lr, args=args, logger=logger,
+            dataloaders=dataloaders_this_round,
+            nets=nets_this_round,
+            global_model=global_model,
+            prev_nets=prev_nets,
+            prev_global_model=prev_global_model,
+            device=device,
+            round=round,
+            lr=lr,
+            args=args,
+            logger=logger,
+            global_control=global_control,
+            client_controls=client_controls,
+            scaffold_results=scaffold_results,
         )
+        
+        # ===== SCAFFOLD control update =====
+        if use_scaffold:
+            new_controls = scaffold_results['new_client_controls']
+            control_deltas = scaffold_results['client_control_deltas']
+
+            # Update participating clients' c_i
+            for client_id, new_control in new_controls.items():
+                client_controls[client_id] = new_control
+
+            # Update global control c
+            with torch.no_grad():
+                for name in global_control:
+                    delta_sum = torch.zeros_like(global_control[name])
+
+                    for client_id in control_deltas:
+                        delta_sum += control_deltas[client_id][name]
+
+                    global_control[name] += (
+                        delta_sum / float(args.n_clients)
+                    )
+        # ===================================
 
         # 결과 처리
         if len(local_results) == 8:
@@ -3411,11 +3571,26 @@ def main():
                 f"norm={drift_metrics['client_update_norm']:.6f}, "
                 f"cos={drift_metrics['client_update_cosine']:.6f}"
             )
+            
+        if use_scaffold:
+            aggregation_freqs = [
+                1.0 / len(nets_this_round)
+                for _ in nets_this_round
+            ]
+        else:
+            aggregation_freqs = fed_avg_freqs
 
         if getattr(args, 'use_norm_agg', False):
-            global_w = norm_based_classwise_aggregation(global_model, nets_this_round, fed_avg_freqs)
+            global_w = norm_based_classwise_aggregation(
+                global_model, nets_this_round, fed_avg_freqs
+            )
         else:
-            global_w = fl_utils.aggregate_models(args, nets_this_round, fed_avg_freqs, global_w)
+            global_w = fl_utils.aggregate_models(
+                args,
+                nets_this_round,
+                aggregation_freqs,
+                global_w,
+            )
 
         # 서버 최적화 (Server Momentum 등)
         global_w, moment_first, moment_second = fl_utils.apply_server_side_optimization(
@@ -3548,7 +3723,13 @@ def main():
             logger.info(f" └─ [Branch Acc] B1(Shallow):{test_branches[0]:.2f}% | B2:{test_branches[1]:.2f}% | B3:{test_branches[2]:.2f}% | Teacher:{test_branches[3]:.2f}%")
 
         for i in clients_this_round:
-            client_nets[i].to('cpu') # 다시 CPU로 돌려보냄
+            nets_this_round[int(i)].to('cpu') # 다시 CPU로 돌려보냄
+
+        if transient_client_models:
+            # No subsequent round consumes these local states in the supported
+            # FedAvg/FedBYOT path. Release them before materializing the next
+            # selected-client set to keep host RAM proportional to m, not K.
+            del nets_this_round
             
         if prev_nets is not None:
             del prev_nets # MOON 등에서 복사했던 이전 모델 메모리 해제
