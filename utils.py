@@ -14,6 +14,7 @@ import torch.nn.functional as F  # Softmax 사용을 위해 추가
 from models import resnet_cifar
 from models import mobilenet_v2
 from models import simplecnn
+from models import cct
 
 try:
     from resnet_byot import multi_resnet18_kd, multi_resnet50_kd
@@ -32,6 +33,22 @@ def convert_bn_to_gn(module, num_groups=8):
         else:
             convert_bn_to_gn(child, num_groups)
     return module
+
+
+def _cct_input_size(args):
+    """Resolve the fixed token-grid size from the dataset transform."""
+    dataset_name = str(getattr(args, "dataset", "")).lower()
+    if dataset_name in {"cifar10", "cifar100"}:
+        return 32
+    if dataset_name in {"tinyimagenet", "imagenet100_64", "food101_64"}:
+        return 64
+    for suffix in ("_64", "_84", "_96"):
+        if dataset_name.endswith(suffix):
+            return int(suffix[1:])
+    raise ValueError(
+        f"CCT input size is not defined for dataset={dataset_name!r}. "
+        "Add the dataset's deterministic train/test image size first."
+    )
 
 def init_net(dataset, num_nets, args, device='cpu', base=False):
     nets = {}
@@ -67,6 +84,21 @@ def init_net(dataset, num_nets, args, device='cpu', base=False):
                 fan=args.fan,
                 linit=args.linit,
                 no_init=args.no_init if base else True,
+            )
+        elif args.model == 'cct':
+            net = cct.cct_7_3x2_32(
+                pretrained=False,
+                img_size=_cct_input_size(args),
+                num_classes=num_classes,
+                n_input_channels=args.in_channels,
+            )
+        elif args.model == 'cct_byot':
+            net = cct.cct_7_3x2_32_byot(
+                pretrained=False,
+                img_size=_cct_input_size(args),
+                num_classes=num_classes,
+                n_input_channels=args.in_channels,
+                branch_blocks=(2, 4, 5),
             )
         elif args.model == 'simplecnn':
             net = simplecnn.SimpleCNN(num_classes=num_classes)
