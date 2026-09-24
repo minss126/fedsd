@@ -194,6 +194,46 @@ def unpack_model_output(out):
     else:
         # Logits only or unexpected structure
         return None, out
+    
+def prepare_scaffold_correction(net, global_control, local_control):
+    """Cache ``c - c_i`` on the active client's device once per local run.
+
+    SCAFFOLD controls remain stored on CPU between clients/rounds.  The
+    controls are constant during one client's local optimization, so copying
+    both full control dictionaries before every mini-batch is unnecessary.
+    """
+    if global_control is None or local_control is None:
+        return None
+
+    correction = {}
+    with torch.no_grad():
+        for name, param in net.named_parameters():
+            if (
+                param.requires_grad
+                and name in global_control
+                and name in local_control
+            ):
+                c_global = global_control[name].to(
+                    device=param.device,
+                    dtype=param.dtype,
+                )
+                c_local = local_control[name].to(
+                    device=param.device,
+                    dtype=param.dtype,
+                )
+                correction[name] = c_global - c_local
+
+    return correction
+
+
+def apply_scaffold_correction(net, correction):
+    if correction is None:
+        return
+
+    with torch.no_grad():
+        for name, param in net.named_parameters():
+            if param.grad is not None and name in correction:
+                param.grad.add_(correction[name])
 
 
 def _byot_proxy_temperature(args):
@@ -1691,6 +1731,55 @@ def moon(net, global_model, previous_net, train_dataloader, optimizer, device, a
     
     return avg_loss, avg_correct_conf, avg_entropy
 
+def scaffold(
+    net,
+    global_model,
+    global_control,
+    local_control,
+    train_dataloader,
+    optimizer,
+    device,
+    args,
+):
+    criterion = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    completed_steps = 0
+
+    net.train()
+    scaffold_correction = prepare_scaffold_correction(
+        net,
+        global_control,
+        local_control,
+    )
+
+    for epoch in range(args.epochs):
+        for x, target in train_dataloader:
+            x = x.to(device)
+            target = target.to(device).long()
+
+            optimizer.zero_grad()
+
+            raw_out = net(x)
+            _, logits = unpack_model_output(raw_out)
+
+            loss = criterion(logits, target)
+            total_loss += float(loss.item())
+
+            loss.backward()
+
+            apply_scaffold_correction(
+                net,
+                scaffold_correction,
+            )
+
+            optimizer.step()
+            completed_steps += 1
+
+    net.zero_grad()
+    del scaffold_correction
+
+    return total_loss / max(1, completed_steps)
+
 def fedrcl(net, train_dataloader, optimizer, device, args):
     total_loss = 0.
     net.train()
@@ -1945,7 +2034,7 @@ def _fedlc_client_margin(train_dataloader, args, device, force=False):
     return margin.unsqueeze(0)
 
 
-def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, args):
+def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, args, scaffold_global_control=None, scaffold_local_control=None,):
     temperature = args.temperature
     teacher_source = str(getattr(args, "byot_teacher_source", "local") or "local")
     if teacher_source not in {"local", "global"}:
@@ -2047,6 +2136,11 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
         train_dataloader, args, device
     ) if branch_freq_stats is not None else (None, None, None)
     net.train()
+    scaffold_correction = prepare_scaffold_correction(
+        net,
+        scaffold_global_control,
+        scaffold_local_control,
+    )
     
     for epoch in range(args.epochs):
         for step, (x, target) in enumerate(train_dataloader):
@@ -2310,8 +2404,16 @@ def fedbyot(net, global_model, prev_net, train_dataloader, optimizer, device, ar
             
             total_loss += loss.item()
             loss.backward()
+            
+            if scaffold_correction is not None:
+                apply_scaffold_correction(
+                    net,
+                    scaffold_correction,
+                )
+                
             optimizer.step()
 
+    del scaffold_correction
     denom = max(1, len(train_dataloader) * max(1, getattr(args, "epochs", 1)))
     avg_correct_conf = total_correct_conf / max(1, valid_conf_batches)
     avg_entropy = total_entropy / max(1, len(train_dataloader))
@@ -3467,6 +3569,55 @@ def fedbyot_rs_greedy(net, global_model, prev_net, train_dataloader, optimizer, 
 def dataloader_batch_size_estimate(dataloader):
     # 추정용 헬퍼 함수
     return dataloader.batch_size if hasattr(dataloader, 'batch_size') else 64
+
+def update_scaffold_local_control(
+    net,
+    global_model,
+    global_control,
+    local_control,
+    lr,
+    local_steps,
+):
+    if local_steps <= 0 or lr <= 0:
+        new_control = {
+            name: value.clone()
+            for name, value in local_control.items()
+        }
+        delta_control = {
+            name: torch.zeros_like(value)
+            for name, value in local_control.items()
+        }
+        return new_control, delta_control
+
+    coeff = 1.0 / (local_steps * lr)
+
+    global_params = {
+        name: param.detach().cpu()
+        for name, param in global_model.named_parameters()
+    }
+
+    local_params = {
+        name: param.detach().cpu()
+        for name, param in net.named_parameters()
+    }
+
+    new_control = {}
+    delta_control = {}
+
+    for name in local_control:
+        new_value = (
+            local_control[name]
+            - global_control[name]
+            + coeff * (
+                global_params[name]
+                - local_params[name]
+            )
+        )
+
+        new_control[name] = new_value
+        delta_control[name] = new_value - local_control[name]
+
+    return new_control, delta_control
 
 '''
 def fedbyot_logit_adj(net, global_model, prev_net, train_dataloader, optimizer, device, args):
@@ -4909,7 +5060,7 @@ def fedflocora_byot_v2(net, train_dataloader, optimizer, device, args, current_r
 
 '''
 
-def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_model, device, round, lr, args, logger):
+def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_model, device, round, lr, args, logger, global_control=None, client_controls=None, scaffold_results=None,):
     total_loss = 0.0
     total_ratio = 0.0 
     total_entropy = 0.0
@@ -4927,6 +5078,12 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     total_kd_std = 0.0  
     total_branch_freq_stats = init_train_branch_freq_stats() if getattr(args, "log_train_branch_frequency_stats", False) else {}
     args._last_round_update_step_records = []
+    use_scaffold = (
+        args.alg == 'scaffold'
+        or getattr(args, 'use_scaffold', False)
+    )
+    new_client_controls = {}
+    client_control_deltas = {}
     
     # [NEW] 시간 및 연산 효율 측정을 위한 누적 변수
     total_time = 0.0
@@ -4936,6 +5093,7 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
     # aggregate.  Reusing one attribute for both made the previous round's
     # dictionary get copied into every client in the next round.
     args._last_round_client_skew_proxy_stats = {}
+    
     for net_id, net in nets.items():
         sequential_client_execution = bool(
             getattr(args, "sequential_client_execution", False)
@@ -4968,8 +5126,14 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
             optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()),
                                    lr=lr, weight_decay=args.reg, amsgrad=True)
         elif args.optimizer == 'sgd':
-            optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()),
-                                  lr=lr, momentum=args.momentum, weight_decay=args.reg)
+            local_momentum = 0.0 if use_scaffold else args.momentum
+
+            optimizer = optim.SGD(
+                filter(lambda p: p.requires_grad, net.parameters()),
+                lr=lr,
+                momentum=local_momentum,
+                weight_decay=args.reg,
+            )
 
         update_step_records = _install_update_step_tracker(
             optimizer, net, net_id, args
@@ -5071,6 +5235,19 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
             loss, correct_conf, entropy = moon(net, global_model, prev_net, dataloaders[net_id], optimizer, device, args)
             wall_clock_time = time.time() - start_time
             
+        elif args.alg == 'scaffold':
+            loss = scaffold(
+                net,
+                global_model,
+                global_control,
+                client_controls[net_id],
+                dataloaders[net_id],
+                optimizer,
+                device,
+                args,
+            )
+            wall_clock_time = time.time() - start_time
+            
         elif args.alg == 'fedrcl':
             loss = fedrcl(net, dataloaders[net_id], optimizer, device, args)
             wall_clock_time = time.time() - start_time
@@ -5084,7 +5261,22 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
             wall_clock_time = time.time() - start_time
             
         elif args.alg == 'fedbyot':
-            fedbyot_result = fedbyot(net, global_model, prev_net, dataloaders[net_id], optimizer, device, args)
+            fedbyot_result = fedbyot(
+                net,
+                global_model,
+                prev_net,
+                dataloaders[net_id],
+                optimizer,
+                device,
+                args,
+                scaffold_global_control=(
+                    global_control if use_scaffold else None
+                ),
+                scaffold_local_control=(
+                    client_controls[net_id]
+                    if use_scaffold else None
+                ),
+            )
             branch_freq_stats = None
             if len(fedbyot_result) == 12:
                 (
@@ -5132,6 +5324,22 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
         else: 
             loss = fedavg(net, dataloaders[net_id], optimizer, device, args)
             wall_clock_time = time.time() - start_time
+        
+        # SCAFFOLD: update the participating client's local control c_i
+        if use_scaffold:
+            local_steps = args.epochs * len(dataloaders[net_id])
+
+            new_c, delta_c = update_scaffold_local_control(
+                net=net,
+                global_model=global_model,
+                global_control=global_control,
+                local_control=client_controls[net_id],
+                lr=lr,
+                local_steps=local_steps,
+            )
+
+            new_client_controls[net_id] = new_c
+            client_control_deltas[net_id] = delta_c
              
         # 누적 계산
         total_loss += loss
@@ -5175,6 +5383,10 @@ def train_local_net(dataloaders, nets, global_model, prev_nets, prev_global_mode
 
         if update_step_records is not None:
             args._last_round_update_step_records.extend(update_step_records)
+            
+    if use_scaffold and scaffold_results is not None:
+        scaffold_results['new_client_controls'] = new_client_controls
+        scaffold_results['client_control_deltas'] = client_control_deltas
 
     num_clients = len(nets)
     avg_loss = total_loss / num_clients
