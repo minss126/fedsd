@@ -25,8 +25,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 read -r -a GPUS <<< "${GPUS_OVERRIDE:-0 1}"
-(( ${#GPUS[@]} == 2 )) || {
-    echo "Exactly two GPU ids are required; got: ${GPUS[*]:-<empty>}" >&2
+(( ${#GPUS[@]} >= 2 )) || {
+    echo "At least two GPU ids are required; got: ${GPUS[*]:-<empty>}" >&2
     exit 2
 }
 
@@ -51,8 +51,10 @@ if [[ -z "$IMAGENET100_DATADIR" ]]; then
 fi
 IMAGENET100_DATADIR="${IMAGENET100_DATADIR:-${DATA_ROOT}/imagenet100_resized_64_png}"
 
-LOG_ROOT="${LOG_ROOT:-logs/lambda/final/logs_cct_model_extension_seed0}"
-SMOKE_LOG_ROOT="${SMOKE_LOG_ROOT:-logs/lambda/smoke/logs_cct_model_extension_seed0}"
+# Keep matched-tokenizer runs isolated from the earlier invalid CCT-BYOT
+# factory outputs so SKIP_EXISTING can never reuse those PKLs.
+LOG_ROOT="${LOG_ROOT:-logs/lambda/final/logs_cct_model_extension_seed0_matched_tokenizer}"
+SMOKE_LOG_ROOT="${SMOKE_LOG_ROOT:-logs/lambda/smoke/logs_cct_model_extension_seed0_matched_tokenizer}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 RUN_SMOKE_FIRST="${RUN_SMOKE_FIRST:-1}"
 REUSE_SMOKE="${REUSE_SMOKE:-1}"
@@ -329,8 +331,11 @@ run_smoke() {
 }
 
 # Validate model imports and both supported token-grid sizes before occupying a
-# GPU.  This is intentionally a forward-only static preflight, not a training
-# experiment.
+# GPU.  In addition to output shape, require the plain and BYOT variants to
+# have an identical tokenizer grid and identical shared-backbone
+# initialization under the same seed.  This prevents a factory-default change
+# from silently turning the model-extension comparison into an architecture
+# comparison.
 preflight_model() {
     "$PYTHON_BIN" - <<'PY'
 import torch
@@ -338,14 +343,46 @@ from models.cct import cct_7_3x2_32, cct_7_3x2_32_byot
 
 for image_size, classes in ((32, 100), (64, 200), (64, 100)):
     x = torch.zeros(1, 3, image_size, image_size)
+    torch.manual_seed(0)
     plain = cct_7_3x2_32(img_size=image_size, num_classes=classes)
+    torch.manual_seed(0)
     byot = cct_7_3x2_32_byot(img_size=image_size, num_classes=classes)
-    plain_output = plain(x)
-    byot_output = byot(x)
+
+    plain_tokens = plain.tokenizer(x)
+    byot_tokens = byot.tokenizer(x)
+    assert plain_tokens.shape == byot_tokens.shape, (
+        f"CCT tokenizer mismatch at {image_size}x{image_size}: "
+        f"plain={tuple(plain_tokens.shape)}, byot={tuple(byot_tokens.shape)}"
+    )
+
+    plain_state = plain.state_dict()
+    byot_state = byot.state_dict()
+    shared_keys = sorted(set(plain_state).intersection(byot_state))
+    assert set(plain_state).issubset(byot_state), (
+        "CCT-BYOT is missing parameters or buffers from the plain CCT."
+    )
+    for key in shared_keys:
+        assert plain_state[key].shape == byot_state[key].shape, (
+            f"CCT shared-state shape mismatch for {key}: "
+            f"plain={tuple(plain_state[key].shape)}, "
+            f"byot={tuple(byot_state[key].shape)}"
+        )
+        assert torch.equal(plain_state[key], byot_state[key]), (
+            f"CCT shared-state initialization mismatch for {key}."
+        )
+
+    plain.eval()
+    byot.eval()
+    with torch.no_grad():
+        plain_output = plain(x)
+        byot_output = byot(x)
     assert plain_output.shape == (1, classes)
     assert isinstance(byot_output, tuple) and len(byot_output) == 8
     assert all(value.shape == (1, classes) for value in byot_output[:4])
     assert all(value.shape == (1, 256) for value in byot_output[4:])
+    assert torch.equal(plain_output, byot_output[0]), (
+        f"CCT final-path mismatch at {image_size}x{image_size}."
+    )
 print("CCT static preflight passed for 32x32 and 64x64 inputs.")
 PY
 }

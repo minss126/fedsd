@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
 
-# Queue for the 5070-1 two-GPU server.
+# Completion queue for the 5070-1 two-GPU server.
 #
-# 1. Wait until the currently running MobileNetV2/TinyImageNet R300 matrix
-#    has been idle for three consecutive checks.
-# 2. Run the matching MobileNetV2/ImageNet100-64 R300 matrix.
+# Phase 1: MobileNetV2 fixed-lambda R100 on TinyImageNet/ImageNet100-64.
+# Phase 2: corrected matched-tokenizer CCT R100 on ImageNet100-64.
 #
-# The invoked launcher keeps the finalized model-extension protocol:
-# seed 0, FedAvg, IID/beta=.1, Plain/Fixed(.3)/Adaptive, E=5, C=.1,
-# batch=64, KD-only, no feature loss, T_KD=T_proxy=1, and canonical RNG.
+# The currently running R300 queue must be stopped before launching this file.
 
 set -euo pipefail
 
@@ -21,51 +18,44 @@ read -r -a GPUS <<< "${GPUS_OVERRIDE:-0 1}"
     exit 2
 }
 
-WAIT_FOR_TINY="${WAIT_FOR_TINY:-1}"
-WAIT_POLL_SECONDS="${WAIT_POLL_SECONDS:-60}"
-WAIT_IDLE_POLLS="${WAIT_IDLE_POLLS:-3}"
 DRY_RUN="${DRY_RUN:-0}"
-
-for value_name in WAIT_FOR_TINY DRY_RUN; do
-    value="${!value_name}"
-    [[ "$value" == 0 || "$value" == 1 ]] || {
-        echo "$value_name must be 0 or 1; got $value." >&2
-        exit 2
-    }
-done
-[[ "$WAIT_POLL_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
-    echo "WAIT_POLL_SECONDS must be a positive integer." >&2; exit 2;
-}
-[[ "$WAIT_IDLE_POLLS" =~ ^[1-9][0-9]*$ ]] || {
-    echo "WAIT_IDLE_POLLS must be a positive integer." >&2; exit 2;
+[[ "$DRY_RUN" == 0 || "$DRY_RUN" == 1 ]] || {
+    echo "DRY_RUN must be 0 or 1; got $DRY_RUN." >&2
+    exit 2
 }
 
-TINY_PROCESS_PATTERN='[m]ain.py.*logs/lambda/final/logs_mobilenetv2_tiny_r300_canonical_seed0'
+MOBILENET_LOG_ROOT="${MOBILENET_LOG_ROOT:-logs/lambda/final/logs_mobilenetv2_fixed_r100_canonical_seed0}"
+CCT_LOG_ROOT="${CCT_LOG_ROOT:-logs/lambda/final/logs_cct_model_extension_seed0_matched_tokenizer_r100}"
+CCT_SMOKE_LOG_ROOT="${CCT_SMOKE_LOG_ROOT:-logs/lambda/smoke/logs_cct_model_extension_seed0_matched_tokenizer}"
 
-if [[ "$WAIT_FOR_TINY" == 1 && "$DRY_RUN" != 1 ]]; then
-    echo "Waiting for the current MobileNetV2/TinyImageNet R300 queue to finish."
-    idle_polls=0
-    while (( idle_polls < WAIT_IDLE_POLLS )); do
-        if pgrep -f "$TINY_PROCESS_PATTERN" >/dev/null; then
-            idle_polls=0
-        else
-            idle_polls=$((idle_polls + 1))
-            echo "Tiny queue idle check: ${idle_polls}/${WAIT_IDLE_POLLS}"
-        fi
-        (( idle_polls >= WAIT_IDLE_POLLS )) || sleep "$WAIT_POLL_SECONDS"
-    done
-fi
+echo "========== 5070-1 R100 completion queue =========="
+echo "GPUs=${GPUS[*]}"
+echo "[Phase 1/2] MobileNetV2 Fixed(lambda=.3), Tiny/Image R100"
+GPUS_OVERRIDE="${GPUS[*]}" \
+DATASETS_OVERRIDE="tinyimagenet imagenet100_64" \
+PARTITIONS_OVERRIDE="iid beta_0.1" \
+METHODS_OVERRIDE="fixed" \
+SEEDS_OVERRIDE="0" \
+ROUNDS_OVERRIDE=100 \
+LOG_ROOT="$MOBILENET_LOG_ROOT" \
+SKIP_EXISTING="${SKIP_EXISTING:-1}" \
+DRY_RUN="$DRY_RUN" \
+bash scripts/experiments/lambda/run_mobilenetv2_tiny_r300_canonical_seed0_2gpu.sh
 
-echo "Starting MobileNetV2/ImageNet100-64 R300 on GPUs: ${GPUS[*]}"
+echo "[Phase 2/2] Corrected CCT, ImageNet100-64 R100"
 GPUS_OVERRIDE="${GPUS[*]}" \
 DATASETS_OVERRIDE="imagenet100_64" \
 PARTITIONS_OVERRIDE="iid beta_0.1" \
 METHODS_OVERRIDE="plain fixed adaptive" \
 SEEDS_OVERRIDE="0" \
-ROUNDS_OVERRIDE=300 \
-LOG_ROOT="${LOG_ROOT:-logs/lambda/final/logs_mobilenetv2_imagenet100_64_r300_canonical_seed0}" \
+ROUNDS_OVERRIDE=100 \
+LOG_ROOT="$CCT_LOG_ROOT" \
+SMOKE_LOG_ROOT="$CCT_SMOKE_LOG_ROOT" \
+RUN_SMOKE_FIRST="${RUN_SMOKE_FIRST:-1}" \
+REUSE_SMOKE="${REUSE_SMOKE:-0}" \
+RUN_FULL_AFTER_SMOKE=1 \
 SKIP_EXISTING="${SKIP_EXISTING:-1}" \
 DRY_RUN="$DRY_RUN" \
-bash scripts/experiments/lambda/run_mobilenetv2_tiny_r300_canonical_seed0_2gpu.sh
+bash scripts/experiments/lambda/run_cct_model_extension_seed0_2gpu.sh
 
-echo "5070-1 priority queue complete."
+echo "5070-1 R100 completion queue complete."

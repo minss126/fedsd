@@ -413,6 +413,11 @@ def cct_7_3x2_32_byot(pretrained=False, progress=False,
         mlp_ratio=2,
         embedding_dim=256,
         kernel_size=3,
+        # Match cct_7_3x2_32 -> _cct exactly.  Falling back to CCT's
+        # constructor defaults (stride=2, padding=3) changes the tokenizer
+        # grid and therefore does not provide a matched BYOT extension.
+        stride=1,
+        padding=1,
         n_conv_layers=2,
         img_size=img_size,
         positional_embedding=positional_embedding,
